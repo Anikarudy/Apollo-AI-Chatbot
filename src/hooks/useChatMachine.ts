@@ -107,7 +107,7 @@ export function useChatMachine() {
         { id: nextId(), sender: "user", text },
       ]);
 
-      const event = mapInputToEvent(text);
+      const event = mapInputToEvent(text, currentState);
       runner.sendEvent(event);
 
       const nextState = runner.currentState;
@@ -116,7 +116,7 @@ export function useChatMachine() {
       setMachineCtx(nextCtx);
       await pushLlmBotMessage(nextState, runner.context as Record<string, unknown>, text);
     },
-    [pushLlmBotMessage]
+    [currentState, pushLlmBotMessage]
   );
 
   const sendQuickReply = useCallback(

@@ -7,7 +7,8 @@ import { buildLlmContext } from "../src/knowledgeBase";
 dotenv.config();
 
 const app = express();
-app.use(cors({ origin: "http://localhost:5173" }));
+const frontendOrigin = process.env.FRONTEND_ORIGIN ?? "http://localhost:5173";
+app.use(cors({ origin: frontendOrigin }));
 app.use(express.json());
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY ?? "");

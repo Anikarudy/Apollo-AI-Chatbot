@@ -4,6 +4,7 @@
  *
  * Hospital, speciality, and doctor data is auto-generated from
  * "Master Data (local).xlsx" via scripts/extractData.js.
+ * Web packages and procedures are auto-generated via scripts/extractWebData.js.
  * Run `node scripts/extractData.js` to refresh after data changes.
  */
 
@@ -17,6 +18,11 @@ import {
   type GeneratedSpeciality,
   type GeneratedDoctor,
 } from "./generatedData";
+import {
+  healthPackages,
+  topProcedures,
+  type HealthPackage,
+} from "./webData.generated";
 
 // ── 1. CONTACT NUMBERS ──────────────────────────────────────────────────
 export const contacts = {
@@ -120,77 +126,9 @@ export const symptomToSpecialty: Record<string, string> = {
   "stress": "Psychology",
 };
 
-// ── 5. HEALTH CHECK PACKAGES (scraped from prohealth.apollohospitals.com) ─
-export interface HealthPackage {
-  name: string;
-  description: string;
-  url: string;
-}
-
-export const healthPackages: Record<string, HealthPackage[]> = {
-  Chennai: [
-    { name: "Heart Health Checkup", description: "Comprehensive cardiac risk assessment", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/chennai/hospital/apollo-hospitals-greams-road-chennai/apollo-prohealth-heart-program" },
-    { name: "Women's Health Checkup", description: "Complete women's wellness screen", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/chennai/hospital/apollo-hospitals-greams-road-chennai/apollo-prohealth-comprehensive-well-women-program" },
-    { name: "Master Health Checkup", description: "All-round health assessment", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/chennai/hospital/apollo-hospitals-greams-road-chennai/apollo-prohealth-master-health-program" },
-    { name: "Full Body Checkup", description: "Regal whole-body programme", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/chennai/hospital/apollo-hospitals-greams-road-chennai/apollo-prohealth-regal-whole-body-program" },
-    { name: "Senior Citizen Checkup", description: "Tailored for 60+ patients", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/chennai/hospital/apollo-hospitals-greams-road-chennai/prohealth-senior-citizen-program-male" },
-  ],
-  Hyderabad: [
-    { name: "Heart Health Checkup", description: "Cardiac risk panel", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/hyderabad/hospital/apollo-health-city-jubilee-hills/apollo-prohealth-heart-program" },
-    { name: "Primary Health Checkup", description: "Basic annual wellness check", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/hyderabad/hospital/apollo-health-city-jubilee-hills/apollo-prohealth-primary-health-program" },
-    { name: "Full Body Checkup", description: "Regal whole-body programme", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/hyderabad/hospital/apollo-health-city-jubilee-hills/apollo-prohealth-regal-whole-body-program" },
-    { name: "Women's Health Checkup", description: "Complete women's wellness screen", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/hyderabad/hospital/apollo-health-city-jubilee-hills/apollo-prohealth-comprehensive-well-women-program" },
-    { name: "Senior Citizen Checkup", description: "Tailored for 60+ patients", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/hyderabad/hospital/apollo-health-city-jubilee-hills/prohealth-comprehensive-senior-citizen-program" },
-  ],
-  Bangalore: [
-    { name: "Heart Health Checkup", description: "Cardiac risk panel", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/bangalore/hospital/apollo-hospitals-bannerghatta-road/apollo-prohealth-heart-program" },
-    { name: "Women's Health Check", description: "Advanced platinum programme", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/bangalore/hospital/apollo-hospitals-bannerghatta-road/apollo-prohealth-advanced-platinum-health-program-female" },
-    { name: "Senior Citizen Checkup", description: "Tailored for 60+ patients", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/bangalore/hospital/apollo-hospitals-bannerghatta-road/apollo-prohealth-senior-citizen-program" },
-    { name: "Stroke Risk Checkup", description: "Neuro-vascular risk assessment", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/bangalore/hospital/apollo-hospitals-bannerghatta-road/apollo-prohealth-stroke-risk-program" },
-    { name: "Full Body Checkup", description: "Regal whole-body programme", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/bangalore/hospital/apollo-hospitals-bannerghatta-road/apollo-prohealth-regal-whole-body-program" },
-  ],
-  Mumbai: [
-    { name: "Heart Health Checkup", description: "Cardiac risk panel", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/mumbai/hospital/apollo-hospitals-navi-mumbai/apollo-prohealth-heart-program" },
-    { name: "Women's Health Checkup", description: "Complete women's wellness screen", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/mumbai/hospital/apollo-hospitals-navi-mumbai/apollo-prohealth-comprehensive-well-women-program" },
-    { name: "Master Health Checkup", description: "All-round health assessment", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/mumbai/hospital/apollo-hospitals-navi-mumbai/apollo-prohealth-master-health-program" },
-    { name: "Senior Citizen Checkup", description: "Tailored for 60+ patients", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/mumbai/hospital/apollo-hospitals-navi-mumbai/apollo-prohealth-comprehensive-senior-citizens-health-program" },
-    { name: "Full Body Checkup", description: "Regal whole-body programme", url: "https://prohealth.apollohospitals.com/book-health-check/ahc-packages/mumbai/hospital/apollo-hospitals-navi-mumbai/apollo-prohealth-regal-whole-body-program" },
-  ],
-};
-
-// ── 6. TOP PROCEDURES (scraped from international patients page) ─────────
-export const topProcedures: string[] = [
-  "CABG (Coronary Artery Bypass Grafting)",
-  "PCI / Angioplasty with OCT/IVUS-guided stents",
-  "TAVR / TAVI (Transcatheter Aortic Valve Replacement)",
-  "Robotic & Minimally-Invasive CABG",
-  "Heart Transplant",
-  "Proton Beam Therapy",
-  "CAR-T Cell Therapy",
-  "Bone Marrow Transplant (BMT)",
-  "Cytoreductive Surgery + HIPEC",
-  "Minimally Invasive / Robotic Cancer Surgery",
-  "Stroke Care – Thrombolysis / Endovascular Stroke Therapy",
-  "Craniotomy & Brain-Tumour Surgery",
-  "Deep Brain Stimulation",
-  "Robotic Knee Replacement",
-  "Robotic Hip Replacement",
-  "ACL Reconstruction Surgery",
-  "Total Hip Replacement (THR)",
-  "Liver Transplant (Adult / Paediatric)",
-  "Kidney Transplant",
-  "Lung Transplant",
-  "GI Oncologic Surgery",
-  "Robotic-Assisted GI Surgery",
-  "Laparoscopic Cholecystectomy",
-  "Assisted Reproductive Technologies (IVF / ICSI / ET)",
-  "Radical Prostatectomy (Open / Robotic / Laparoscopic)",
-  "Robotic Bariatric Surgery",
-  "Sleeve Gastrectomy",
-  "LASIK Surgery",
-  "Peritoneal Dialysis",
-  "Kidney Biopsy",
-];
+// ── 6. HEALTH CHECK PACKAGES + TOP PROCEDURES ───────────────────────────
+export type { HealthPackage };
+export { healthPackages, topProcedures };
 
 // ── 7. SERVICE CATEGORIES (from CRM export) ─────────────────────────────
 // These are the broad categories that Apollo's call-centre handles

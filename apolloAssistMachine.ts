@@ -6,7 +6,7 @@
 // ============================================================
 
 import { createMachine, createActor, assign } from "xstate";
-import { mapSymptomToSpecialty } from "./src/knowledgeBase";
+import { allCities, mapSymptomToSpecialty } from "./src/knowledgeBase";
 
 // ─────────────────────────────────────────────────────────────
 // 1. INPUT MAPPING  (text → event)
@@ -76,8 +76,11 @@ export type AppEvent =
  * Converts a raw user text string into a typed AppEvent.
  * Uses simple keyword detection – extend the arrays freely.
  */
-export function mapInputToEvent(message: string): AppEvent {
+export function mapInputToEvent(message: string, currentState?: string): AppEvent {
   const text = message.toLowerCase().trim();
+  const state = (currentState ?? "").toUpperCase();
+
+  if (!text) return { type: "UNKNOWN" };
 
   // ── Greetings / Start ──────────────────────────────────────
   const greetings = ["hi", "hello", "hey", "start", "begin", "help"];
@@ -224,6 +227,50 @@ export function mapInputToEvent(message: string): AppEvent {
   if (text.includes("retry") || text.includes("try again"))
     return { type: "RETRY" };
 
+  // ── State-aware free-text mapping ─────────────────────────
+  if (state === "ENTER_DOCTOR_NAME") {
+    return { type: "ENTER_NAME", value: message.trim() };
+  }
+
+  if (state === "SELECT_SPECIALTY") {
+    return { type: "ENTER_SPECIALTY", value: message.trim() };
+  }
+
+  if (state === "ASK_BASIC_DETAILS") {
+    return { type: "ENTER_SYMPTOM", value: message.trim() };
+  }
+
+  if (state === "ASK_CITY" || state === "HEALTH_CHECKUP_ENTRY") {
+    const cityMatch = allCities.find((city) => {
+      const lower = city.toLowerCase();
+      return lower === text || lower.includes(text) || text.includes(lower);
+    });
+    return { type: "ENTER_CITY", value: cityMatch ?? message.trim() };
+  }
+
+  if (state === "ASK_BRANCH") {
+    return { type: "SELECT_BRANCH", value: message.trim() };
+  }
+
+  if (state === "ENTER_PHONE") {
+    const phone = message.replace(/[^0-9+]/g, "");
+    if (/^\+?[0-9]{10,13}$/.test(phone)) {
+      return { type: "ENTER_PHONE", value: phone };
+    }
+  }
+
+  if (state === "VERIFY_OTP" && /^\d{4,8}$/.test(text)) {
+    return { type: "OTP_SUCCESS" };
+  }
+
+  if (state === "ASK_DETAILS") {
+    return { type: "ENTER_PARTIAL_DETAILS" };
+  }
+
+  if (state === "ASK_SPECIFIC_DETAIL") {
+    return { type: "PROVIDE_DETAIL" };
+  }
+
   // ── Fallback ──────────────────────────────────────────────
   return { type: "UNKNOWN" };
 }
@@ -304,6 +351,7 @@ export const apolloMachine = createMachine(
             target: "PROCESS_DOCTOR_NAME",
             actions: assign({ doctorName: ({ event }) => event.value }),
           },
+          UNKNOWN: "FALLBACK",
         },
       },
 
@@ -327,6 +375,7 @@ export const apolloMachine = createMachine(
             target: "PROCESS_SPECIALTY",
             actions: assign({ specialty: ({ event }) => event.value }),
           },
+          UNKNOWN: "FALLBACK",
         },
       },
 
@@ -398,6 +447,8 @@ export const apolloMachine = createMachine(
             target: "ASK_BRANCH",
             actions: assign({ city: ({ event }) => event.value }),
           },
+          BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
         },
       },
 
@@ -408,6 +459,7 @@ export const apolloMachine = createMachine(
             actions: assign({ branch: ({ event }) => event.value }),
           },
           BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
         },
       },
 
@@ -453,6 +505,7 @@ export const apolloMachine = createMachine(
             actions: assign({ phoneNumber: ({ event }) => event.value }),
           },
           EXIT_VERIFICATION: "SHOW_DOCTORS",
+          UNKNOWN: "FALLBACK",
         },
       },
 
@@ -481,6 +534,7 @@ export const apolloMachine = createMachine(
             actions: assign({ city: ({ event }) => event.value }),
           },
           BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
         },
       },
 
@@ -498,7 +552,7 @@ export const apolloMachine = createMachine(
 
       REDIRECT_TO_WEBSITE: {
         on: {
-          EXIT: "END",
+          EXIT: "MAIN_MENU",
         },
       },
 
@@ -516,6 +570,7 @@ export const apolloMachine = createMachine(
           ENTER_ALL_DETAILS: "CONFIRM_SUBMISSION",
           REFUSE_DETAIL: "HANDLE_REFUSAL",
           BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
         },
       },
 
@@ -530,6 +585,7 @@ export const apolloMachine = createMachine(
         on: {
           PROVIDE_DETAIL: "CHECK_MISSING_DETAILS",
           REFUSE_DETAIL: "HANDLE_REFUSAL",
+          UNKNOWN: "FALLBACK",
         },
       },
 
@@ -613,7 +669,7 @@ export class ApolloAssistRunner {
 
   /** Feed a raw user message string into the machine */
   sendMessage(userText: string): void {
-    const event = mapInputToEvent(userText);
+    const event = mapInputToEvent(userText, this.currentState);
     console.log("[Mapped event]", event);
     this.actor.send(event as AppEvent);
   }
@@ -639,14 +695,15 @@ export class ApolloAssistRunner {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 5. QUICK DEMO (run with: npx ts-node apolloAssistMachine.ts)
+// 5. QUICK DEMO (optional)
 // ─────────────────────────────────────────────────────────────
 
-const runner = new ApolloAssistRunner();
-
-runner.sendMessage("Hello");                        // START → MAIN_MENU
-runner.sendMessage("I want to book an appointment");// BOOK_APPOINTMENT → BOOK_APPT_OPTIONS
-runner.sendMessage("I have chest pain");            // ENTER_SYMPTOM → ASK_BASIC_DETAILS
-runner.sendMessage("I want to check cardiologist"); // handled inside symptom → category flow
-runner.sendMessage("Hyderabad");                    // ENTER_CITY
-runner.sendMessage("Apollo Jubilee Hills");         // SELECT_BRANCH
+export function runDemoConversation(): void {
+  const runner = new ApolloAssistRunner();
+  runner.sendMessage("Hello");
+  runner.sendMessage("I want to book an appointment");
+  runner.sendMessage("I have chest pain");
+  runner.sendMessage("I want to check cardiologist");
+  runner.sendMessage("Hyderabad");
+  runner.sendMessage("Apollo Jubilee Hills");
+}

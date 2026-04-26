@@ -7,6 +7,9 @@
     "dev": "concurrently \"npm run dev:frontend\" \"npm run dev:server\"",
     "dev:frontend": "vite",
     "dev:server": "ts-node --project tsconfig.server.json api/index.ts",
+    "extract:data": "node scripts/extractData.js",
+    "extract:web": "node scripts/extractWebData.js",
+    "extract:all": "npm run extract:data && npm run extract:web",
     "build": "vite build",
     "preview": "vite preview",
     "demo": "ts-node --project tsconfig.server.json apolloAssistMachine.ts",
@@ -29,6 +32,8 @@
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "@vitejs/plugin-react": "^6.0.1",
+    "axios": "^1.11.0",
+    "cheerio": "^1.1.2",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
