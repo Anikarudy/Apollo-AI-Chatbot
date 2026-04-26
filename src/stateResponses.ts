@@ -1,0 +1,557 @@
+/**
+ * stateResponses.ts
+ * Maps each XState machine state to a bot message and quick-reply buttons.
+ * Buttons carry the exact event type to send to the machine.
+ */
+
+import { allCities, specialities, contacts, getHospitalsForCity, getPackagesForCity, getDoctorsByName, buildDoctorSearchUrl, mapSymptomToSpecialty } from "./knowledgeBase";
+
+export { mapSymptomToSpecialty };
+
+export interface QuickReply {
+  label: string;
+  eventType: string;
+  value?: string;
+}
+
+export interface StateResponse {
+  message: string;
+  quickReplies: QuickReply[];
+  /** If true, the text input is shown for free text entry */
+  showInput?: boolean;
+  /** Placeholder for the text input */
+  inputPlaceholder?: string;
+}
+
+const responses: Record<string, StateResponse> = {
+  WELCOME: {
+    message:
+      "Hi, I'm Apollo Assist, your personal support for all medical needs. How can I help you?",
+    quickReplies: [
+      { label: "Help me find a doctor", eventType: "FIND_DOCTOR" },
+      { label: "I want to book appointment", eventType: "BOOK_APPOINTMENT" },
+      { label: "I want to book health check", eventType: "HEALTH_CHECKUP" },
+      { label: "International patient services", eventType: "INTERNATIONAL_SERVICES" },
+      { label: "I have an emergency", eventType: "EMERGENCY" },
+    ],
+  },
+
+  MAIN_MENU: {
+    message: "What would you like to do?",
+    quickReplies: [
+      { label: "Help me find a doctor", eventType: "FIND_DOCTOR" },
+      { label: "I want to book appointment", eventType: "BOOK_APPOINTMENT" },
+      { label: "I want to book health check", eventType: "HEALTH_CHECKUP" },
+      { label: "International patient services", eventType: "INTERNATIONAL_SERVICES" },
+      { label: "I have an emergency", eventType: "EMERGENCY" },
+    ],
+  },
+
+  BOOK_APPT_OPTIONS: {
+    message: "How would you like to search for a doctor?",
+    quickReplies: [
+      { label: "I know the doctor's name", eventType: "KNOW_DOCTOR_NAME" },
+      { label: "Search by specialty", eventType: "FIND_BY_SPECIALTY" },
+      { label: "I have symptoms", eventType: "HAVE_SYMPTOMS" },
+      { label: "Book a health checkup", eventType: "HEALTH_CHECKUP" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+  },
+
+  FIND_DOCTOR_OPTIONS: {
+    message: "How would you like to find a doctor?",
+    quickReplies: [
+      { label: "By specialty", eventType: "BY_SPECIALTY" },
+      { label: "By doctor name", eventType: "BY_DOCTOR_NAME" },
+      { label: "By symptoms", eventType: "BY_SYMPTOMS" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+  },
+
+  ENTER_DOCTOR_NAME: {
+    message: "Please enter the doctor's name.",
+    quickReplies: [{ label: "Back", eventType: "BACK_TO_MENU" }],
+    showInput: true,
+    inputPlaceholder: "e.g. Dr. Sharma or Dr. Priya Reddy",
+  },
+
+  PROCESS_DOCTOR_NAME: {
+    message: "Got it! Let me find that doctor for you.",
+    quickReplies: [],
+  },
+
+  SELECT_SPECIALTY: {
+    message: "Which specialty are you looking for? (We have 360+ specialties.)",
+    quickReplies: [
+      // Top specialties from CRM knowledge base
+      { label: "Cardiology", eventType: "SELECT_SPECIALTY", value: "Cardiology" },
+      { label: "Neurology", eventType: "SELECT_SPECIALTY", value: "Neurology" },
+      { label: "Orthopaedics", eventType: "SELECT_SPECIALTY", value: "Orthopaedics" },
+      { label: "Oncology", eventType: "SELECT_SPECIALTY", value: "Oncology" },
+      { label: "Gastroenterology", eventType: "SELECT_SPECIALTY", value: "Gastroenterology" },
+      { label: "Gynaecology", eventType: "SELECT_SPECIALTY", value: "Gynaecology" },
+      { label: "Paediatrics", eventType: "SELECT_SPECIALTY", value: "Paediatrics" },
+      { label: "ENT", eventType: "SELECT_SPECIALTY", value: "ENT" },
+      { label: "Dermatology", eventType: "SELECT_SPECIALTY", value: "Dermatology" },
+      { label: "Urology", eventType: "SELECT_SPECIALTY", value: "Urology" },
+    ],
+    showInput: true,
+    inputPlaceholder: `Type any specialty (${specialities.length} available)…`,
+  },
+
+  PROCESS_SPECIALTY: {
+    message: "Searching for doctors in that specialty…",
+    quickReplies: [],
+  },
+
+  ASK_BASIC_DETAILS: {
+    message: "Please describe your symptoms so I can suggest the right specialist.",
+    quickReplies: [
+      { label: "Chest pain / heart issues", eventType: "ENTER_SYMPTOM", value: "chest pain" },
+      { label: "Headache / neurological", eventType: "ENTER_SYMPTOM", value: "headache" },
+      { label: "Joint / bone pain", eventType: "ENTER_SYMPTOM", value: "joint pain" },
+      { label: "Skin issues", eventType: "ENTER_SYMPTOM", value: "skin rash" },
+      { label: "Stomach / digestion", eventType: "ENTER_SYMPTOM", value: "stomach pain" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+    showInput: true,
+    inputPlaceholder: "Describe your symptoms…",
+  },
+
+  SELECT_SYMPTOM_CATEGORY: {
+    message: "Which area best describes your concern?",
+    quickReplies: [
+      { label: "Heart & Chest", eventType: "SELECT_CATEGORY", value: "heart" },
+      { label: "Head & Brain", eventType: "SELECT_CATEGORY", value: "neuro" },
+      { label: "Bones & Joints", eventType: "SELECT_CATEGORY", value: "ortho" },
+      { label: "Skin", eventType: "SELECT_CATEGORY", value: "skin" },
+      { label: "Digestion", eventType: "SELECT_CATEGORY", value: "gastro" },
+      { label: "Women's Health", eventType: "SELECT_CATEGORY", value: "gynae" },
+      { label: "Children's Health", eventType: "SELECT_CATEGORY", value: "paeds" },
+    ],
+  },
+
+  PROCESS_SYMPTOM_CATEGORY: {
+    message: "Analysing your symptoms…",
+    quickReplies: [],
+  },
+
+  SELECT_SYMPTOM_DETAIL: {
+    message: "How severe are your symptoms?",
+    quickReplies: [
+      { label: "Mild – occasional discomfort", eventType: "SELECT_DETAIL", value: "mild" },
+      { label: "Moderate – affects daily life", eventType: "SELECT_DETAIL", value: "moderate" },
+      { label: "Severe – need urgent attention", eventType: "SELECT_DETAIL", value: "severe" },
+    ],
+  },
+
+  PROCESS_SYMPTOM_DETAIL: {
+    message: "Mapping your symptoms to the right specialist…",
+    quickReplies: [],
+  },
+
+  MAP_TO_SPECIALTY: {
+    message: "Finding the best specialist for you…",
+    quickReplies: [],
+  },
+
+  SHOW_SPECIALTY_RESULT: {
+    message:
+      "Based on your symptoms, I recommend seeing a specialist. Shall I show you available doctors?",
+    quickReplies: [
+      { label: "Yes, show doctors", eventType: "CONTINUE" },
+      { label: "Change my symptoms", eventType: "CHANGE_SPECIALTY" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+  },
+
+  ASK_CITY: {
+    message: "Which city are you in?",
+    quickReplies: [
+      // Top cities with Apollo hospitals (from knowledge base)
+      ...allCities.slice(0, 8).map(c => ({ label: c, eventType: "SELECT_CITY", value: c })),
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+    showInput: true,
+    inputPlaceholder: "Or type your city…",
+  },
+
+  ASK_BRANCH: {
+    message: "Which Apollo Hospital branch would you prefer?",
+    quickReplies: [{ label: "Back to menu", eventType: "BACK_TO_MENU" }],
+    showInput: true,
+    inputPlaceholder: "Type branch name…",
+  },
+
+  SHOW_DOCTORS: {
+    message:
+      "Here are the available doctors. Select a time slot to book your appointment.",
+    quickReplies: [
+      { label: "Book this slot", eventType: "SELECT_SLOT" },
+      { label: "Change search", eventType: "CHANGE_SEARCH" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+  },
+
+  DOCTOR_NOT_FOUND: {
+    message:
+      "Sorry, I couldn't find doctors matching your search. What would you like to do?",
+    quickReplies: [
+      { label: "Try another name", eventType: "RETRY_NAME" },
+      { label: "Search by specialty", eventType: "SEARCH_BY_SPECIALTY" },
+      { label: "Change city", eventType: "CHANGE_CITY" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+  },
+
+  SPECIALTY_NOT_FOUND: {
+    message:
+      "No doctors found for that specialty in your area. What would you like to do?",
+    quickReplies: [
+      { label: "Try another specialty", eventType: "RETRY_SPECIALTY" },
+      { label: "Change city", eventType: "CHANGE_CITY" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+  },
+
+  CONFIRM_BOOKING: {
+    message:
+      "Great! I have your appointment details. Shall I proceed to confirm the booking?",
+    quickReplies: [
+      { label: "Yes, continue", eventType: "CONTINUE" },
+      { label: "Cancel", eventType: "CANCEL" },
+    ],
+  },
+
+  ENTER_PHONE: {
+    message: "Please enter your mobile number to receive an OTP for confirmation.",
+    quickReplies: [{ label: "Go back", eventType: "EXIT_VERIFICATION" }],
+    showInput: true,
+    inputPlaceholder: "+91 XXXXX XXXXX",
+  },
+
+  VERIFY_OTP: {
+    message: "An OTP has been sent to your mobile. Please enter it to confirm your booking.",
+    quickReplies: [
+      { label: "OTP verified ✓ (simulate)", eventType: "OTP_SUCCESS" },
+      { label: "Go back", eventType: "EXIT_VERIFICATION" },
+    ],
+    showInput: true,
+    inputPlaceholder: "Enter OTP…",
+  },
+
+  BOOKING_SUCCESS: {
+    message:
+      "Your appointment has been confirmed! You will receive a confirmation SMS shortly.",
+    quickReplies: [{ label: "Back to main menu", eventType: "DONE" }],
+  },
+
+  HEALTH_CHECKUP_ENTRY: {
+    message: "For health checkup packages, please tell me your city.",
+    quickReplies: [
+      { label: "Hyderabad", eventType: "SELECT_CITY", value: "Hyderabad" },
+      { label: "Chennai", eventType: "SELECT_CITY", value: "Chennai" },
+      { label: "Bangalore", eventType: "SELECT_CITY", value: "Bangalore" },
+      { label: "Mumbai", eventType: "SELECT_CITY", value: "Mumbai" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+    showInput: true,
+    inputPlaceholder: "Or type your city…",
+  },
+
+  SHOW_PACKAGES: {
+    message:
+      "Here are the available health checkup packages in your city. Which one interests you?",
+    quickReplies: [
+      { label: "View package details", eventType: "VIEW_PACKAGE_DETAILS" },
+      { label: "Book a package", eventType: "ASK_TO_BOOK" },
+      { label: "Change city", eventType: "CHANGE_CITY" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+  },
+
+  REDIRECT_TO_WEBSITE: {
+    message:
+      "You will be redirected to the Apollo Hospitals website for full package details.",
+    quickReplies: [{ label: "Done, exit", eventType: "EXIT" }],
+  },
+
+  PROVIDE_CONTACT_NUMBER: {
+    message:
+      "To book a health checkup, please call our helpline: 1860-500-1066. Our team will assist you.",
+    quickReplies: [
+      { label: "Call now", eventType: "CALL" },
+      { label: "Back to menu", eventType: "DONE" },
+    ],
+  },
+
+  ASK_DETAILS: {
+    message:
+      "Welcome! For international patient services, please share your details — name, country, medical condition, and preferred dates.",
+    quickReplies: [
+      { label: "I'll provide all details", eventType: "ENTER_ALL_DETAILS" },
+      { label: "I'll provide some details now", eventType: "ENTER_PARTIAL_DETAILS" },
+      { label: "I'd prefer not to share", eventType: "REFUSE_DETAIL" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+    showInput: true,
+    inputPlaceholder: "Your name, country, condition…",
+  },
+
+  CHECK_MISSING_DETAILS: {
+    message: "Checking your submission for completeness…",
+    quickReplies: [
+      { label: "All fields are present", eventType: "ALL_FIELDS_PRESENT" },
+      { label: "Some fields are missing", eventType: "MISSING_FIELDS" },
+    ],
+  },
+
+  ASK_SPECIFIC_DETAIL: {
+    message: "Could you please provide the missing information?",
+    quickReplies: [
+      { label: "I'll provide it now", eventType: "PROVIDE_DETAIL" },
+      { label: "I'd prefer not to", eventType: "REFUSE_DETAIL" },
+    ],
+    showInput: true,
+    inputPlaceholder: "Enter the missing details…",
+  },
+
+  HANDLE_REFUSAL: {
+    message:
+      "That's perfectly fine. Would you like us to contact you instead?",
+    quickReplies: [
+      { label: "Show contact options", eventType: "SHOW_CONTACT_OPTION" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+  },
+
+  PROVIDE_CONTACT_DETAILS: {
+    message:
+      "Please contact our International Patient Services team:\n📞 +91-40-2360-7777\n✉ internationalpatients@apollohospitals.com",
+    quickReplies: [{ label: "Thank you", eventType: "DONE" }],
+  },
+
+  CONFIRM_SUBMISSION: {
+    message: "Please review your details. Shall I submit your request?",
+    quickReplies: [
+      { label: "Confirm & submit", eventType: "CONFIRM" },
+      { label: "Edit details", eventType: "EDIT_DETAILS" },
+      { label: "Cancel", eventType: "CANCEL" },
+    ],
+  },
+
+  SUBMIT_REQUEST: {
+    message: "Submitting your request…",
+    quickReplies: [
+      { label: "Request submitted ✓ (simulate)", eventType: "SUCCESS" },
+    ],
+  },
+
+  SUBMISSION_SUCCESS: {
+    message:
+      "Your request has been submitted! Our international patient services team will contact you within 24 hours.",
+    quickReplies: [{ label: "Back to main menu", eventType: "DONE" }],
+  },
+
+  SHOW_EMERGENCY_MESSAGE: {
+    message:
+      "⚠️ EMERGENCY — Please call Apollo Emergency immediately:\n🚨 1066 (toll-free)\n📞 040-2360-7777\n\nIf you are in immediate danger, call 112 (national emergency).",
+    quickReplies: [
+      { label: "Call Emergency now", eventType: "CALL_EMERGENCY" },
+      { label: "I'm okay, go to main menu", eventType: "CONTINUE" },
+      { label: "End conversation", eventType: "END_CONVERSATION" },
+    ],
+  },
+
+  FALLBACK: {
+    message:
+      "I'm sorry, I didn't understand that. Let me take you back to the main menu.",
+    quickReplies: [{ label: "OK, go to main menu", eventType: "RETRY" }],
+  },
+
+  END: {
+    message: "Thank you for using Apollo Assist. Take care and stay healthy! 💙",
+    quickReplies: [],
+  },
+};
+
+export type ChatContext = Record<string, string | undefined>;
+
+/**
+ * Returns the bot response for a given state.
+ * Pass `ctx` (machine context) so dynamic states can show real data.
+ */
+export function getStateResponse(state: string, ctx?: ChatContext): StateResponse {
+  // ── Dynamic: SHOW_PACKAGES ────────────────────────────────────────────
+  if (state === "SHOW_PACKAGES") {
+    const city = ctx?.city ?? "";
+    const packages = getPackagesForCity(city);
+
+    if (packages.length > 0) {
+      const list = packages
+        .map((p) => `• ${p.name} — ${p.description}`)
+        .join("\n");
+      const pkgReplies: QuickReply[] = packages.map((p) => ({
+        label: p.name,
+        eventType: "VIEW_PACKAGE_DETAILS",
+        value: p.url,
+      }));
+      return {
+        message: `Here are the Apollo health checkup packages available in ${city}:\n\n${list}\n\nWhich one would you like to know more about?`,
+        quickReplies: [
+          ...pkgReplies,
+          { label: "Change city", eventType: "CHANGE_CITY" },
+          { label: "Back to menu", eventType: "BACK_TO_MENU" },
+        ],
+      };
+    }
+
+    // city not in knowledge base (Delhi etc.)
+    return {
+      message: `We currently have detailed packages for Chennai, Hyderabad, Bangalore, and Mumbai. Please select one of these cities or call 1860-500-1066 for packages in ${city || "your city"}.`,
+      quickReplies: [
+        { label: "Chennai", eventType: "SELECT_CITY", value: "Chennai" },
+        { label: "Hyderabad", eventType: "SELECT_CITY", value: "Hyderabad" },
+        { label: "Bangalore", eventType: "SELECT_CITY", value: "Bangalore" },
+        { label: "Mumbai", eventType: "SELECT_CITY", value: "Mumbai" },
+        { label: "Back to menu", eventType: "BACK_TO_MENU" },
+      ],
+    };
+  }
+
+  // ── Dynamic: ASK_BRANCH — branches from knowledge base for selected city ────
+  if (state === "ASK_BRANCH") {
+    const city = ctx?.city ?? "";
+    const hospitals = city ? getHospitalsForCity(city) : [];
+    if (hospitals.length > 0) {
+      return {
+        message: `Which Apollo Hospital in ${city} would you prefer?`,
+        quickReplies: [
+          ...hospitals.map((h) => ({
+            label: h.name,
+            eventType: "SELECT_BRANCH",
+            value: h.name,
+          })),
+          { label: "Back to menu", eventType: "BACK_TO_MENU" },
+        ],
+        showInput: true,
+        inputPlaceholder: "Or type branch name…",
+      };
+    }
+    return {
+      message: city
+        ? `Please type the Apollo Hospital branch in ${city} you prefer, or call 1860-500-1066 for assistance.`
+        : "Which Apollo Hospital branch would you prefer?",
+      quickReplies: [{ label: "Back to menu", eventType: "BACK_TO_MENU" }],
+      showInput: true,
+      inputPlaceholder: "Type branch name…",
+    };
+  }
+
+  // ── Dynamic: SHOW_SPECIALTY_RESULT — show matched specialty from ctx ────────
+  if (state === "SHOW_SPECIALTY_RESULT") {
+    const specialty = ctx?.specialty;
+    return {
+      message: specialty
+        ? `Based on your symptoms, I recommend a ${specialty} specialist. Shall I find available doctors near you?`
+        : "Based on your symptoms, I recommend seeing a specialist. Shall I show you available doctors?",
+      quickReplies: [
+        { label: "Yes, find doctors", eventType: "CONTINUE" },
+        { label: "Change symptoms", eventType: "CHANGE_SPECIALTY" },
+        { label: "Back to menu", eventType: "BACK_TO_MENU" },
+      ],
+    };
+  }
+
+  // ── Dynamic: PROCESS_DOCTOR_NAME — search doctors from Master Data xlsx ──────
+  if (state === "PROCESS_DOCTOR_NAME") {
+    const name = ctx?.doctorName ?? "";
+    const matches = name ? getDoctorsByName(name) : [];
+    if (matches.length > 0) {
+      const list = matches.map(d => `• ${d.name} (ID: ${d.id})`).join("\n");
+      return {
+        message: `Found ${matches.length} Apollo doctor(s) matching "${name}":\n\n${list}\n\nTo book an appointment, please select your city next.`,
+        quickReplies: [
+          { label: "Continue to city selection", eventType: "AUTO" },
+          { label: "Try different name", eventType: "RETRY_NAME" },
+          { label: "Back to menu", eventType: "BACK_TO_MENU" },
+        ],
+      };
+    }
+    return {
+      message: `No doctors found matching "${name}" in our directory of 17,000+ Apollo doctors. Try a different spelling or search by specialty instead.`,
+      quickReplies: [
+        { label: "Search by specialty", eventType: "SEARCH_BY_SPECIALTY" },
+        { label: "Try again", eventType: "RETRY_NAME" },
+        { label: "Back to menu", eventType: "BACK_TO_MENU" },
+      ],
+    };
+  }
+
+  // ── Dynamic: SHOW_DOCTORS — real doctor search deep-link ─────────────────────
+  if (state === "SHOW_DOCTORS") {
+    const specialty = ctx?.specialty ?? "";
+    const branch = ctx?.branch ?? "";
+    const city = ctx?.city ?? "";
+    const doctorName = ctx?.doctorName ?? "";
+    const location = branch ? `${branch}${city ? ", " + city : ""}` : city;
+
+    // Build Apollo doctor search URL with specialty + city filter
+    const searchUrl = buildDoctorSearchUrl(specialty, city);
+
+    // If searching by name, also show matching doctors
+    const nameMatches = doctorName ? getDoctorsByName(doctorName) : [];
+    let msg = "";
+    if (nameMatches.length > 0) {
+      const list = nameMatches.map(d => `• ${d.name}`).join("\n");
+      msg = `Apollo doctors matching "${doctorName}"${location ? ` at ${location}` : ""}:\n\n${list}\n\nBook online:\n${searchUrl}\nOr call 1860-500-1066`;
+    } else {
+      msg = `Apollo ${specialty || "doctors"}${location ? ` at ${location}` : ""} — book online:\n\n${searchUrl}\n\nOr call our helpline: 1860-500-1066`;
+    }
+
+    return {
+      message: msg,
+      quickReplies: [
+        { label: "Proceed to book", eventType: "SELECT_SLOT" },
+        { label: "Change search", eventType: "CHANGE_SEARCH" },
+        { label: "Back to menu", eventType: "BACK_TO_MENU" },
+      ],
+    };
+  }
+
+  // ── Dynamic: REDIRECT_TO_WEBSITE — show actual package URL ──────────────────
+  if (state === "REDIRECT_TO_WEBSITE") {
+    const url = ctx?.packageUrl;
+    return {
+      message: url
+        ? `Book this package directly on Apollo's website:\n\n${url}`
+        : `Visit Apollo ProHealth to view full package details and book:\nhttps://prohealth.apollohospitals.com`,
+      quickReplies: [{ label: "Done, back to menu", eventType: "EXIT" }],
+    };
+  }
+
+  // ── Dynamic: CONFIRM_BOOKING — show booking summary from ctx ────────────────
+  if (state === "CONFIRM_BOOKING") {
+    const specialty = ctx?.specialty ?? "";
+    const doctorName = ctx?.doctorName ?? "";
+    const branch = ctx?.branch ?? "";
+    const city = ctx?.city ?? "";
+    const who = doctorName || (specialty ? `a ${specialty} specialist` : "your doctor");
+    const where = branch ? `${branch}${city ? ", " + city : ""}` : city;
+    return {
+      message: `You’re booking an appointment with ${who}${where ? ` at ${where}` : ""}. Shall I proceed to confirm?`,
+      quickReplies: [
+        { label: "Yes, confirm", eventType: "CONTINUE" },
+        { label: "Cancel", eventType: "CANCEL" },
+      ],
+    };
+  }
+
+  // ── Static lookup ─────────────────────────────────────────────────────
+  return (
+    responses[state] ?? {
+      message: `(State: ${state}) — processing…`,
+      quickReplies: [{ label: "Back to menu", eventType: "BACK_TO_MENU" }],
+    }
+  );
+}

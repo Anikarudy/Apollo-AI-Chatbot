@@ -1,0 +1,16 @@
+/* Apollo Assist Chat Widget – global styles
+   Deployed as a standalone page; embedded via <iframe> by the Apollo website team. */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: "Inter", sans-serif;
+  background: transparent;
+}
+
+#root {
+  width: 100%;
+  height: 100%;
+}
