@@ -4,7 +4,7 @@
  * Buttons carry the exact event type to send to the machine.
  */
 
-import { allCities, specialities, contacts, getHospitalsForCity, getPackagesForCity, getDoctorsByName, buildDoctorSearchUrl, mapSymptomToSpecialty } from "./knowledgeBase";
+import { allCities, specialities, contacts, getSubBranchesForCity, getDoctorsForLocation, getPackagesForCity, getDoctorsByName, buildDoctorSearchUrl, mapSymptomToSpecialty } from "./knowledgeBase";
 
 export { mapSymptomToSpecialty };
 
@@ -473,18 +473,18 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
     };
   }
 
-  // ── Dynamic: ASK_BRANCH — branches from knowledge base for selected city ────
+  // ── Dynamic: ASK_BRANCH — sub-branches from new doctor mapping ────────────
   if (state === "ASK_BRANCH") {
     const city = ctx?.city ?? "";
-    const hospitals = city ? getHospitalsForCity(city) : [];
-    if (hospitals.length > 0) {
+    const branches = city ? getSubBranchesForCity(city) : [];
+    if (branches.length > 0) {
       return {
-        message: `Which Apollo Hospital in ${city} would you prefer?`,
+        message: `Which Apollo Hospital branch in ${city} would you prefer?`,
         quickReplies: [
-          ...hospitals.map((h) => ({
-            label: h.name,
+          ...branches.map((b) => ({
+            label: b,
             eventType: "SELECT_BRANCH",
-            value: h.name,
+            value: b,
           })),
           { label: "Back to menu", eventType: "BACK_TO_MENU" },
         ],
@@ -504,15 +504,15 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
 
   if (state === "ASK_BRANCH_FOR_LOCATION") {
     const city = ctx?.city ?? "";
-    const hospitals = city ? getHospitalsForCity(city) : [];
-    if (hospitals.length > 0) {
+    const branches = city ? getSubBranchesForCity(city) : [];
+    if (branches.length > 0) {
       return {
         message: `Which Apollo Hospital branch in ${city} would you like to visit?`,
         quickReplies: [
-          ...hospitals.map((h) => ({
-            label: h.name,
+          ...branches.map((b) => ({
+            label: b,
             eventType: "SELECT_BRANCH",
-            value: h.name,
+            value: b,
           })),
           { label: "Change city", eventType: "CHANGE_CITY" },
           { label: "Back to menu", eventType: "BACK_TO_MENU" },
@@ -568,12 +568,15 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
     };
   }
 
-  // ── Dynamic: PROCESS_DOCTOR_NAME — search doctors from Master Data xlsx ──────
+  // ── Dynamic: PROCESS_DOCTOR_NAME — search doctors from new mapping ──────────
   if (state === "PROCESS_DOCTOR_NAME") {
     const name = ctx?.doctorName ?? "";
     const matches = name ? getDoctorsByName(name) : [];
     if (matches.length > 0) {
-      const list = matches.map(d => `• ${d.name} (ID: ${d.id})`).join("\n");
+      const list = matches.map(d => {
+        const loc = d.branch ? `${d.branch}, ${d.location}` : d.location;
+        return `• ${d.name} — ${d.speciality} (${loc})`;
+      }).join("\n");
       return {
         message: `Found ${matches.length} Apollo doctor(s) matching "${name}":\n\n${list}\n\nTo book an appointment, please select your city next.`,
         quickReplies: [
@@ -584,7 +587,7 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
       };
     }
     return {
-      message: `No doctors found matching "${name}" in our directory of 17,000+ Apollo doctors. Try a different spelling or search by specialty instead.`,
+      message: `No doctors found matching "${name}" in our directory of 6,900+ Apollo doctors. Try a different spelling or search by specialty instead.`,
       quickReplies: [
         { label: "Search by specialty", eventType: "SEARCH_BY_SPECIALTY" },
         { label: "Try again", eventType: "RETRY_NAME" },
@@ -624,32 +627,38 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
     };
   }
 
-  // ── Dynamic: SHOW_DOCTORS — real doctor search deep-link ─────────────────────
+  // ── Dynamic: SHOW_DOCTORS — serve from local mapping, link to Apollo website ──
   if (state === "SHOW_DOCTORS") {
     const specialty = ctx?.specialty ?? "";
     const branch = ctx?.branch ?? "";
     const city = ctx?.city ?? "";
     const doctorName = ctx?.doctorName ?? "";
-    const location = branch ? `${branch}${city ? ", " + city : ""}` : city;
+    const location = branch ? `${branch}, ${city}` : city;
 
-    // Build Apollo doctor search URL with branch preferred over city for location scoping
     const searchUrl = buildDoctorSearchUrl(specialty, city, branch);
 
-    // If searching by name, also show matching doctors
+    // Count available doctors for the heading
+    const localDocs = (city || branch)
+      ? getDoctorsForLocation(city, branch || undefined, specialty || undefined)
+      : [];
     const nameMatches = doctorName ? getDoctorsByName(doctorName) : [];
+    const count = nameMatches.length > 0 ? nameMatches.length : localDocs.length;
+
     let msg = "";
-    if (nameMatches.length > 0) {
-      const list = nameMatches.map(d => `• ${d.name}`).join("\n");
-      msg = `Apollo doctors matching "${doctorName}"${location ? ` at ${location}` : ""}:\n\n${list}\n\nShowing results for selected location${location ? `: ${location}` : ""}.\n\nBook online:\n${searchUrl}\nOr call 1860-500-1066`;
+    if (location || specialty || doctorName) {
+      const filterParts: string[] = [];
+      if (location) filterParts.push(`📍 ${location}`);
+      if (specialty) filterParts.push(`🩺 ${specialty}`);
+      if (doctorName) filterParts.push(`👨‍⚕️ ${doctorName}`);
+      msg = `Showing ${count > 0 ? `${Math.min(count, 6)} of ${count}` : ""} available doctors${filterParts.length ? ` for ${filterParts.join(" · ")}` : ""}.\n\nSelect a time slot below to book, or refine your search.\n\nBook online: ${searchUrl}`;
     } else {
-      msg = `Apollo ${specialty || "doctors"}${location ? ` at ${location}` : ""} — showing results for selected location.\n\nBook online:\n${searchUrl}\n\nOr call our helpline: 1860-500-1066`;
+      msg = `Here are the available Apollo doctors. Select a time slot to book your appointment.\n\nBook online: ${searchUrl}`;
     }
 
     return {
       message: msg,
       quickReplies: [
-        { label: "Proceed to book", eventType: "SELECT_SLOT" },
-        { label: "Change search", eventType: "CHANGE_SEARCH" },
+        { label: "Filter by specialty", eventType: "CHANGE_SEARCH" },
         { label: "Back to menu", eventType: "BACK_TO_MENU" },
       ],
     };

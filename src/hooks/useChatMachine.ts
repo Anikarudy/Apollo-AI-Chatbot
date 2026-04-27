@@ -15,6 +15,13 @@ export interface ChatMessage {
   text: string;
 }
 
+export interface DoctorCardData {
+  name: string;
+  specialty?: string;
+  hospital: string;
+  profileUrl?: string;
+}
+
 let msgId = 0;
 const nextId = () => ++msgId;
 
@@ -24,6 +31,7 @@ export function useChatMachine() {
   const [currentState, setCurrentState] = useState<string>("WELCOME");
   const [machineCtx, setMachineCtx] = useState<ChatContext>({});
   const [isLlmLoading, setIsLlmLoading] = useState(false);
+  const [doctorCards, setDoctorCards] = useState<DoctorCardData[]>([]);
 
   // Initialize runner once and push the opening welcome message
   useEffect(() => {
@@ -47,6 +55,61 @@ export function useChatMachine() {
       { id: nextId(), sender: "bot", text: resp.message },
     ]);
   }, []);
+
+  // Fetch scraped doctor names from Apollo website when showing doctor results
+  useEffect(() => {
+    if (currentState !== "SHOW_DOCTORS") {
+      setDoctorCards([]);
+      return;
+    }
+
+    const hospital = machineCtx.branch
+      ? `${machineCtx.branch}${machineCtx.city ? `, ${machineCtx.city}` : ""}`
+      : machineCtx.city
+      ? `Apollo Hospitals, ${machineCtx.city}`
+      : "Selected Apollo location";
+
+    const fallbackName = machineCtx.doctorName ?? (machineCtx.specialty ? `${machineCtx.specialty} specialist` : "Apollo doctor");
+
+    const controller = new AbortController();
+
+    const loadDoctors = async () => {
+      try {
+        const params = new URLSearchParams();
+        if (machineCtx.specialty) params.set("specialty", machineCtx.specialty);
+        if (machineCtx.city) params.set("city", machineCtx.city);
+        if (machineCtx.branch) params.set("branch", machineCtx.branch);
+
+        const res = await fetch(`/api/doctors?${params.toString()}`, {
+          signal: controller.signal,
+        });
+
+        if (!res.ok) throw new Error("doctor scrape failed");
+        const data = (await res.json()) as {
+          doctors?: Array<{ name: string; profileUrl?: string }>;
+        };
+
+        const cards = (data.doctors ?? []).slice(0, 6).map((d) => ({
+          name: d.name,
+          specialty: machineCtx.specialty,
+          hospital,
+          profileUrl: d.profileUrl,
+        }));
+
+        setDoctorCards(
+          cards.length > 0
+            ? cards
+            : [{ name: fallbackName, specialty: machineCtx.specialty, hospital }]
+        );
+      } catch {
+        setDoctorCards([{ name: fallbackName, specialty: machineCtx.specialty, hospital }]);
+      }
+    };
+
+    void loadDoctors();
+
+    return () => controller.abort();
+  }, [currentState, machineCtx.branch, machineCtx.city, machineCtx.doctorName, machineCtx.specialty]);
 
   // LLM response — only called when the user types a free-text message
   const pushLlmBotMessage = useCallback(async (state: string, ctx: Record<string, unknown>, userMessage: string) => {
@@ -136,6 +199,7 @@ export function useChatMachine() {
     currentState,
     machineCtx,
     isLlmLoading,
+    doctorCards,
     sendUserText,
     sendQuickReply,
   };

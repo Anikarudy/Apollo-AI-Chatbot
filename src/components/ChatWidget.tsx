@@ -4,11 +4,11 @@ import { useChatMachine } from "../hooks/useChatMachine";
 import { getStateResponse } from "../stateResponses";
 
 const ChatWidget: React.FC = () => {
-  const { messages, currentState, machineCtx, isLlmLoading, sendUserText, sendQuickReply } =
+  const { messages, currentState, machineCtx, isLlmLoading, doctorCards, sendUserText, sendQuickReply } =
     useChatMachine();
   const [inputText, setInputText] = useState("");
-  const [selectedDayIndex, setSelectedDayIndex] = useState(0);
-  const [selectedSlot, setSelectedSlot] = useState<string | null>(null);
+  const [selectedDayIndexByDoctor, setSelectedDayIndexByDoctor] = useState<Record<string, number>>({});
+  const [selectedSlotByDoctor, setSelectedSlotByDoctor] = useState<Record<string, string | null>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const slotDays = [
@@ -17,20 +17,6 @@ const ChatWidget: React.FC = () => {
     { label: "WED", date: "06", slots: [] as string[] },
   ];
 
-  const doctorCard = {
-    name:
-      machineCtx.doctorName ??
-      (machineCtx.specialty ? `${machineCtx.specialty} specialist` : "Apollo doctor"),
-    specialty: machineCtx.specialty,
-    experience: undefined as string | undefined,
-    hospital: machineCtx.branch
-      ? `${machineCtx.branch}${machineCtx.city ? `, ${machineCtx.city}` : ""}`
-      : machineCtx.city
-      ? `Apollo Hospitals, ${machineCtx.city}`
-      : "Selected Apollo location",
-    languages: undefined as string | undefined,
-  };
-
   // Auto-scroll to bottom
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -38,9 +24,9 @@ const ChatWidget: React.FC = () => {
 
   useEffect(() => {
     if (currentState !== "SHOW_DOCTORS") return;
-    setSelectedDayIndex(0);
-    setSelectedSlot(null);
-  }, [currentState]);
+    setSelectedDayIndexByDoctor({});
+    setSelectedSlotByDoctor({});
+  }, [currentState, doctorCards.length]);
 
   const stateResp = getStateResponse(currentState, machineCtx);
 
@@ -125,92 +111,99 @@ const ChatWidget: React.FC = () => {
         {/* Rich appointment booking card for doctor results */}
         {currentState === "SHOW_DOCTORS" && !isLlmLoading && (
           <div className="appt-card-wrap" aria-live="polite">
-            <article className="appt-card">
-              <div className="appt-top">
-                <div className="appt-avatar" aria-hidden="true">👩‍⚕️</div>
-                <div className="appt-headline">
-                  <h4>{doctorCard.name}</h4>
-                  <button className="appt-view-profile" type="button">View profile</button>
-                  {(doctorCard.specialty || doctorCard.experience) && (
-                    <p>
-                      {[doctorCard.specialty, doctorCard.experience].filter(Boolean).join(" • ")}
-                    </p>
-                  )}
-                </div>
-              </div>
+            {doctorCards.map((doctor, idx) => {
+              const doctorKey = `${doctor.name}-${idx}`;
+              const selectedDayIndex = selectedDayIndexByDoctor[doctorKey] ?? 0;
+              const selectedSlot = selectedSlotByDoctor[doctorKey] ?? null;
 
-              <div className="appt-meta">
-                {doctorCard.languages && <p>🗣 {doctorCard.languages}</p>}
-                <p>🏥 {doctorCard.hospital}</p>
-              </div>
+              return (
+                <article className="appt-card" key={doctorKey}>
+                  <div className="appt-top">
+                    <div className="appt-avatar" aria-hidden="true">👩‍⚕️</div>
+                    <div className="appt-headline">
+                      <h4>{doctor.name}</h4>
+                      {doctor.profileUrl ? (
+                        <a className="appt-view-profile" href={doctor.profileUrl} target="_blank" rel="noopener noreferrer">View profile</a>
+                      ) : (
+                        <span className="appt-view-profile muted">Profile unavailable</span>
+                      )}
+                      {doctor.specialty && <p>{doctor.specialty}</p>}
+                    </div>
+                  </div>
 
-              <div className="appt-day-tabs" role="tablist" aria-label="Choose a day">
-                {slotDays.map((day, idx) => (
+                  <div className="appt-meta">
+                    <p>🏥 {doctor.hospital}</p>
+                  </div>
+
+                  <div className="appt-day-tabs" role="tablist" aria-label={`Choose a day for ${doctor.name}`}>
+                    {slotDays.map((day, dayIdx) => (
+                      <button
+                        key={`${doctorKey}-${day.label}-${day.date}`}
+                        type="button"
+                        className={`appt-day-btn ${selectedDayIndex === dayIdx ? "active" : ""}`}
+                        onClick={() => {
+                          setSelectedDayIndexByDoctor((prev) => ({ ...prev, [doctorKey]: dayIdx }));
+                          setSelectedSlotByDoctor((prev) => ({ ...prev, [doctorKey]: null }));
+                        }}
+                      >
+                        <span>{day.label}</span>
+                        <strong>{day.date}</strong>
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="appt-slots" role="group" aria-label={`Available slots for ${doctor.name}`}>
+                    {slotDays[selectedDayIndex].slots.length > 0 ? (
+                      slotDays[selectedDayIndex].slots.map((slot) => (
+                        <button
+                          key={`${doctorKey}-${slot}`}
+                          type="button"
+                          className={`appt-slot-btn ${selectedSlot === slot ? "selected" : ""}`}
+                          onClick={() => setSelectedSlotByDoctor((prev) => ({ ...prev, [doctorKey]: slot }))}
+                        >
+                          {slot}
+                        </button>
+                      ))
+                    ) : (
+                      <p className="appt-no-slots">No slots available for this day.</p>
+                    )}
+                  </div>
+
                   <button
-                    key={`${day.label}-${day.date}`}
                     type="button"
-                    className={`appt-day-btn ${selectedDayIndex === idx ? "active" : ""}`}
+                    className="appt-book-btn"
+                    disabled={!selectedSlot}
                     onClick={() => {
-                      setSelectedDayIndex(idx);
-                      setSelectedSlot(null);
+                      if (!selectedSlot) return;
+                      const day = slotDays[selectedDayIndex];
+                      void sendQuickReply(
+                        `Book ${doctor.name} (${day.label} ${day.date} • ${selectedSlot})`,
+                        "SELECT_SLOT"
+                      );
                     }}
                   >
-                    <span>{day.label}</span>
-                    <strong>{day.date}</strong>
+                    Book appointment
                   </button>
-                ))}
-              </div>
 
-              <div className="appt-slots" role="group" aria-label="Available slots">
-                {slotDays[selectedDayIndex].slots.length > 0 ? (
-                  slotDays[selectedDayIndex].slots.map((slot) => (
+                  <div className="appt-secondary-actions">
                     <button
-                      key={slot}
                       type="button"
-                      className={`appt-slot-btn ${selectedSlot === slot ? "selected" : ""}`}
-                      onClick={() => setSelectedSlot(slot)}
+                      className="appt-secondary-btn"
+                      onClick={() => void sendQuickReply("Change search", "CHANGE_SEARCH")}
                     >
-                      {slot}
+                      Change search
                     </button>
-                  ))
-                ) : (
-                  <p className="appt-no-slots">No slots available for this day.</p>
-                )}
-              </div>
-
-              <button
-                type="button"
-                className="appt-book-btn"
-                disabled={!selectedSlot}
-                onClick={() => {
-                  if (!selectedSlot) return;
-                  const day = slotDays[selectedDayIndex];
-                  void sendQuickReply(
-                    `Book ${doctorCard.name} (${day.label} ${day.date} • ${selectedSlot})`,
-                    "SELECT_SLOT"
-                  );
-                }}
-              >
-                Book appointment
-              </button>
-
-              <div className="appt-secondary-actions">
-                <button
-                  type="button"
-                  className="appt-secondary-btn"
-                  onClick={() => void sendQuickReply("Change search", "CHANGE_SEARCH")}
-                >
-                  Change search
-                </button>
-                <button
-                  type="button"
-                  className="appt-secondary-btn"
-                  onClick={() => void sendQuickReply("Back to menu", "BACK_TO_MENU")}
-                >
-                  Back to menu
-                </button>
-              </div>
-            </article>
+                    <button
+                      type="button"
+                      className="appt-secondary-btn"
+                      onClick={() => void sendQuickReply("Back to menu", "BACK_TO_MENU")}
+                    >
+                      Back to menu
+                    </button>
+                  </div>
+                </article>
+              );
+            })}
           </div>
         )}
 

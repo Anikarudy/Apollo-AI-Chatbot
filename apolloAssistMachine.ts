@@ -479,7 +479,7 @@ export const apolloMachine = createMachine(
       ASK_BRANCH_FOR_LOCATION: {
         on: {
           SELECT_BRANCH: {
-            target: "BOOK_APPT_OPTIONS_LOCATION",
+            target: "SEARCH_DOCTORS_BY_CRITERIA",
             actions: assign({ branch: ({ event }) => event.value }),
           },
           CHANGE_CITY: "ASK_CITY_FOR_LOCATION",

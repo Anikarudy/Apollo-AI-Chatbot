@@ -324,6 +324,13 @@
   font-weight: 600;
   padding: 0;
   cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+}
+
+.appt-view-profile.muted {
+  color: #6e8aa3;
+  cursor: default;
 }
 
 .appt-meta {
