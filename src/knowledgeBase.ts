@@ -209,12 +209,13 @@ export function getDoctorsByName(query: string, limit = 8): Doctor[] {
   return doctors.filter(d => d.name.toLowerCase().includes(q)).slice(0, limit);
 }
 
-/** Build an Apollo website doctor search URL for a specialty + city */
-export function buildDoctorSearchUrl(specialty: string, city?: string): string {
+/** Build an Apollo website doctor search URL for a specialty + location (branch preferred, else city) */
+export function buildDoctorSearchUrl(specialty: string, city?: string, branch?: string): string {
   const base = "https://www.apollohospitals.com/doctors/";
   const params = new URLSearchParams();
   if (specialty) params.set("speciality", specialty.toUpperCase());
-  if (city) params.set("location", city);
+  const location = (branch && branch.trim()) || city;
+  if (location) params.set("location", location);
   const qs = params.toString();
   return qs ? `${base}?${qs}` : base;
 }

@@ -67,7 +67,18 @@ const ChatWidget: React.FC = () => {
                 👩‍⚕️
               </div>
             )}
-            <div className={`chat-bubble ${msg.sender}`}>{msg.text}</div>
+            <div className={`chat-bubble ${msg.sender}`}>
+              {/* Convert URLs in message to clickable links */}
+              {msg.text.split(/(\bhttps?:\/\/[^\s]+)/g).map((part, i) =>
+                /^https?:\/\//.test(part) ? (
+                  <a key={i} href={part} target="_blank" rel="noopener noreferrer" className="message-link">
+                    {part}
+                  </a>
+                ) : (
+                  <span key={i}>{part}</span>
+                )
+              )}
+            </div>
           </div>
         ))}
 

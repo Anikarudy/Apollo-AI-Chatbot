@@ -5,7 +5,8 @@
  */
 
 import { useState, useRef, useCallback, useEffect } from "react";
-import { ApolloAssistRunner, mapInputToEvent, AppEvent } from "../../apolloAssistMachine";
+import { ApolloAssistRunner } from "../../apolloAssistMachine";
+import { mapInputToEvent, AppEvent } from "../inputMapping.js";
 import { getStateResponse, ChatContext } from "../stateResponses";
 
 export interface ChatMessage {

@@ -7,276 +7,10 @@
 
 import { createMachine, createActor, assign } from "xstate";
 import { allCities, mapSymptomToSpecialty } from "./src/knowledgeBase";
+import { AppEvent, mapInputToEvent } from "./src/inputMapping.js";
 
 // ─────────────────────────────────────────────────────────────
-// 1. INPUT MAPPING  (text → event)
-// ─────────────────────────────────────────────────────────────
-
-export type AppEvent =
-  | { type: "START" }
-  | { type: "BOOK_APPOINTMENT" }
-  | { type: "FIND_DOCTOR" }
-  | { type: "HEALTH_CHECKUP" }
-  | { type: "INTERNATIONAL_SERVICES" }
-  | { type: "EMERGENCY" }
-  | { type: "KNOW_DOCTOR_NAME" }
-  | { type: "FIND_BY_SPECIALTY" }
-  | { type: "HAVE_SYMPTOMS" }
-  | { type: "ENTER_NAME"; value: string }
-  | { type: "ENTER_SYMPTOM"; value: string }
-  | { type: "SELECT_SPECIALTY"; value: string }
-  | { type: "ENTER_SPECIALTY"; value: string }
-  | { type: "SELECT_CATEGORY"; value: string }
-  | { type: "ENTER_SYMPTOM_TEXT"; value: string }
-  | { type: "SELECT_DETAIL"; value: string }
-  | { type: "AUTO" }
-  | { type: "ENTER_CITY"; value: string }
-  | { type: "SELECT_CITY"; value: string }
-  | { type: "SELECT_BRANCH"; value: string }
-  | { type: "FOUND" }
-  | { type: "NOT_FOUND" }
-  | { type: "SELECT_SLOT" }
-  | { type: "CHANGE_SEARCH" }
-  | { type: "CHANGE_SPECIALTY" }
-  | { type: "RETRY_NAME" }
-  | { type: "RETRY_SPECIALTY" }
-  | { type: "SEARCH_BY_SPECIALTY" }
-  | { type: "CHANGE_CITY" }
-  | { type: "CONTINUE" }
-  | { type: "ENTER_PHONE"; value: string }
-  | { type: "EXIT_VERIFICATION" }
-  | { type: "OTP_SUCCESS" }
-  | { type: "DONE" }
-  | { type: "BY_SPECIALTY" }
-  | { type: "BY_DOCTOR_NAME" }
-  | { type: "BY_SYMPTOMS" }
-  | { type: "VIEW_PACKAGE_DETAILS"; value?: string }
-  | { type: "ASK_TO_BOOK" }
-  | { type: "EXIT" }
-  | { type: "CALL" }
-  | { type: "ENTER_PARTIAL_DETAILS" }
-  | { type: "ENTER_ALL_DETAILS" }
-  | { type: "REFUSE_DETAIL" }
-  | { type: "MISSING_FIELDS" }
-  | { type: "ALL_FIELDS_PRESENT" }
-  | { type: "PROVIDE_DETAIL" }
-  | { type: "SHOW_CONTACT_OPTION" }
-  | { type: "CONFIRM" }
-  | { type: "EDIT_DETAILS" }
-  | { type: "CANCEL" }
-  | { type: "SUCCESS" }
-  | { type: "CALL_EMERGENCY" }
-  | { type: "END_CONVERSATION" }
-  | { type: "RETRY" }
-  | { type: "BACK_TO_MENU" }
-  | { type: "UNKNOWN" };
-
-/**
- * mapInputToEvent
- * Converts a raw user text string into a typed AppEvent.
- * Uses simple keyword detection – extend the arrays freely.
- */
-export function mapInputToEvent(message: string, currentState?: string): AppEvent {
-  const text = message.toLowerCase().trim();
-  const state = (currentState ?? "").toUpperCase();
-
-  if (!text) return { type: "UNKNOWN" };
-
-  // ── Greetings / Start ──────────────────────────────────────
-  const greetings = ["hi", "hello", "hey", "start", "begin", "help"];
-  if (greetings.some((k) => text.includes(k))) return { type: "START" };
-
-  // ── Emergency ─────────────────────────────────────────────
-  const emergency = [
-    "emergency",
-    "ambulance",
-    "urgent",
-    "critical",
-    "heart attack",
-    "stroke",
-    "unconscious",
-    "not breathing",
-  ];
-  if (emergency.some((k) => text.includes(k))) return { type: "EMERGENCY" };
-
-  // ── Book appointment ──────────────────────────────────────
-  const bookAppt = [
-    "book",
-    "appointment",
-    "schedule",
-    "consultation",
-    "consult",
-    "need a doctor",
-    "want a doctor",
-    "see a doctor",
-    "meet doctor",
-    "get appointment",
-  ];
-  if (bookAppt.some((k) => text.includes(k)))
-    return { type: "BOOK_APPOINTMENT" };
-
-  // ── Find doctor ───────────────────────────────────────────
-  const findDoc = [
-    "find doctor",
-    "find a doctor",
-    "search doctor",
-    "look for doctor",
-    "doctor list",
-  ];
-  if (findDoc.some((k) => text.includes(k))) return { type: "FIND_DOCTOR" };
-
-  // ── Health checkup / packages ─────────────────────────────
-  const checkup = [
-    "health checkup",
-    "health check",
-    "health package",
-    "lab test",
-    "screening",
-    "full body",
-    "diagnostic",
-    "blood test",
-  ];
-  if (checkup.some((k) => text.includes(k)))
-    return { type: "HEALTH_CHECKUP" };
-
-  // ── International patients ────────────────────────────────
-  const intl = [
-    "international",
-    "travelling",
-    "traveling",
-    "visa",
-    "medical tourism",
-    "foreign patient",
-    "coming from abroad",
-  ];
-  if (intl.some((k) => text.includes(k)))
-    return { type: "INTERNATIONAL_SERVICES" };
-
-  // ── Symptom input ─────────────────────────────────────────
-  // Must come BEFORE doctor-name check (avoids "Dr" false-pos on "I have fever")
-  const symptomPhrases = [
-    "i have",
-    "i feel",
-    "i am feeling",
-    "suffering from",
-    "experiencing",
-    "symptom",
-    "pain",
-    "fever",
-    "cough",
-    "headache",
-    "chest",
-    "stomach",
-    "nausea",
-    "vomiting",
-    "dizziness",
-    "shortness of breath",
-    "fatigue",
-    "rash",
-    "swelling",
-  ];
-  if (symptomPhrases.some((k) => text.includes(k)))
-    return { type: "ENTER_SYMPTOM", value: message };
-
-  // ── Doctor name (must match "Dr" or "doctor + name pattern") ─
-  const isDrTitle = /\bdr\.?\s+\w+/i.test(message);
-  const isShortName = /^[A-Z][a-z]{2,15}(\s[A-Z][a-z]{2,15})?$/.test(
-    message.trim()
-  );
-  if (isDrTitle || isShortName) return { type: "ENTER_NAME", value: message };
-
-  // ── Specialty keywords ────────────────────────────────────
-  const specialties = [
-    "cardiology",
-    "cardiologist",
-    "neurology",
-    "neurologist",
-    "orthopedic",
-    "ortho",
-    "dermatology",
-    "dermatologist",
-    "gynecology",
-    "pediatrics",
-    "pediatrician",
-    "oncology",
-    "oncologist",
-    "psychiatry",
-    "psychiatrist",
-    "ent",
-    "ophthalmology",
-    "urology",
-    "gastroenterology",
-    "pulmonology",
-    "endocrinology",
-    "nephrology",
-    "rheumatology",
-    "diabetologist",
-  ];
-  if (specialties.some((k) => text.includes(k)))
-    return { type: "SELECT_SPECIALTY", value: message };
-
-  // ── Navigation / actions ──────────────────────────────────
-  if (text.includes("back") || text.includes("main menu") || text.includes("go back"))
-    return { type: "BACK_TO_MENU" };
-  if (text.includes("cancel") || text.includes("stop"))
-    return { type: "CANCEL" };
-  if (text.includes("confirm") || text.includes("yes") || text.includes("proceed"))
-    return { type: "CONFIRM" };
-  if (text.includes("done") || text.includes("finish") || text.includes("completed"))
-    return { type: "DONE" };
-  if (text.includes("retry") || text.includes("try again"))
-    return { type: "RETRY" };
-
-  // ── State-aware free-text mapping ─────────────────────────
-  if (state === "ENTER_DOCTOR_NAME") {
-    return { type: "ENTER_NAME", value: message.trim() };
-  }
-
-  if (state === "SELECT_SPECIALTY") {
-    return { type: "ENTER_SPECIALTY", value: message.trim() };
-  }
-
-  if (state === "ASK_BASIC_DETAILS") {
-    return { type: "ENTER_SYMPTOM", value: message.trim() };
-  }
-
-  if (state === "ASK_CITY" || state === "HEALTH_CHECKUP_ENTRY") {
-    const cityMatch = allCities.find((city) => {
-      const lower = city.toLowerCase();
-      return lower === text || lower.includes(text) || text.includes(lower);
-    });
-    return { type: "ENTER_CITY", value: cityMatch ?? message.trim() };
-  }
-
-  if (state === "ASK_BRANCH") {
-    return { type: "SELECT_BRANCH", value: message.trim() };
-  }
-
-  if (state === "ENTER_PHONE") {
-    const phone = message.replace(/[^0-9+]/g, "");
-    if (/^\+?[0-9]{10,13}$/.test(phone)) {
-      return { type: "ENTER_PHONE", value: phone };
-    }
-  }
-
-  if (state === "VERIFY_OTP" && /^\d{4,8}$/.test(text)) {
-    return { type: "OTP_SUCCESS" };
-  }
-
-  if (state === "ASK_DETAILS") {
-    return { type: "ENTER_PARTIAL_DETAILS" };
-  }
-
-  if (state === "ASK_SPECIFIC_DETAIL") {
-    return { type: "PROVIDE_DETAIL" };
-  }
-
-  // ── Fallback ──────────────────────────────────────────────
-  return { type: "UNKNOWN" };
-}
-
-// ─────────────────────────────────────────────────────────────
-// 2. CONTEXT  (shared session data)
+// CONTEXT  (shared session data)
 // ─────────────────────────────────────────────────────────────
 
 interface ApolloContext {
@@ -284,9 +18,11 @@ interface ApolloContext {
   specialty?: string;
   city?: string;
   branch?: string;
+  searchByLocation?: boolean;
   symptomText?: string;
   phoneNumber?: string;
   packageUrl?: string;
+  formData?: Record<string, string>;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -300,12 +36,24 @@ export const apolloMachine = createMachine(
     types: {} as { context: ApolloContext; events: AppEvent },
     context: {},
 
+    on: {
+      // Global emergency handling: reachable from ANY state
+      EMERGENCY: { target: ".SHOW_EMERGENCY_MESSAGE" },
+    },
+
     states: {
       // ── Entry ──────────────────────────────────────────────
       WELCOME: {
         on: {
           START: "MAIN_MENU",
-          BOOK_APPOINTMENT: "BOOK_APPT_OPTIONS",
+          BOOK_APPOINTMENT: {
+            target: "BOOK_APPT_OPTIONS",
+            actions: assign({ searchByLocation: () => false }),
+          },
+          BOOK_BY_LOCATION: {
+            target: "ASK_CITY_FOR_LOCATION",
+            actions: assign({ searchByLocation: () => true }),
+          },
           FIND_DOCTOR: "FIND_DOCTOR_OPTIONS",
           HEALTH_CHECKUP: "HEALTH_CHECKUP_ENTRY",
           INTERNATIONAL_SERVICES: "ASK_DETAILS",
@@ -315,7 +63,14 @@ export const apolloMachine = createMachine(
 
       MAIN_MENU: {
         on: {
-          BOOK_APPOINTMENT: "BOOK_APPT_OPTIONS",
+          BOOK_APPOINTMENT: {
+            target: "BOOK_APPT_OPTIONS",
+            actions: assign({ searchByLocation: () => false }),
+          },
+          BOOK_BY_LOCATION: {
+            target: "ASK_CITY_FOR_LOCATION",
+            actions: assign({ searchByLocation: () => true }),
+          },
           FIND_DOCTOR: "FIND_DOCTOR_OPTIONS",
           HEALTH_CHECKUP: "HEALTH_CHECKUP_ENTRY",
           INTERNATIONAL_SERVICES: "ASK_DETAILS",
@@ -332,6 +87,7 @@ export const apolloMachine = createMachine(
           HAVE_SYMPTOMS: "ASK_BASIC_DETAILS",
           HEALTH_CHECKUP: "HEALTH_CHECKUP_ENTRY",
           BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
         },
       },
 
@@ -341,6 +97,7 @@ export const apolloMachine = createMachine(
           BY_DOCTOR_NAME: "ENTER_DOCTOR_NAME",
           BY_SYMPTOMS: "ASK_BASIC_DETAILS",
           BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
         },
       },
 
@@ -356,12 +113,35 @@ export const apolloMachine = createMachine(
       },
 
       PROCESS_DOCTOR_NAME: {
-        on: {
-          AUTO: "ASK_CITY",
-          RETRY_NAME: "ENTER_DOCTOR_NAME",
-          SEARCH_BY_SPECIALTY: "SELECT_SPECIALTY",
-          BACK_TO_MENU: "MAIN_MENU",
-        },
+        always: { target: "SEARCH_DOCTOR" },
+      },
+
+      // ── Search doctor by name ──────────────────────────────
+      SEARCH_DOCTOR: {
+        always: [
+          {
+            guard: ({ context }) => {
+              const name = context.doctorName ?? "";
+              return name.length > 0;
+            },
+            target: "DOCTOR_FOUND",
+          },
+          { target: "DOCTOR_NOT_FOUND" },
+        ],
+      },
+
+      DOCTOR_FOUND: {
+        always: [
+          {
+            guard: ({ context }) => {
+              const city = context.city ?? "";
+              const branch = context.branch ?? "";
+              return city.length > 0 && branch.length > 0;
+            },
+            target: "SEARCH_DOCTORS_BY_CRITERIA",
+          },
+          { target: "ASK_CITY" },
+        ],
       },
 
       // ── Specialty flow ─────────────────────────────────────
@@ -380,7 +160,35 @@ export const apolloMachine = createMachine(
       },
 
       PROCESS_SPECIALTY: {
-        always: { target: "ASK_CITY" },
+        always: { target: "SEARCH_BY_SPECIALTY_STATE" },
+      },
+
+      // ── Search doctor by specialty ─────────────────────────
+      SEARCH_BY_SPECIALTY_STATE: {
+        always: [
+          {
+            guard: ({ context }) => {
+              const specialty = context.specialty ?? "";
+              return specialty.length > 0;
+            },
+            target: "SPECIALTY_FOUND",
+          },
+          { target: "SPECIALTY_NOT_FOUND" },
+        ],
+      },
+
+      SPECIALTY_FOUND: {
+        always: [
+          {
+            guard: ({ context }) => {
+              const city = context.city ?? "";
+              const branch = context.branch ?? "";
+              return city.length > 0 && branch.length > 0;
+            },
+            target: "SEARCH_DOCTORS_BY_CRITERIA",
+          },
+          { target: "ASK_CITY" },
+        ],
       },
 
       // ── Symptom flow ───────────────────────────────────────
@@ -400,6 +208,7 @@ export const apolloMachine = createMachine(
           SELECT_CATEGORY: "PROCESS_SYMPTOM_CATEGORY",
           ENTER_SYMPTOM_TEXT: "PROCESS_SYMPTOM_CATEGORY",
           BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
         },
       },
 
@@ -430,7 +239,17 @@ export const apolloMachine = createMachine(
 
       SHOW_SPECIALTY_RESULT: {
         on: {
-          CONTINUE: "ASK_CITY",
+          CONTINUE: [
+            {
+              guard: ({ context }) => {
+                const city = context.city ?? "";
+                const branch = context.branch ?? "";
+                return city.length > 0 && branch.length > 0;
+              },
+              target: "SEARCH_DOCTORS_BY_CRITERIA",
+            },
+            { target: "ASK_CITY" },
+          ],
           CHANGE_SPECIALTY: "SELECT_SYMPTOM_CATEGORY",
           BACK_TO_MENU: "MAIN_MENU",
         },
@@ -455,9 +274,60 @@ export const apolloMachine = createMachine(
       ASK_BRANCH: {
         on: {
           SELECT_BRANCH: {
-            target: "SHOW_DOCTORS",
+            target: "SEARCH_DOCTORS_BY_CRITERIA",
             actions: assign({ branch: ({ event }) => event.value }),
           },
+          BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
+        },
+      },
+
+      // ── Search doctors by all criteria (name, specialty, location) ────
+      SEARCH_DOCTORS_BY_CRITERIA: {
+        always: [
+          {
+            guard: ({ context }) => {
+              const hasName = context.doctorName ?? "";
+              const hasSpec = context.specialty ?? "";
+              const hasCity = context.city ?? "";
+              return hasName.length > 0 || hasSpec.length > 0 || hasCity.length > 0;
+            },
+            target: "DOCTORS_FOUND",
+          },
+          { target: "DOCTOR_NOT_FOUND" },
+        ],
+      },
+
+      DOCTORS_FOUND: {
+        always: { target: "SHOW_DOCTORS" },
+      },
+
+      DOCTOR_NOT_FOUND: {
+        on: {
+          RETRY_NAME: "ENTER_DOCTOR_NAME",
+          SEARCH_BY_SPECIALTY: "SELECT_SPECIALTY",
+          CHANGE_CITY: [
+            {
+              guard: ({ context }) => context.searchByLocation === true,
+              target: "ASK_CITY_FOR_LOCATION",
+            },
+            { target: "ASK_CITY" },
+          ],
+          BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
+        },
+      },
+
+      SPECIALTY_NOT_FOUND: {
+        on: {
+          RETRY_SPECIALTY: "SELECT_SPECIALTY",
+          CHANGE_CITY: [
+            {
+              guard: ({ context }) => context.searchByLocation === true,
+              target: "ASK_CITY_FOR_LOCATION",
+            },
+            { target: "ASK_CITY" },
+          ],
           BACK_TO_MENU: "MAIN_MENU",
           UNKNOWN: "FALLBACK",
         },
@@ -466,38 +336,80 @@ export const apolloMachine = createMachine(
       SHOW_DOCTORS: {
         on: {
           SELECT_SLOT: "CONFIRM_BOOKING",
-          CHANGE_SEARCH: "BOOK_APPT_OPTIONS",
+          CHANGE_SEARCH: [
+            {
+              guard: ({ context }) => {
+                return context.searchByLocation === true;
+              },
+              target: "BOOK_APPT_OPTIONS_LOCATION",
+            },
+            { target: "BOOK_APPT_OPTIONS" },
+          ],
           CHANGE_SPECIALTY: "SELECT_SPECIALTY",
           BACK_TO_MENU: "MAIN_MENU",
           UNKNOWN: "FALLBACK",
         },
       },
 
-      DOCTOR_NOT_FOUND: {
+      BOOK_APPT_OPTIONS_LOCATION: {
         on: {
-          RETRY_NAME: "ENTER_DOCTOR_NAME",
-          SEARCH_BY_SPECIALTY: "SELECT_SPECIALTY",
-          CHANGE_CITY: "ASK_CITY",
+          KNOW_DOCTOR_NAME: "ENTER_DOCTOR_NAME",
+          FIND_BY_SPECIALTY: "SELECT_SPECIALTY",
+          HAVE_SYMPTOMS: "ASK_BASIC_DETAILS",
+          CHANGE_CITY: {
+            target: "ASK_CITY_FOR_LOCATION",
+            actions: assign({
+              branch: () => undefined,
+              searchByLocation: () => true,
+            }),
+          },
           BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
         },
       },
 
-      SPECIALTY_NOT_FOUND: {
-        on: {
-          RETRY_SPECIALTY: "SELECT_SPECIALTY",
-          CHANGE_CITY: "ASK_CITY",
-          BACK_TO_MENU: "MAIN_MENU",
-        },
-      },
-
-      // ── Booking + OTP ──────────────────────────────────────
       CONFIRM_BOOKING: {
         on: {
           CONTINUE: "ENTER_PHONE",
           CANCEL: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
         },
       },
 
+      // ── Location-based booking flow ─────────────────────────
+      // ── Location-based booking workflow entry ──────────────
+      ASK_CITY_FOR_LOCATION: {
+        on: {
+          ENTER_CITY: {
+            target: "ASK_BRANCH_FOR_LOCATION",
+            actions: assign({
+              city: ({ event }) => event.value,
+              branch: () => undefined,
+            }),
+          },
+          SELECT_CITY: {
+            target: "ASK_BRANCH_FOR_LOCATION",
+            actions: assign({
+              city: ({ event }) => event.value,
+              branch: () => undefined,
+            }),
+          },
+          BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
+        },
+      },
+
+      ASK_BRANCH_FOR_LOCATION: {
+        on: {
+          SELECT_BRANCH: {
+            target: "BOOK_APPT_OPTIONS_LOCATION",
+            actions: assign({ branch: ({ event }) => event.value }),
+          },
+          CHANGE_CITY: "ASK_CITY_FOR_LOCATION",
+          BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
+        },
+      },
       ENTER_PHONE: {
         on: {
           ENTER_PHONE: {
@@ -513,6 +425,7 @@ export const apolloMachine = createMachine(
         on: {
           OTP_SUCCESS: "BOOKING_SUCCESS",
           EXIT_VERIFICATION: "SHOW_DOCTORS",
+          UNKNOWN: "FALLBACK",
         },
       },
 
@@ -547,6 +460,7 @@ export const apolloMachine = createMachine(
           ASK_TO_BOOK: "PROVIDE_CONTACT_NUMBER",
           CHANGE_CITY: "HEALTH_CHECKUP_ENTRY",
           BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
         },
       },
 
@@ -566,8 +480,25 @@ export const apolloMachine = createMachine(
       // ── International patient ──────────────────────────────
       ASK_DETAILS: {
         on: {
-          ENTER_PARTIAL_DETAILS: "CHECK_MISSING_DETAILS",
-          ENTER_ALL_DETAILS: "CONFIRM_SUBMISSION",
+          ENTER_PARTIAL_DETAILS: {
+            target: "CHECK_MISSING_DETAILS",
+            actions: assign({ 
+              formData: ({ context }) => ({
+                ...context.formData,
+                // Accumulate form data in context
+                partialEntry: new Date().toISOString(),
+              }),
+            }),
+          },
+          ENTER_ALL_DETAILS: {
+            target: "CONFIRM_SUBMISSION",
+            actions: assign({ 
+              formData: ({ context }) => ({
+                ...context.formData,
+                completeEntry: new Date().toISOString(),
+              }),
+            }),
+          },
           REFUSE_DETAIL: "HANDLE_REFUSAL",
           BACK_TO_MENU: "MAIN_MENU",
           UNKNOWN: "FALLBACK",
@@ -578,12 +509,22 @@ export const apolloMachine = createMachine(
         on: {
           MISSING_FIELDS: "ASK_SPECIFIC_DETAIL",
           ALL_FIELDS_PRESENT: "CONFIRM_SUBMISSION",
+          UNKNOWN: "FALLBACK",
         },
       },
 
       ASK_SPECIFIC_DETAIL: {
         on: {
-          PROVIDE_DETAIL: "CHECK_MISSING_DETAILS",
+          PROVIDE_DETAIL: {
+            target: "CHECK_MISSING_DETAILS",
+            actions: assign({ 
+              formData: ({ context }) => ({
+                ...context.formData,
+                // Accumulate additional details
+                detailUpdated: new Date().toISOString(),
+              }),
+            }),
+          },
           REFUSE_DETAIL: "HANDLE_REFUSAL",
           UNKNOWN: "FALLBACK",
         },
@@ -593,12 +534,14 @@ export const apolloMachine = createMachine(
         on: {
           SHOW_CONTACT_OPTION: "PROVIDE_CONTACT_DETAILS",
           BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
         },
       },
 
       PROVIDE_CONTACT_DETAILS: {
         on: {
           DONE: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
         },
       },
 

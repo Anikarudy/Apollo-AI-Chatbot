@@ -30,6 +30,7 @@ const responses: Record<string, StateResponse> = {
     quickReplies: [
       { label: "Help me find a doctor", eventType: "FIND_DOCTOR" },
       { label: "I want to book appointment", eventType: "BOOK_APPOINTMENT" },
+        { label: "Book by location", eventType: "BOOK_BY_LOCATION" },
       { label: "I want to book health check", eventType: "HEALTH_CHECKUP" },
       { label: "International patient services", eventType: "INTERNATIONAL_SERVICES" },
       { label: "I have an emergency", eventType: "EMERGENCY" },
@@ -41,6 +42,7 @@ const responses: Record<string, StateResponse> = {
     quickReplies: [
       { label: "Help me find a doctor", eventType: "FIND_DOCTOR" },
       { label: "I want to book appointment", eventType: "BOOK_APPOINTMENT" },
+      { label: "Book by location", eventType: "BOOK_BY_LOCATION" },
       { label: "I want to book health check", eventType: "HEALTH_CHECKUP" },
       { label: "International patient services", eventType: "INTERNATIONAL_SERVICES" },
       { label: "I have an emergency", eventType: "EMERGENCY" },
@@ -168,8 +170,13 @@ const responses: Record<string, StateResponse> = {
   ASK_CITY: {
     message: "Which city are you in?",
     quickReplies: [
-      // Top cities with Apollo hospitals (from knowledge base)
-      ...allCities.slice(0, 8).map(c => ({ label: c, eventType: "SELECT_CITY", value: c })),
+      // Famous cities first (most popular Apollo locations)
+      { label: "Hyderabad", eventType: "SELECT_CITY", value: "Hyderabad" },
+      { label: "Chennai", eventType: "SELECT_CITY", value: "Chennai" },
+      { label: "Bangalore", eventType: "SELECT_CITY", value: "Bangalore" },
+      { label: "Mumbai", eventType: "SELECT_CITY", value: "Mumbai" },
+      { label: "Delhi", eventType: "SELECT_CITY", value: "Delhi" },
+      { label: "Other cities", eventType: "SELECT_CITY", value: "Other" },
       { label: "Back to menu", eventType: "BACK_TO_MENU" },
     ],
     showInput: true,
@@ -181,6 +188,42 @@ const responses: Record<string, StateResponse> = {
     quickReplies: [{ label: "Back to menu", eventType: "BACK_TO_MENU" }],
     showInput: true,
     inputPlaceholder: "Type branch name…",
+  },
+
+  ASK_CITY_FOR_LOCATION: {
+    message: "Which city would you like to book a doctor's appointment in?",
+    quickReplies: [
+      { label: "Hyderabad", eventType: "SELECT_CITY", value: "Hyderabad" },
+      { label: "Chennai", eventType: "SELECT_CITY", value: "Chennai" },
+      { label: "Bangalore", eventType: "SELECT_CITY", value: "Bangalore" },
+      { label: "Mumbai", eventType: "SELECT_CITY", value: "Mumbai" },
+      { label: "Delhi", eventType: "SELECT_CITY", value: "Delhi" },
+      { label: "Other cities", eventType: "SELECT_CITY", value: "Other" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+    showInput: true,
+    inputPlaceholder: "Or type your city…",
+  },
+
+  ASK_BRANCH_FOR_LOCATION: {
+    message: "Which Apollo Hospital branch in that city would you like to visit?",
+    quickReplies: [
+      { label: "Change city", eventType: "CHANGE_CITY" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+    showInput: true,
+    inputPlaceholder: "Type or select branch…",
+  },
+
+  BOOK_APPT_OPTIONS_LOCATION: {
+    message: "How would you like to search at this selected location?",
+    quickReplies: [
+      { label: "I know the doctor's name", eventType: "KNOW_DOCTOR_NAME" },
+      { label: "Search by specialty", eventType: "FIND_BY_SPECIALTY" },
+      { label: "I have symptoms", eventType: "HAVE_SYMPTOMS" },
+      { label: "Change city", eventType: "CHANGE_CITY" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
   },
 
   SHOW_DOCTORS: {
@@ -448,6 +491,57 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
     };
   }
 
+  if (state === "ASK_BRANCH_FOR_LOCATION") {
+    const city = ctx?.city ?? "";
+    const hospitals = city ? getHospitalsForCity(city) : [];
+    if (hospitals.length > 0) {
+      return {
+        message: `Which Apollo Hospital branch in ${city} would you like to visit?`,
+        quickReplies: [
+          ...hospitals.map((h) => ({
+            label: h.name,
+            eventType: "SELECT_BRANCH",
+            value: h.name,
+          })),
+          { label: "Change city", eventType: "CHANGE_CITY" },
+          { label: "Back to menu", eventType: "BACK_TO_MENU" },
+        ],
+        showInput: true,
+        inputPlaceholder: "Or type branch name…",
+      };
+    }
+    return {
+      message: city
+        ? `Please type the Apollo Hospital branch in ${city} you prefer, or change city.`
+        : "Which Apollo Hospital branch would you prefer?",
+      quickReplies: [
+        { label: "Change city", eventType: "CHANGE_CITY" },
+        { label: "Back to menu", eventType: "BACK_TO_MENU" },
+      ],
+      showInput: true,
+      inputPlaceholder: "Type branch name…",
+    };
+  }
+
+  if (state === "BOOK_APPT_OPTIONS_LOCATION") {
+    const city = ctx?.city ?? "";
+    const branch = ctx?.branch ?? "";
+    const loc = branch ? `${branch}${city ? `, ${city}` : ""}` : city;
+    return {
+      message: loc
+        ? `Great, I will search only within ${loc}. How would you like to find a doctor?`
+        : "How would you like to search for a doctor at your selected location?",
+      quickReplies: [
+        { label: "I know the doctor's name", eventType: "KNOW_DOCTOR_NAME" },
+        { label: "Search by specialty", eventType: "FIND_BY_SPECIALTY" },
+        { label: "I have symptoms", eventType: "HAVE_SYMPTOMS" },
+        { label: "Change city", eventType: "CHANGE_CITY" },
+        { label: "Back to menu", eventType: "BACK_TO_MENU" },
+      ],
+    };
+  }
+
+
   // ── Dynamic: SHOW_SPECIALTY_RESULT — show matched specialty from ctx ────────
   if (state === "SHOW_SPECIALTY_RESULT") {
     const specialty = ctx?.specialty;
@@ -496,17 +590,17 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
     const doctorName = ctx?.doctorName ?? "";
     const location = branch ? `${branch}${city ? ", " + city : ""}` : city;
 
-    // Build Apollo doctor search URL with specialty + city filter
-    const searchUrl = buildDoctorSearchUrl(specialty, city);
+    // Build Apollo doctor search URL with branch preferred over city for location scoping
+    const searchUrl = buildDoctorSearchUrl(specialty, city, branch);
 
     // If searching by name, also show matching doctors
     const nameMatches = doctorName ? getDoctorsByName(doctorName) : [];
     let msg = "";
     if (nameMatches.length > 0) {
       const list = nameMatches.map(d => `• ${d.name}`).join("\n");
-      msg = `Apollo doctors matching "${doctorName}"${location ? ` at ${location}` : ""}:\n\n${list}\n\nBook online:\n${searchUrl}\nOr call 1860-500-1066`;
+      msg = `Apollo doctors matching "${doctorName}"${location ? ` at ${location}` : ""}:\n\n${list}\n\nShowing results for selected location${location ? `: ${location}` : ""}.\n\nBook online:\n${searchUrl}\nOr call 1860-500-1066`;
     } else {
-      msg = `Apollo ${specialty || "doctors"}${location ? ` at ${location}` : ""} — book online:\n\n${searchUrl}\n\nOr call our helpline: 1860-500-1066`;
+      msg = `Apollo ${specialty || "doctors"}${location ? ` at ${location}` : ""} — showing results for selected location.\n\nBook online:\n${searchUrl}\n\nOr call our helpline: 1860-500-1066`;
     }
 
     return {
