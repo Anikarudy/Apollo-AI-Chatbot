@@ -36,6 +36,7 @@ export type AppEvent =
   | { type: "ENTER_CITY"; value: string }
   | { type: "SELECT_CITY"; value: string }
   | { type: "SELECT_BRANCH"; value: string }
+  | { type: "SELECT_DOCTOR"; value: string }
   | { type: "FOUND" }
   | { type: "NOT_FOUND" }
   | { type: "SELECT_SLOT" }
@@ -92,6 +93,69 @@ export function mapInputToEvent(message: string, currentState?: string): AppEven
   const state = (currentState ?? "").toUpperCase();
 
   if (!text) return { type: "UNKNOWN" };
+
+  // ── State-aware free-text mapping (highest priority) ─────
+  // This prevents generic parsing from misclassifying inputs like city names as doctor names.
+  if (state === "ENTER_DOCTOR_NAME") {
+    return { type: "ENTER_NAME", value: message.trim() };
+  }
+
+  if (state === "SELECT_SPECIALTY") {
+    return { type: "ENTER_SPECIALTY", value: message.trim() };
+  }
+
+  if (state === "ASK_BASIC_DETAILS") {
+    return { type: "ENTER_SYMPTOM", value: message.trim() };
+  }
+
+  if (state === "ASK_CITY" || state === "HEALTH_CHECKUP_ENTRY" || state === "ASK_CITY_FOR_LOCATION") {
+    const cityMatch = allCities.find((city) => {
+      const lower = city.toLowerCase();
+      return lower === text || lower.includes(text) || text.includes(lower);
+    });
+    return { type: "ENTER_CITY", value: cityMatch ?? message.trim() };
+  }
+
+  if (state === "ASK_BRANCH" || state === "ASK_BRANCH_FOR_LOCATION") {
+    return { type: "SELECT_BRANCH", value: message.trim() };
+  }
+
+  if (state === "DOCTOR_NAME_SUGGESTIONS") {
+    if (/(specialty|speciality|specialist|department)/i.test(text)) return { type: "SEARCH_BY_SPECIALTY" };
+    return { type: "SELECT_DOCTOR", value: message.trim() };
+  }
+
+  if (state === "BOOK_APPT_OPTIONS" || state === "BOOK_APPT_OPTIONS_LOCATION") {
+    if (/(name|doctor name|know doctor)/i.test(text)) return { type: "KNOW_DOCTOR_NAME" };
+    if (/(specialty|speciality|specialist|department)/i.test(text)) return { type: "FIND_BY_SPECIALTY" };
+    if (/(symptom|symptoms|pain|issue|problem)/i.test(text)) return { type: "HAVE_SYMPTOMS" };
+    if (/(health check|checkup|package|preventive)/i.test(text)) return { type: "HEALTH_CHECKUP" };
+  }
+
+  if (state === "FIND_DOCTOR_OPTIONS") {
+    if (/(specialty|speciality|specialist|department)/i.test(text)) return { type: "BY_SPECIALTY" };
+    if (/(name|doctor name|know doctor)/i.test(text)) return { type: "BY_DOCTOR_NAME" };
+    if (/(symptom|symptoms|pain|issue|problem)/i.test(text)) return { type: "BY_SYMPTOMS" };
+  }
+
+  if (state === "ENTER_PHONE") {
+    const phone = message.replace(/[^0-9+]/g, "");
+    if (/^\+?[0-9]{10,13}$/.test(phone)) {
+      return { type: "ENTER_PHONE", value: phone };
+    }
+  }
+
+  if (state === "VERIFY_OTP" && /^\d{4,8}$/.test(text)) {
+    return { type: "OTP_SUCCESS" };
+  }
+
+  if (state === "ASK_DETAILS") {
+    return { type: "ENTER_PARTIAL_DETAILS" };
+  }
+
+  if (state === "ASK_SPECIFIC_DETAIL") {
+    return { type: "PROVIDE_DETAIL" };
+  }
 
   // ── Greetings / Start ──────────────────────────────────────
   const greetings = ["hi", "hello", "hey", "start", "begin", "help"];
@@ -189,11 +253,10 @@ export function mapInputToEvent(message: string, currentState?: string): AppEven
   if (symptomPhrases.some((k) => text.includes(k)))
     return { type: "ENTER_SYMPTOM", value: message };
 
-  // ── Doctor name (match "Dr" prefix or any name-like text) ─
-  // Matches "Dr. Sharma", "Dr Priya", "Sharma", "Priya Reddy", etc.
+  // ── Doctor name (global only for explicit Dr prefix) ─
+  // Name-like free text is handled by ENTER_DOCTOR_NAME state above.
   const isDrTitle = /\bdr\.?\s+/i.test(message);
-  const isNameLike = /^[A-Za-z]{2,}(\s[A-Za-z]{2,})?$/.test(message.trim()) && message.length > 2;
-  if (isDrTitle || isNameLike) return { type: "ENTER_NAME", value: message };
+  if (isDrTitle) return { type: "ENTER_NAME", value: message };
 
   // ── Specialty keywords ────────────────────────────────────
   const specialties = [
@@ -236,50 +299,6 @@ export function mapInputToEvent(message: string, currentState?: string): AppEven
     return { type: "DONE" };
   if (text.includes("retry") || text.includes("try again"))
     return { type: "RETRY" };
-
-  // ── State-aware free-text mapping ─────────────────────────
-  if (state === "ENTER_DOCTOR_NAME") {
-    return { type: "ENTER_NAME", value: message.trim() };
-  }
-
-  if (state === "SELECT_SPECIALTY") {
-    return { type: "ENTER_SPECIALTY", value: message.trim() };
-  }
-
-  if (state === "ASK_BASIC_DETAILS") {
-    return { type: "ENTER_SYMPTOM", value: message.trim() };
-  }
-
-  if (state === "ASK_CITY" || state === "HEALTH_CHECKUP_ENTRY" || state === "ASK_CITY_FOR_LOCATION") {
-    const cityMatch = allCities.find((city) => {
-      const lower = city.toLowerCase();
-      return lower === text || lower.includes(text) || text.includes(lower);
-    });
-    return { type: "ENTER_CITY", value: cityMatch ?? message.trim() };
-  }
-
-  if (state === "ASK_BRANCH" || state === "ASK_BRANCH_FOR_LOCATION") {
-    return { type: "SELECT_BRANCH", value: message.trim() };
-  }
-
-  if (state === "ENTER_PHONE") {
-    const phone = message.replace(/[^0-9+]/g, "");
-    if (/^\+?[0-9]{10,13}$/.test(phone)) {
-      return { type: "ENTER_PHONE", value: phone };
-    }
-  }
-
-  if (state === "VERIFY_OTP" && /^\d{4,8}$/.test(text)) {
-    return { type: "OTP_SUCCESS" };
-  }
-
-  if (state === "ASK_DETAILS") {
-    return { type: "ENTER_PARTIAL_DETAILS" };
-  }
-
-  if (state === "ASK_SPECIFIC_DETAIL") {
-    return { type: "PROVIDE_DETAIL" };
-  }
 
   // ── Fallback ──────────────────────────────────────────────
   return { type: "UNKNOWN" };

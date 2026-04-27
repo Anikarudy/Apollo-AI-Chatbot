@@ -71,7 +71,7 @@ export function useChatMachine() {
       setIsLlmLoading(false);
     }
     // Static fallback
-    pushStaticBotMessage(state);
+    pushStaticBotMessage(state, ctx as ChatContext);
   }, [pushStaticBotMessage]);
 
   // Quick-reply / programmatic events: use static responses (no LLM quota)

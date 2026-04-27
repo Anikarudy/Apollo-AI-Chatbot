@@ -82,6 +82,17 @@ const responses: Record<string, StateResponse> = {
     quickReplies: [],
   },
 
+  DOCTOR_NAME_SUGGESTIONS: {
+    message: "I found multiple doctors with similar names. Please pick one.",
+    quickReplies: [
+      { label: "Search by specialty instead", eventType: "SEARCH_BY_SPECIALTY" },
+      { label: "Try another name", eventType: "RETRY_NAME" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+    showInput: true,
+    inputPlaceholder: "Type/select doctor name…",
+  },
+
   SELECT_SPECIALTY: {
     message: "Which specialty are you looking for? (We have 360+ specialties.)",
     quickReplies: [
@@ -579,6 +590,37 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
         { label: "Try again", eventType: "RETRY_NAME" },
         { label: "Back to menu", eventType: "BACK_TO_MENU" },
       ],
+    };
+  }
+
+  if (state === "DOCTOR_NAME_SUGGESTIONS") {
+    const raw = String(ctx?.doctorSuggestions ?? "");
+    const suggestions = raw
+      .split("||")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 8);
+
+    const city = ctx?.city ?? "";
+    const branch = ctx?.branch ?? "";
+    const loc = branch ? `${branch}${city ? `, ${city}` : ""}` : city;
+
+    return {
+      message: suggestions.length
+        ? `I found multiple matches${loc ? ` for your selected location (${loc})` : ""}. Please choose the correct doctor:`
+        : "I found multiple doctor-name matches. Please type the exact doctor name.",
+      quickReplies: [
+        ...suggestions.map((name) => ({
+          label: name,
+          eventType: "SELECT_DOCTOR",
+          value: name,
+        })),
+        { label: "Search by specialty instead", eventType: "SEARCH_BY_SPECIALTY" },
+        { label: "Try another name", eventType: "RETRY_NAME" },
+        { label: "Back to menu", eventType: "BACK_TO_MENU" },
+      ],
+      showInput: true,
+      inputPlaceholder: "Type/select doctor name…",
     };
   }
 

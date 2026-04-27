@@ -6,7 +6,7 @@
 // ============================================================
 
 import { createMachine, createActor, assign } from "xstate";
-import { allCities, mapSymptomToSpecialty } from "./src/knowledgeBase";
+import { allCities, getDoctorsByName, mapSymptomToSpecialty } from "./src/knowledgeBase";
 import { AppEvent, mapInputToEvent } from "./src/inputMapping.js";
 
 // ─────────────────────────────────────────────────────────────
@@ -15,6 +15,7 @@ import { AppEvent, mapInputToEvent } from "./src/inputMapping.js";
 
 interface ApolloContext {
   doctorName?: string;
+  doctorSuggestions?: string;
   specialty?: string;
   city?: string;
   branch?: string;
@@ -23,6 +24,24 @@ interface ApolloContext {
   phoneNumber?: string;
   packageUrl?: string;
   formData?: Record<string, string>;
+}
+
+function normalizeDoctorName(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/\bdr\.?\s*/g, "")
+    .replace(/[^a-z\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function findDoctorMatches(query: string) {
+  const matches = getDoctorsByName(query, 8);
+  const normalizedQuery = normalizeDoctorName(query);
+  const exactMatches = matches.filter(
+    (d) => normalizeDoctorName(d.name) === normalizedQuery
+  );
+  return { matches, exactMatches };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -106,7 +125,10 @@ export const apolloMachine = createMachine(
         on: {
           ENTER_NAME: {
             target: "PROCESS_DOCTOR_NAME",
-            actions: assign({ doctorName: ({ event }) => event.value }),
+            actions: assign({
+              doctorName: ({ event }) => event.value,
+              doctorSuggestions: () => undefined,
+            }),
           },
           UNKNOWN: "FALLBACK",
         },
@@ -122,12 +144,67 @@ export const apolloMachine = createMachine(
           {
             guard: ({ context }) => {
               const name = context.doctorName ?? "";
-              return name.length > 0;
+              return findDoctorMatches(name).exactMatches.length === 1;
             },
             target: "DOCTOR_FOUND",
+            actions: assign({
+              doctorName: ({ context }) =>
+                findDoctorMatches(context.doctorName ?? "").exactMatches[0]?.name ??
+                context.doctorName,
+              doctorSuggestions: () => undefined,
+            }),
+          },
+          {
+            guard: ({ context }) => {
+              const name = context.doctorName ?? "";
+              return findDoctorMatches(name).matches.length === 1;
+            },
+            target: "DOCTOR_FOUND",
+            actions: assign({
+              doctorName: ({ context }) =>
+                findDoctorMatches(context.doctorName ?? "").matches[0]?.name ??
+                context.doctorName,
+              doctorSuggestions: () => undefined,
+            }),
+          },
+          {
+            guard: ({ context }) => {
+              const name = context.doctorName ?? "";
+              return findDoctorMatches(name).matches.length > 1;
+            },
+            target: "DOCTOR_NAME_SUGGESTIONS",
+            actions: assign({
+              doctorSuggestions: ({ context }) =>
+                findDoctorMatches(context.doctorName ?? "")
+                  .matches.map((d) => d.name)
+                  .join("||"),
+            }),
           },
           { target: "DOCTOR_NOT_FOUND" },
         ],
+      },
+
+      DOCTOR_NAME_SUGGESTIONS: {
+        on: {
+          SELECT_DOCTOR: {
+            target: "PROCESS_DOCTOR_NAME",
+            actions: assign({
+              doctorName: ({ event }) => event.value,
+              doctorSuggestions: () => undefined,
+            }),
+          },
+          ENTER_NAME: {
+            target: "PROCESS_DOCTOR_NAME",
+            actions: assign({
+              doctorName: ({ event }) => event.value,
+              doctorSuggestions: () => undefined,
+            }),
+          },
+          SEARCH_BY_SPECIALTY: "SELECT_SPECIALTY",
+          RETRY_NAME: "ENTER_DOCTOR_NAME",
+          BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
+        },
       },
 
       DOCTOR_FOUND: {
