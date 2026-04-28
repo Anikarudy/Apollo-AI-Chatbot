@@ -254,10 +254,10 @@ const ChatWidget: React.FC = () => {
         {stateResp.quickReplies.length > 0 && !isLlmLoading
           && currentState !== "SHOW_DOCTORS"
           && currentState !== "RESCHEDULE_APPOINTMENT" && (
-          <div className="quick-replies" role="group" aria-label="Quick reply options">
-            {stateResp.quickReplies.map((qr) => (
+          <div key={`quick-${currentState}`} className="quick-replies" role="group" aria-label="Quick reply options">
+            {stateResp.quickReplies.map((qr, idx) => (
               <button
-                key={qr.label}
+                key={`${currentState}-${qr.eventType}-${qr.value ?? qr.label}-${idx}`}
                 className="quick-reply-btn"
                 onClick={() => void sendQuickReply(qr.label, qr.eventType, qr.value)}
               >

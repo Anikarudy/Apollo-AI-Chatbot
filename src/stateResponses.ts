@@ -702,11 +702,11 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
 
   if (state === "DOCTOR_NAME_SUGGESTIONS") {
     const raw = String(ctx?.doctorSuggestions ?? "");
-    const suggestions = raw
+    const suggestions = Array.from(new Set(raw
       .split("||")
       .map((s) => s.trim())
       .filter(Boolean)
-      .slice(0, 8);
+      .slice(0, 8)));
 
     const city = ctx?.city ?? "";
     const branch = ctx?.branch ?? "";
@@ -741,11 +741,62 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
 
     const searchUrl = buildDoctorSearchUrl(specialty, city, branch);
 
-    // Count available doctors for the heading
+    // Count available doctors for the heading using the same filtering rules as /api/doctors
     const localDocs = (city || branch)
       ? getDoctorsForLocation(city, branch || undefined, specialty || undefined)
       : [];
-    const nameMatches = doctorName ? getDoctorsByName(doctorName) : [];
+    const normaliseDoctorName = (value: string): string =>
+      value
+        .toLowerCase()
+        .replace(/\bdr\.?\s*/g, "")
+        .replace(/[^a-z\s]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    const US_TO_UK: Record<string, string> = {
+      pediatrics: "paediatrics",
+      gynecology: "gynaecology",
+      gynecologist: "gynaecology",
+      orthopedics: "orthopaedics",
+      anesthesiology: "anaesthesiology",
+      "fetal medicine": "foetal medicine",
+      hematology: "haematology",
+      "hemato oncology": "haemato oncology",
+    };
+    const normaliseSpecialty = (s: string): string => {
+      const lower = s.toLowerCase().trim();
+      return US_TO_UK[lower] ?? lower;
+    };
+
+    let nameMatches = doctorName ? getDoctorsByName(doctorName, 200) : [];
+    if (doctorName) {
+      const normInputName = normaliseDoctorName(doctorName);
+      if (normInputName.split(" ").filter(Boolean).length >= 2) {
+        const exactByFullName = nameMatches.filter(
+          (d) => normaliseDoctorName(d.name) === normInputName
+        );
+        if (exactByFullName.length > 0) nameMatches = exactByFullName;
+      }
+
+      if (city) {
+        nameMatches = nameMatches.filter(
+          (d) => d.location.toLowerCase() === city.toLowerCase()
+        );
+      }
+      if (branch) {
+        nameMatches = nameMatches.filter(
+          (d) => d.branch.toLowerCase() === branch.toLowerCase()
+        );
+      }
+      if (specialty) {
+        const specNorm = normaliseSpecialty(specialty);
+        nameMatches = nameMatches.filter((d) => {
+          const ds = normaliseSpecialty(d.speciality);
+          return ds === specNorm || ds === specialty.toLowerCase();
+        });
+      }
+    }
+
     const count = nameMatches.length > 0 ? nameMatches.length : localDocs.length;
 
     let msg = "";

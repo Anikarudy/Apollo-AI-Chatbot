@@ -252,11 +252,41 @@ export function getHospitalsForCity(city: string): Hospital[] {
   return key ? hospitalsByCity[key] : [];
 }
 
-/** Search doctors by partial name (case-insensitive), returns up to `limit` results */
+/** Normalise a string for strict name matching: lowercase and collapse punctuation/whitespace */
+function normaliseForSearch(s: string): string {
+  return s.toLowerCase().replace(/[.\-,']/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function normaliseDoctorName(s: string): string {
+  return normaliseForSearch(s).replace(/^dr\s+/, "").trim();
+}
+
+/**
+ * Search doctors by strict name rules:
+ * - Single-word input: first token must match exactly ("arun" matches "Dr Arun Kumar", not "Dr Aruna"/"Dr Varun")
+ * - Multi-word input: full name exact match or safe prefix match (startsWith)
+ */
 export function getDoctorsByName(query: string, limit = 8): Doctor[] {
   if (!query || query.trim().length < 2) return [];
-  const q = query.toLowerCase().trim();
-  return doctors.filter(d => d.name.toLowerCase().includes(q)).slice(0, limit);
+  const q = normaliseDoctorName(query);
+  if (q.length < 2) return [];
+
+  const qParts = q.split(" ").filter(Boolean);
+  const isSingleWord = qParts.length === 1;
+
+  return doctors
+    .filter(d => {
+      const dn = normaliseDoctorName(d.name);
+      if (!dn) return false;
+
+      if (isSingleWord) {
+        const firstToken = dn.split(" ")[0] ?? "";
+        return firstToken === q;
+      }
+
+      return dn === q || dn.startsWith(q);
+    })
+    .slice(0, limit);
 }
 
 /**

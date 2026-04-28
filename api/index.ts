@@ -252,11 +252,51 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
   const branch    = String(req.query.branch    ?? "").trim();
   const name      = String(req.query.name      ?? "").trim();
 
-  // ── 1a. Name-based search: respect city/branch context if present ─────────
+  const normaliseDoctorName = (value: string): string =>
+    value
+      .toLowerCase()
+      .replace(/\bdr\.?\s*/g, "")
+      .replace(/[^a-z\s]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  // ─ Normalise specialty: handle US/UK spelling variants and case ───────────────
+  const US_TO_UK: Record<string, string> = {
+    "pediatrics": "paediatrics",
+    "gynecology": "gynaecology",
+    "gynecologist": "gynaecology",
+    "orthopedics": "orthopaedics",
+    "anesthesiology": "anaesthesiology",
+    "fetal medicine": "foetal medicine",
+    "hematology": "haematology",
+    "hemato oncology": "haemato oncology",
+  };
+  const normaliseSpecialty = (s: string) => {
+    const lower = s.toLowerCase().trim();
+    return US_TO_UK[lower] ?? lower;
+  };
+  const specNorm = normaliseSpecialty(specialty);
+
+  // ── 1a. Name-based search: respect city/branch/specialty context if present ──
   if (name) {
     let matched = getDoctorsByName(name, 200);
-    if (city)   matched = matched.filter(d => d.location.toLowerCase() === city.toUpperCase().toLowerCase());
-    if (branch) matched = matched.filter(d => d.branch.toLowerCase() === branch.toUpperCase().toLowerCase());
+
+    // If user entered a full name (2+ tokens), prefer exact full-name matches.
+    const normName = normaliseDoctorName(name);
+    if (normName.split(" ").filter(Boolean).length >= 2) {
+      const exactByFullName = matched.filter(
+        (d) => normaliseDoctorName(d.name) === normName
+      );
+      if (exactByFullName.length > 0) matched = exactByFullName;
+    }
+
+    if (city)    matched = matched.filter(d => d.location.toLowerCase() === city.toUpperCase().toLowerCase());
+    if (branch)  matched = matched.filter(d => d.branch.toLowerCase() === branch.toUpperCase().toLowerCase());
+    // Also filter by specialty if provided (e.g. user searched by name AND changed to specialty)
+    if (specialty) matched = matched.filter(d => {
+      const ds = normaliseSpecialty(d.speciality);
+      return ds === specNorm || ds === specialty.toLowerCase();
+    });
     const url = buildDoctorSearchUrl(specialty, city, branch);
     res.json({
       url,
@@ -275,14 +315,21 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
   // ── 1b. City/branch + optional specialty ─────────────────────────────────
   if (city || branch) {
     const localDocs = getDoctorsForLocation(city, branch || undefined, specialty || undefined);
-    if (localDocs.length > 0) {
+    // If specialty didn't match, try with the normalised UK spelling
+    const finalDocs = localDocs.length > 0
+      ? localDocs
+      : specNorm !== specialty.toLowerCase()
+        ? getDoctorsForLocation(city, branch || undefined, specNorm)
+        : [];
+    if (finalDocs.length > 0) {
       const url = buildDoctorSearchUrl(specialty, city, branch);
       res.json({
         url,
         source: "local",
-        doctors: localDocs.slice(0, 12).map((d) => ({
+        doctors: finalDocs.slice(0, 12).map((d) => ({
           name: d.name,
           specialty: d.speciality,
+          hospital: d.branch ? `Apollo ${d.branch}, ${d.location}` : `Apollo Hospitals, ${d.location}`,
           profileUrl: undefined,
           resourceId: undefined,
         })),
@@ -294,7 +341,10 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
   // ── 1c. Specialty-only (no city/branch): search local KB ─────────────────
   if (specialty && !city && !branch) {
     const specDocs = doctors
-      .filter(d => d.speciality.toUpperCase() === specialty.toUpperCase())
+      .filter(d => {
+        const ds = normaliseSpecialty(d.speciality);
+        return ds === specNorm || ds === specialty.toLowerCase();
+      })
       .slice(0, 12);
     if (specDocs.length > 0) {
       res.json({

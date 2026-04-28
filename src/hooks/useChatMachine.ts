@@ -48,12 +48,15 @@ const NO_LLM_STATES = new Set([
   "PROCESS_UHID", "PROCESS_BOOKING", "PROCESS_RESCHEDULE", "PROCESS_CANCEL",
   "GENERATE_UHID_STATE", "PROCESS_DOCTOR_NAME", "PROCESS_SPECIALTY",
   "SEARCH_DOCTORS_BY_CRITERIA", "DOCTORS_FOUND", "DOCTOR_FOUND", "SPECIALTY_FOUND",
+  "ASK_CITY", "ASK_CITY_FOR_LOCATION", "ASK_BRANCH", "ASK_BRANCH_FOR_LOCATION",
   "SEARCH_BY_SPECIALTY_STATE", "PROCESS_SYMPTOM_CATEGORY", "PROCESS_SYMPTOM_DETAIL",
   "MAP_TO_SPECIALTY", "BOOKING_FAILED_STATE", "RESCHEDULE_FAILED_STATE",
   "CANCEL_FAILED_STATE", "UHID_GENERATE_FAILED",
-  "SHOW_DOCTORS",        // UI is card-driven; LLM message shown before cards load
-  "CONFIRM_APPOINTMENT", // Dynamic context-aware message handled by stateResponses
-  "BOOKING_CONFIRMED",   // Dynamic message handled by stateResponses
+  "DOCTOR_NAME_SUGGESTIONS", // rendered by stateResponses with suggestion buttons
+  "AI_PREFILL_ROUTE",        // transient routing state, never shown
+  "SHOW_DOCTORS",            // UI is card-driven; LLM message shown before cards load
+  "CONFIRM_APPOINTMENT",     // Dynamic context-aware message handled by stateResponses
+  "BOOKING_CONFIRMED",       // Dynamic message handled by stateResponses
 ]);
 
 // States where free-text should first be sent to the AI intent parser.
@@ -511,9 +514,9 @@ export function useChatMachine() {
         branch?: string | null;
         doctorName?: string | null;
       };
-      // Only auto-navigate if we have a clear booking/find intent AND at least specialty or city
+      // Only auto-navigate if we have a clear booking/find intent AND at least specialty or doctorName
       const isActionable = (parsed.intent === "book_appointment" || parsed.intent === "find_doctor")
-        && (parsed.specialty || parsed.city || parsed.doctorName);
+        && (parsed.specialty || parsed.doctorName);
       if (!isActionable) return false;
 
       const payload = JSON.stringify({

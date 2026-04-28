@@ -48,6 +48,11 @@ function normalizeDoctorName(value: string): string {
     .trim();
 }
 
+function isGenericDoctorQuery(query: string): boolean {
+  const parts = normalizeDoctorName(query).split(" ").filter(Boolean);
+  return parts.length < 2;
+}
+
 /** Maps the broad category button values used in SELECT_SYMPTOM_CATEGORY to a
  *  concrete symptom keyword that mapSymptomToSpecialty() can resolve. */
 const CATEGORY_TO_SYMPTOM: Record<string, string> = {
@@ -61,7 +66,7 @@ const CATEGORY_TO_SYMPTOM: Record<string, string> = {
 };
 
 function findDoctorMatches(query: string) {
-  const matches = getDoctorsByName(query, 8);
+  const matches = getDoctorsByName(query, 30); // wide net – normalise then exact-match below
   const normalizedQuery = normalizeDoctorName(query);
   const exactMatches = matches.filter(
     (d) => normalizeDoctorName(d.name) === normalizedQuery
@@ -76,6 +81,11 @@ function findDoctorMatches(query: string) {
 /** Shared assign action for AI_PREFILL: sets specialty/city/branch/doctorName from JSON */
 function parsePrefill(value: string | undefined): Partial<ApolloContext> {
   try { return JSON.parse(value ?? "{}") as Partial<ApolloContext>; } catch { return {}; }
+}
+
+function hasActionablePrefill(value: string | undefined): boolean {
+  const parsed = parsePrefill(value);
+  return !!((parsed.specialty ?? "").trim() || (parsed.doctorName ?? "").trim());
 }
 
 export const apolloMachine = createMachine(
@@ -107,18 +117,36 @@ export const apolloMachine = createMachine(
           HEALTH_CHECKUP: "HEALTH_CHECKUP_ENTRY",
           INTERNATIONAL_SERVICES: "ASK_DETAILS",
           EMERGENCY: "SHOW_EMERGENCY_MESSAGE",
-          // AI intent shortcut: skip all menu steps and jump straight to results
-          AI_PREFILL: {
-            target: "SEARCH_DOCTORS_BY_CRITERIA",
-            actions: assign({
-              specialty:        ({ event }) => parsePrefill(event.value).specialty,
-              city:             ({ event }) => parsePrefill(event.value).city,
-              branch:           ({ event }) => parsePrefill(event.value).branch,
-              doctorName:       ({ event }) => parsePrefill(event.value).doctorName,
-              searchByLocation: ({ event }) => !!(parsePrefill(event.value).city),
-            }),
-          },
+          // AI intent shortcut — route to correct next step based on what was extracted
+          AI_PREFILL: [
+            {
+              guard: ({ event }) => hasActionablePrefill(event.value),
+              target: "AI_PREFILL_ROUTE",
+              actions: assign({
+                specialty:        ({ event }) => parsePrefill(event.value).specialty,
+                city:             ({ event }) => parsePrefill(event.value).city,
+                branch:           ({ event }) => parsePrefill(event.value).branch,
+                doctorName:       ({ event }) => parsePrefill(event.value).doctorName,
+                searchByLocation: ({ event }) => !!(parsePrefill(event.value).city),
+              }),
+            },
+            { target: "WELCOME" },
+          ],
         },
+      },
+
+      // Transient routing state after AI_PREFILL — determines what to ask next
+      AI_PREFILL_ROUTE: {
+        always: [
+          // Already have city → search directly (name+city or specialty+city)
+          { guard: ({ context }) => (context.city ?? "").length > 0, target: "SEARCH_DOCTORS_BY_CRITERIA" },
+          // Specialty but no city → ask city → branch → search
+          { guard: ({ context }) => (context.specialty ?? "").length > 0, target: "SPECIALTY_FOUND" },
+          // Doctor name but no city → ask city (ASK_CITY will skip branch for names)
+          { guard: ({ context }) => (context.doctorName ?? "").length > 0, target: "ASK_CITY" },
+          // Nothing actionable → stay at menu
+          { target: "MAIN_MENU" },
+        ],
       },
 
       MAIN_MENU: {
@@ -151,16 +179,20 @@ export const apolloMachine = createMachine(
           HEALTH_CHECKUP: "HEALTH_CHECKUP_ENTRY",
           INTERNATIONAL_SERVICES: "ASK_DETAILS",
           EMERGENCY: "SHOW_EMERGENCY_MESSAGE",
-          AI_PREFILL: {
-            target: "SEARCH_DOCTORS_BY_CRITERIA",
-            actions: assign({
-              specialty:        ({ event }) => parsePrefill(event.value).specialty,
-              city:             ({ event }) => parsePrefill(event.value).city,
-              branch:           ({ event }) => parsePrefill(event.value).branch,
-              doctorName:       ({ event }) => parsePrefill(event.value).doctorName,
-              searchByLocation: ({ event }) => !!(parsePrefill(event.value).city),
-            }),
-          },
+          AI_PREFILL: [
+            {
+              guard: ({ event }) => hasActionablePrefill(event.value),
+              target: "AI_PREFILL_ROUTE",
+              actions: assign({
+                specialty:        ({ event }) => parsePrefill(event.value).specialty,
+                city:             ({ event }) => parsePrefill(event.value).city,
+                branch:           ({ event }) => parsePrefill(event.value).branch,
+                doctorName:       ({ event }) => parsePrefill(event.value).doctorName,
+                searchByLocation: ({ event }) => !!(parsePrefill(event.value).city),
+              }),
+            },
+            { target: "MAIN_MENU" },
+          ],
           UNKNOWN: "FALLBACK",
         },
       },
@@ -168,7 +200,13 @@ export const apolloMachine = createMachine(
       // ── Appointment entry ──────────────────────────────────
       BOOK_APPT_OPTIONS: {
         on: {
-          KNOW_DOCTOR_NAME: "ENTER_DOCTOR_NAME",
+          KNOW_DOCTOR_NAME: {
+            target: "ENTER_DOCTOR_NAME",
+            actions: assign({
+              specialty: () => undefined,
+              doctorSuggestions: () => undefined,
+            }),
+          },
           FIND_BY_SPECIALTY: "SELECT_SPECIALTY",
           HAVE_SYMPTOMS: "ASK_BASIC_DETAILS",
           HEALTH_CHECKUP: "HEALTH_CHECKUP_ENTRY",
@@ -180,7 +218,13 @@ export const apolloMachine = createMachine(
       FIND_DOCTOR_OPTIONS: {
         on: {
           BY_SPECIALTY: "SELECT_SPECIALTY",
-          BY_DOCTOR_NAME: "ENTER_DOCTOR_NAME",
+          BY_DOCTOR_NAME: {
+            target: "ENTER_DOCTOR_NAME",
+            actions: assign({
+              specialty: () => undefined,
+              doctorSuggestions: () => undefined,
+            }),
+          },
           BY_SYMPTOMS: "ASK_BASIC_DETAILS",
           BACK_TO_MENU: "MAIN_MENU",
           UNKNOWN: "FALLBACK",
@@ -224,7 +268,9 @@ export const apolloMachine = createMachine(
           {
             guard: ({ context }) => {
               const name = context.doctorName ?? "";
-              return findDoctorMatches(name).matches.length === 1;
+              return findDoctorMatches(name).matches.length === 1
+                && !isGenericDoctorQuery(name)
+                && findDoctorMatches(name).exactMatches.length === 0;
             },
             target: "DOCTOR_FOUND",
             actions: assign({
@@ -237,14 +283,22 @@ export const apolloMachine = createMachine(
           {
             guard: ({ context }) => {
               const name = context.doctorName ?? "";
-              return findDoctorMatches(name).matches.length > 1;
+              return findDoctorMatches(name).matches.length > 0
+                && (context.city ?? "").length > 0;
             },
-            target: "DOCTOR_NAME_SUGGESTIONS",
+            target: "SEARCH_DOCTORS_BY_CRITERIA",
             actions: assign({
-              doctorSuggestions: ({ context }) =>
-                findDoctorMatches(context.doctorName ?? "")
-                  .matches.map((d) => d.name)
-                  .join("||"),
+              doctorSuggestions: () => undefined,
+            }),
+          },
+          {
+            guard: ({ context }) => {
+              const name = context.doctorName ?? "";
+              return findDoctorMatches(name).matches.length > 0;
+            },
+            target: "ASK_CITY",
+            actions: assign({
+              doctorSuggestions: () => undefined,
             }),
           },
           { target: "DOCTOR_NOT_FOUND" },
@@ -267,7 +321,14 @@ export const apolloMachine = createMachine(
               doctorSuggestions: () => undefined,
             }),
           },
-          SEARCH_BY_SPECIALTY: "SELECT_SPECIALTY",
+          // Clear doctorName when switching to specialty — prevents stale name bleeding into results
+          SEARCH_BY_SPECIALTY: {
+            target: "SELECT_SPECIALTY",
+            actions: assign({
+              doctorName: () => undefined,
+              doctorSuggestions: () => undefined,
+            }),
+          },
           RETRY_NAME: "ENTER_DOCTOR_NAME",
           BACK_TO_MENU: "MAIN_MENU",
           UNKNOWN: "FALLBACK",
@@ -275,8 +336,7 @@ export const apolloMachine = createMachine(
       },
 
       DOCTOR_FOUND: {
-        // Always search — city/branch are optional filters, not requirements.
-        // If city was pre-selected, the /api/doctors endpoint scopes the results automatically.
+        // Specific doctor selected/found: go directly to card results.
         always: { target: "SEARCH_DOCTORS_BY_CRITERIA" },
       },
 
@@ -314,8 +374,17 @@ export const apolloMachine = createMachine(
       },
 
       SPECIALTY_FOUND: {
-        // Always search across all locations; city/branch are optional filters.
-        always: { target: "SEARCH_DOCTORS_BY_CRITERIA" },
+        always: [
+          {
+            guard: ({ context }) => {
+              const city = context.city ?? "";
+              const branch = context.branch ?? "";
+              return city.length > 0 && branch.length > 0;
+            },
+            target: "SEARCH_DOCTORS_BY_CRITERIA",
+          },
+          { target: "ASK_CITY" },
+        ],
       },
 
       // ── Symptom flow ───────────────────────────────────────
@@ -370,10 +439,10 @@ export const apolloMachine = createMachine(
       MAP_TO_SPECIALTY: {
         always: [
           {
-            // Symptom mapped to a specialty → show doctors immediately
+            // Symptom mapped → funnel through SPECIALTY_FOUND so city/branch are asked if missing
             guard: ({ context }) =>
               (mapSymptomToSpecialty(context.symptomText ?? "") ?? context.specialty ?? "").length > 0,
-            target: "SEARCH_DOCTORS_BY_CRITERIA",
+            target: "SPECIALTY_FOUND",
             actions: assign({
               specialty: ({ context }) =>
                 mapSymptomToSpecialty(context.symptomText ?? "") ?? context.specialty,
@@ -406,15 +475,32 @@ export const apolloMachine = createMachine(
 
       // ── Shared location steps ──────────────────────────────
       ASK_CITY: {
+        // Clear any stale suggestions so they don’t bleed into city quick replies
+        entry: assign({ doctorSuggestions: () => undefined }),
         on: {
-          ENTER_CITY: {
-            target: "ASK_BRANCH",
-            actions: assign({ city: ({ event }) => event.value }),
-          },
-          SELECT_CITY: {
-            target: "ASK_BRANCH",
-            actions: assign({ city: ({ event }) => event.value }),
-          },
+          ENTER_CITY: [
+            {
+              // Name search: city is enough, skip branch
+              guard: ({ context }) => (context.doctorName ?? "").length > 0,
+              target: "SEARCH_DOCTORS_BY_CRITERIA",
+              actions: assign({ city: ({ event }) => event.value }),
+            },
+            {
+              target: "ASK_BRANCH",
+              actions: assign({ city: ({ event }) => event.value }),
+            },
+          ],
+          SELECT_CITY: [
+            {
+              guard: ({ context }) => (context.doctorName ?? "").length > 0,
+              target: "SEARCH_DOCTORS_BY_CRITERIA",
+              actions: assign({ city: ({ event }) => event.value }),
+            },
+            {
+              target: "ASK_BRANCH",
+              actions: assign({ city: ({ event }) => event.value }),
+            },
+          ],
           BACK_TO_MENU: "MAIN_MENU",
           UNKNOWN: "FALLBACK",
         },
@@ -439,7 +525,11 @@ export const apolloMachine = createMachine(
               const hasName = context.doctorName ?? "";
               const hasSpec = context.specialty ?? "";
               const hasCity = context.city ?? "";
-              return hasName.length > 0 || hasSpec.length > 0 || hasCity.length > 0;
+              const hasBranch = context.branch ?? "";
+              const hasLocationBookingFilters = context.searchByLocation === true
+                && hasCity.length > 0
+                && hasBranch.length > 0;
+              return hasName.length > 0 || hasSpec.length > 0 || hasLocationBookingFilters;
             },
             target: "DOCTORS_FOUND",
           },
@@ -527,7 +617,13 @@ export const apolloMachine = createMachine(
 
       BOOK_APPT_OPTIONS_LOCATION: {
         on: {
-          KNOW_DOCTOR_NAME: "ENTER_DOCTOR_NAME",
+          KNOW_DOCTOR_NAME: {
+            target: "ENTER_DOCTOR_NAME",
+            actions: assign({
+              specialty: () => undefined,
+              doctorSuggestions: () => undefined,
+            }),
+          },
           FIND_BY_SPECIALTY: "SELECT_SPECIALTY",
           HAVE_SYMPTOMS: "ASK_BASIC_DETAILS",
           CHANGE_CITY: {
@@ -927,16 +1023,20 @@ export const apolloMachine = createMachine(
         on: {
           RETRY: "MAIN_MENU",
           BACK_TO_MENU: "MAIN_MENU",
-          AI_PREFILL: {
-            target: "SEARCH_DOCTORS_BY_CRITERIA",
-            actions: assign({
-              specialty:        ({ event }) => parsePrefill(event.value).specialty,
-              city:             ({ event }) => parsePrefill(event.value).city,
-              branch:           ({ event }) => parsePrefill(event.value).branch,
-              doctorName:       ({ event }) => parsePrefill(event.value).doctorName,
-              searchByLocation: ({ event }) => !!(parsePrefill(event.value).city),
-            }),
-          },
+          AI_PREFILL: [
+            {
+              guard: ({ event }) => hasActionablePrefill(event.value),
+              target: "AI_PREFILL_ROUTE",
+              actions: assign({
+                specialty:        ({ event }) => parsePrefill(event.value).specialty,
+                city:             ({ event }) => parsePrefill(event.value).city,
+                branch:           ({ event }) => parsePrefill(event.value).branch,
+                doctorName:       ({ event }) => parsePrefill(event.value).doctorName,
+                searchByLocation: ({ event }) => !!(parsePrefill(event.value).city),
+              }),
+            },
+            { target: "MAIN_MENU" },
+          ],
         },
       },
 
