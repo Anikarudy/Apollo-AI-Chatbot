@@ -39,7 +39,7 @@ export type AppEvent =
   | { type: "SELECT_DOCTOR"; value: string }
   | { type: "FOUND" }
   | { type: "NOT_FOUND" }
-  | { type: "SELECT_SLOT" }
+  | { type: "SELECT_SLOT"; value?: string }  // value = JSON {date,startTime,endTime,resourceId,locationId,regionId,serviceId}
   | { type: "CHANGE_SEARCH" }
   | { type: "CHANGE_SPECIALTY" }
   | { type: "RETRY_NAME" }
@@ -73,6 +73,27 @@ export type AppEvent =
   | { type: "END_CONVERSATION" }
   | { type: "RETRY" }
   | { type: "BACK_TO_MENU" }
+  // ── EDOC real-booking events ─────────────────────────────────────────────
+  | { type: "UHID_FOUND"; value: string }
+  | { type: "UHID_NOT_FOUND" }
+  | { type: "UHID_GENERATED"; value: string }
+  | { type: "UHID_FAILED" }
+  | { type: "BOOKING_DONE"; value: string }
+  | { type: "BOOKING_FAILED" }
+  | { type: "CONFIRM_BOOKING_REAL" }
+  | { type: "RESCHEDULE" }
+  | { type: "RESCHEDULE_DONE"; value: string }
+  | { type: "RESCHEDULE_FAILED" }
+  | { type: "CANCEL_BOOKING" }
+  | { type: "CONFIRM_CANCEL" }
+  | { type: "CANCEL_DONE" }
+  | { type: "CANCEL_FAILED" }
+  | { type: "SKIP_UHID" }
+  | { type: "RETRY_PATIENT_DETAILS" }
+  | { type: "ENTER_PATIENT_DETAILS"; value: string }
+  // ── AI intent navigation ──────────────────────────────────────────────────
+  | { type: "AI_PREFILL"; value: string }   // JSON: {specialty?,city?,branch?,doctorName?}
+  | { type: "AI_SYMPTOM_MAPPED"; value: string } // specialty string from AI
   | { type: "UNKNOWN" };
 
 // ─────────────────────────────────────────────────────────────
@@ -138,7 +159,7 @@ export function mapInputToEvent(message: string, currentState?: string): AppEven
     if (/(symptom|symptoms|pain|issue|problem)/i.test(text)) return { type: "BY_SYMPTOMS" };
   }
 
-  if (state === "ENTER_PHONE") {
+  if (state === "ENTER_PHONE" || state === "ENTER_PHONE_FOR_BOOKING") {
     const phone = message.replace(/[^0-9+]/g, "");
     if (/^\+?[0-9]{10,13}$/.test(phone)) {
       return { type: "ENTER_PHONE", value: phone };
@@ -155,6 +176,10 @@ export function mapInputToEvent(message: string, currentState?: string): AppEven
 
   if (state === "ASK_SPECIFIC_DETAIL") {
     return { type: "PROVIDE_DETAIL" };
+  }
+
+  if (state === "COLLECT_PATIENT_DETAILS") {
+    return { type: "ENTER_PATIENT_DETAILS", value: message.trim() };
   }
 
   // ── Greetings / Start ──────────────────────────────────────

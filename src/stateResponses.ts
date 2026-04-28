@@ -241,9 +241,113 @@ const responses: Record<string, StateResponse> = {
     message:
       "Here are the available doctors. Select a time slot to book your appointment.",
     quickReplies: [
-      { label: "Book this slot", eventType: "SELECT_SLOT" },
       { label: "Change search", eventType: "CHANGE_SEARCH" },
       { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+  },
+
+  // ── EDOC real-booking states ──────────────────────────────────────────
+  ENTER_PHONE_FOR_BOOKING: {
+    message: "Please enter your mobile number to look up your patient profile (UHID).",
+    quickReplies: [{ label: "Go back", eventType: "BACK_TO_MENU" }],
+    showInput: true,
+    inputPlaceholder: "10-digit mobile number",
+  },
+
+  PROCESS_UHID: {
+    message: "Looking up your patient profile… please wait.",
+    quickReplies: [],
+  },
+
+  COLLECT_PATIENT_DETAILS: {
+    message: "No existing profile found. Please provide your name and date of birth.\nExample: Harika Sunanda 28-Apr-1990\n(Date format: DD-Mon-YYYY)",
+    quickReplies: [{ label: "Back to menu", eventType: "BACK_TO_MENU" }],
+    showInput: true,
+    inputPlaceholder: "Name DD-Mon-YYYY  (e.g. Harika Sunanda 28-Apr-1990)",
+  },
+
+  GENERATE_UHID_STATE: {
+    message: "Creating your patient profile… please wait.",
+    quickReplies: [],
+  },
+
+  UHID_GENERATE_FAILED: {
+    message: "Unable to create a patient profile automatically at this time. You can skip this step and proceed with your phone number as a reference, or try again.",
+    quickReplies: [
+      { label: "Skip & continue booking", eventType: "SKIP_UHID" },
+      { label: "Try again", eventType: "RETRY_PATIENT_DETAILS" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+  },
+
+  CONFIRM_APPOINTMENT: {
+    message: "Please review your booking details and confirm.",
+    quickReplies: [
+      { label: "Confirm booking", eventType: "CONFIRM_BOOKING_REAL" },
+      { label: "Go back", eventType: "CANCEL" },
+    ],
+  },
+
+  PROCESS_BOOKING: {
+    message: "Confirming your appointment… please wait.",
+    quickReplies: [],
+  },
+
+  BOOKING_FAILED_STATE: {
+    message: "Unable to confirm your appointment at this time. This may be a temporary issue with the booking system.",
+    quickReplies: [
+      { label: "Try again", eventType: "RETRY" },
+      { label: "Back to menu", eventType: "BACK_TO_MENU" },
+    ],
+  },
+
+  BOOKING_CONFIRMED: {
+    message: "Your appointment has been confirmed! You will receive a confirmation shortly.",
+    quickReplies: [
+      { label: "Reschedule", eventType: "RESCHEDULE" },
+      { label: "Cancel appointment", eventType: "CANCEL_BOOKING" },
+      { label: "Back to main menu", eventType: "DONE" },
+    ],
+  },
+
+  RESCHEDULE_APPOINTMENT: {
+    message: "Please select a new date and time slot from the doctor's card above.",
+    quickReplies: [
+      { label: "Go back", eventType: "BACK_TO_MENU" },
+    ],
+  },
+
+  PROCESS_RESCHEDULE: {
+    message: "Rescheduling your appointment… please wait.",
+    quickReplies: [],
+  },
+
+  RESCHEDULE_FAILED_STATE: {
+    message: "Unable to reschedule your appointment at this time.",
+    quickReplies: [
+      { label: "Try again", eventType: "RETRY" },
+      { label: "Back to booking", eventType: "BACK_TO_MENU" },
+    ],
+  },
+
+  CANCEL_APPOINTMENT_STATE: {
+    message: "Are you sure you want to cancel your appointment? This cannot be undone.",
+    quickReplies: [
+      { label: "Yes, cancel appointment", eventType: "CONFIRM_CANCEL" },
+      { label: "No, keep my appointment", eventType: "CANCEL" },
+    ],
+  },
+
+  PROCESS_CANCEL: {
+    message: "Cancelling your appointment… please wait.",
+    quickReplies: [],
+  },
+
+  CANCEL_FAILED_STATE: {
+    message: "Unable to cancel your appointment at this time. Please try again or call Apollo at 1860-500-1066.",
+    quickReplies: [
+      { label: "Try again", eventType: "RETRY" },
+      { label: "Back to booking", eventType: "BACK_TO_MENU" },
     ],
   },
 
@@ -675,7 +779,43 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
     };
   }
 
-  // ── Dynamic: CONFIRM_BOOKING — show booking summary from ctx ────────────────
+  // ── Dynamic: CONFIRM_APPOINTMENT — EDOC real booking summary ────────────────
+  if (state === "CONFIRM_APPOINTMENT") {
+    const specialty = ctx?.specialty ?? "";
+    const doctorName = ctx?.doctorName ?? "";
+    const branch = ctx?.branch ?? "";
+    const city = ctx?.city ?? "";
+    const date = ctx?.selectedDate ?? "";
+    const startTime = ctx?.selectedSlotStart ?? "";
+    const uhid = ctx?.uhid ?? "";
+    const who = doctorName || (specialty ? `a ${specialty} specialist` : "your doctor");
+    const where = branch ? `${branch}${city ? ", " + city : ""}` : city;
+    return {
+      message: `Please confirm your booking:\n\n👨‍⚕️ ${who}${where ? `\n📍 ${where}` : ""}${date ? `\n📅 ${date}${startTime ? ` at ${startTime}` : ""}` : ""}${uhid ? `\n🆔 UHID: ${uhid}` : ""}\n\nProceed?`,
+      quickReplies: [
+        { label: "✅ Confirm booking", eventType: "CONFIRM_BOOKING_REAL" },
+        { label: "Go back", eventType: "CANCEL" },
+      ],
+    };
+  }
+
+  // ── Dynamic: BOOKING_CONFIRMED — show appointment ID ────────────────────────
+  if (state === "BOOKING_CONFIRMED") {
+    const appointmentId = ctx?.appointmentId ?? "";
+    const doctorName = ctx?.doctorName ?? "";
+    const date = ctx?.selectedDate ?? "";
+    const startTime = ctx?.selectedSlotStart ?? "";
+    return {
+      message: `✅ Appointment confirmed!${appointmentId ? `\n\n🎫 Appointment ID: ${appointmentId}` : ""}${doctorName ? `\n👨‍⚕️ ${doctorName}` : ""}${date ? `\n📅 ${date}${startTime ? ` at ${startTime}` : ""}` : ""}\n\nYou will receive a confirmation SMS shortly.`,
+      quickReplies: [
+        { label: "Reschedule", eventType: "RESCHEDULE" },
+        { label: "Cancel appointment", eventType: "CANCEL_BOOKING" },
+        { label: "Back to main menu", eventType: "DONE" },
+      ],
+    };
+  }
+
+  // ── Dynamic: CONFIRM_BOOKING (legacy flow) ───────────────────────────────────
   if (state === "CONFIRM_BOOKING") {
     const specialty = ctx?.specialty ?? "";
     const doctorName = ctx?.doctorName ?? "";
@@ -684,7 +824,7 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
     const who = doctorName || (specialty ? `a ${specialty} specialist` : "your doctor");
     const where = branch ? `${branch}${city ? ", " + city : ""}` : city;
     return {
-      message: `You’re booking an appointment with ${who}${where ? ` at ${where}` : ""}. Shall I proceed to confirm?`,
+      message: `You're booking an appointment with ${who}${where ? ` at ${where}` : ""}. Shall I proceed to confirm?`,
       quickReplies: [
         { label: "Yes, confirm", eventType: "CONTINUE" },
         { label: "Cancel", eventType: "CANCEL" },
@@ -692,7 +832,7 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
     };
   }
 
-  // ── Static lookup ─────────────────────────────────────────────────────
+    // ── Static lookup ─────────────────────────────────────────────────────
   return (
     responses[state] ?? {
       message: `(State: ${state}) — processing…`,

@@ -371,18 +371,6 @@ export function buildLlmContext(currentState: string, ctx: Record<string, string
     lines.push(`User selected specialty: ${ctx.specialty}`);
   }
 
-  if (ctx.city) {
-    const subBranches = getSubBranchesForCity(ctx.city);
-    if (subBranches.length) lines.push(`Branches in ${ctx.city}: ${subBranches.join("; ")}`);
-
-    if (ctx.branch || ctx.specialty) {
-      const localDocs = getDoctorsForLocation(ctx.city, ctx.branch, ctx.specialty);
-      if (localDocs.length) {
-        lines.push(`Doctors found: ${localDocs.slice(0, 8).map(d => `${d.name} (${toTitleCase(d.speciality)})`).join("; ")}`);
-      }
-    }
-  }
-
   lines.push(`Top procedures: ${topProcedures.slice(0, 10).join("; ")}`);
   lines.push(`Key specialties: ${specialities.slice(0, 20).join(", ")}`);
   lines.push(`Total doctors in database: ${doctors.length}`);

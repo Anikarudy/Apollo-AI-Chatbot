@@ -24,6 +24,19 @@ interface ApolloContext {
   phoneNumber?: string;
   packageUrl?: string;
   formData?: Record<string, string>;
+  // EDOC booking fields
+  resourceId?: string;       // EDOC doctor ResourceID
+  locationId?: string;       // EDOC LocationID
+  regionId?: string;         // EDOC RegionID (default "5")
+  serviceId?: string;        // EDOC ServiceID
+  uhid?: string;             // Patient UHID
+  appointmentId?: string;    // Booked appointment ID
+  selectedDate?: string;     // "01-JUL-2025"
+  selectedSlotStart?: string; // "21:00"
+  selectedSlotEnd?: string;   // "21:15"
+  patientFirstName?: string;
+  patientLastName?: string;
+  patientDob?: string;        // "03-Jun-1998"
 }
 
 function normalizeDoctorName(value: string): string {
@@ -47,6 +60,11 @@ function findDoctorMatches(query: string) {
 // ─────────────────────────────────────────────────────────────
 // 3. STATE MACHINE
 // ─────────────────────────────────────────────────────────────
+
+/** Shared assign action for AI_PREFILL: sets specialty/city/branch/doctorName from JSON */
+function parsePrefill(value: string | undefined): Partial<ApolloContext> {
+  try { return JSON.parse(value ?? "{}") as Partial<ApolloContext>; } catch { return {}; }
+}
 
 export const apolloMachine = createMachine(
   {
@@ -77,6 +95,17 @@ export const apolloMachine = createMachine(
           HEALTH_CHECKUP: "HEALTH_CHECKUP_ENTRY",
           INTERNATIONAL_SERVICES: "ASK_DETAILS",
           EMERGENCY: "SHOW_EMERGENCY_MESSAGE",
+          // AI intent shortcut: skip all menu steps and jump straight to results
+          AI_PREFILL: {
+            target: "SEARCH_DOCTORS_BY_CRITERIA",
+            actions: assign({
+              specialty:        ({ event }) => parsePrefill(event.value).specialty,
+              city:             ({ event }) => parsePrefill(event.value).city,
+              branch:           ({ event }) => parsePrefill(event.value).branch,
+              doctorName:       ({ event }) => parsePrefill(event.value).doctorName,
+              searchByLocation: ({ event }) => !!(parsePrefill(event.value).city),
+            }),
+          },
         },
       },
 
@@ -94,6 +123,16 @@ export const apolloMachine = createMachine(
           HEALTH_CHECKUP: "HEALTH_CHECKUP_ENTRY",
           INTERNATIONAL_SERVICES: "ASK_DETAILS",
           EMERGENCY: "SHOW_EMERGENCY_MESSAGE",
+          AI_PREFILL: {
+            target: "SEARCH_DOCTORS_BY_CRITERIA",
+            actions: assign({
+              specialty:        ({ event }) => parsePrefill(event.value).specialty,
+              city:             ({ event }) => parsePrefill(event.value).city,
+              branch:           ({ event }) => parsePrefill(event.value).branch,
+              doctorName:       ({ event }) => parsePrefill(event.value).doctorName,
+              searchByLocation: ({ event }) => !!(parsePrefill(event.value).city),
+            }),
+          },
           UNKNOWN: "FALLBACK",
         },
       },
@@ -208,17 +247,9 @@ export const apolloMachine = createMachine(
       },
 
       DOCTOR_FOUND: {
-        always: [
-          {
-            guard: ({ context }) => {
-              const city = context.city ?? "";
-              const branch = context.branch ?? "";
-              return city.length > 0 && branch.length > 0;
-            },
-            target: "SEARCH_DOCTORS_BY_CRITERIA",
-          },
-          { target: "ASK_CITY" },
-        ],
+        // Always search — city/branch are optional filters, not requirements.
+        // If city was pre-selected, the /api/doctors endpoint scopes the results automatically.
+        always: { target: "SEARCH_DOCTORS_BY_CRITERIA" },
       },
 
       // ── Specialty flow ─────────────────────────────────────
@@ -255,17 +286,8 @@ export const apolloMachine = createMachine(
       },
 
       SPECIALTY_FOUND: {
-        always: [
-          {
-            guard: ({ context }) => {
-              const city = context.city ?? "";
-              const branch = context.branch ?? "";
-              return city.length > 0 && branch.length > 0;
-            },
-            target: "SEARCH_DOCTORS_BY_CRITERIA",
-          },
-          { target: "ASK_CITY" },
-        ],
+        // Always search across all locations; city/branch are optional filters.
+        always: { target: "SEARCH_DOCTORS_BY_CRITERIA" },
       },
 
       // ── Symptom flow ───────────────────────────────────────
@@ -285,6 +307,14 @@ export const apolloMachine = createMachine(
           SELECT_CATEGORY: "PROCESS_SYMPTOM_CATEGORY",
           ENTER_SYMPTOM_TEXT: "PROCESS_SYMPTOM_CATEGORY",
           BACK_TO_MENU: "MAIN_MENU",
+          // AI mapped symptom → skip category drill-down, jump straight to specialty search
+          AI_SYMPTOM_MAPPED: {
+            target: "SEARCH_DOCTORS_BY_CRITERIA",
+            actions: assign({
+              specialty: ({ event }) => event.value,
+              searchByLocation: () => false,
+            }),
+          },
           UNKNOWN: "FALLBACK",
         },
       },
@@ -412,7 +442,32 @@ export const apolloMachine = createMachine(
 
       SHOW_DOCTORS: {
         on: {
-          SELECT_SLOT: "CONFIRM_BOOKING",
+          SELECT_SLOT: {
+            target: "ENTER_PHONE_FOR_BOOKING",
+            actions: assign({
+              resourceId: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).resourceId; } catch { return undefined; }
+              },
+              locationId: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).locationId; } catch { return undefined; }
+              },
+              regionId: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).regionId ?? "5"; } catch { return "5"; }
+              },
+              serviceId: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).serviceId; } catch { return undefined; }
+              },
+              selectedDate: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).date; } catch { return undefined; }
+              },
+              selectedSlotStart: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).startTime; } catch { return undefined; }
+              },
+              selectedSlotEnd: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).endTime; } catch { return undefined; }
+              },
+            }),
+          },
           CHANGE_SEARCH: [
             {
               guard: ({ context }) => {
@@ -509,6 +564,180 @@ export const apolloMachine = createMachine(
       BOOKING_SUCCESS: {
         on: {
           DONE: "MAIN_MENU",
+        },
+      },
+
+      // ── Real EDOC booking flow ─────────────────────────────
+      ENTER_PHONE_FOR_BOOKING: {
+        on: {
+          ENTER_PHONE: {
+            target: "PROCESS_UHID",
+            actions: assign({ phoneNumber: ({ event }) => event.value }),
+          },
+          BACK_TO_MENU: "SHOW_DOCTORS",
+          UNKNOWN: "FALLBACK",
+        },
+      },
+
+      PROCESS_UHID: {
+        on: {
+          UHID_FOUND: {
+            target: "CONFIRM_APPOINTMENT",
+            actions: assign({ uhid: ({ event }) => event.value }),
+          },
+          UHID_NOT_FOUND: "COLLECT_PATIENT_DETAILS",
+          BACK_TO_MENU: "MAIN_MENU",
+        },
+      },
+
+      COLLECT_PATIENT_DETAILS: {
+        on: {
+          ENTER_PATIENT_DETAILS: {
+            target: "GENERATE_UHID_STATE",
+            actions: assign({
+              patientFirstName: ({ event }) => {
+                // Last token is DOB if it looks like a date, otherwise use first word as name
+                const parts = event.value.trim().split(/\s+/);
+                const lastIsDate = /^\d{1,2}[-\/][a-zA-Z0-9]{2,3}[-\/]\d{2,4}$/.test(parts[parts.length - 1] ?? "");
+                const nameParts = lastIsDate ? parts.slice(0, -1) : parts;
+                return nameParts[0] ?? "Patient";
+              },
+              patientLastName: ({ event }) => {
+                const parts = event.value.trim().split(/\s+/);
+                const lastIsDate = /^\d{1,2}[-\/][a-zA-Z0-9]{2,3}[-\/]\d{2,4}$/.test(parts[parts.length - 1] ?? "");
+                const nameParts = lastIsDate ? parts.slice(0, -1) : parts;
+                return nameParts.slice(1).join(" ") || "User";
+              },
+              patientDob: ({ event }) => {
+                const parts = event.value.trim().split(/\s+/);
+                const last = parts[parts.length - 1] ?? "";
+                const lastIsDate = /^\d{1,2}[-\/][a-zA-Z0-9]{2,3}[-\/]\d{2,4}$/.test(last);
+                return lastIsDate ? last.replace(/\//g, "-") : "01-Jan-1990";
+              },
+            }),
+          },
+          BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
+        },
+      },
+
+      GENERATE_UHID_STATE: {
+        on: {
+          UHID_GENERATED: {
+            target: "CONFIRM_APPOINTMENT",
+            actions: assign({ uhid: ({ event }) => event.value }),
+          },
+          UHID_FAILED: "UHID_GENERATE_FAILED",
+          BACK_TO_MENU: "MAIN_MENU",
+        },
+      },
+
+      UHID_GENERATE_FAILED: {
+        on: {
+          // Skip UHID — proceed with phone as patient reference
+          SKIP_UHID: {
+            target: "CONFIRM_APPOINTMENT",
+            actions: assign({ uhid: ({ context }) => `TEMP-${context.phoneNumber ?? "unknown"}` }),
+          },
+          RETRY_PATIENT_DETAILS: "COLLECT_PATIENT_DETAILS",
+          BACK_TO_MENU: "MAIN_MENU",
+        },
+      },
+
+      CONFIRM_APPOINTMENT: {
+        on: {
+          CONFIRM_BOOKING_REAL: "PROCESS_BOOKING",
+          CANCEL: "SHOW_DOCTORS",
+          BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
+        },
+      },
+
+      PROCESS_BOOKING: {
+        on: {
+          BOOKING_DONE: {
+            target: "BOOKING_CONFIRMED",
+            actions: assign({ appointmentId: ({ event }) => event.value }),
+          },
+          BOOKING_FAILED: "BOOKING_FAILED_STATE",
+          BACK_TO_MENU: "MAIN_MENU",
+        },
+      },
+
+      BOOKING_FAILED_STATE: {
+        on: {
+          RETRY: "CONFIRM_APPOINTMENT",
+          BACK_TO_MENU: "MAIN_MENU",
+        },
+      },
+
+      BOOKING_CONFIRMED: {
+        on: {
+          RESCHEDULE: "RESCHEDULE_APPOINTMENT",
+          CANCEL_BOOKING: "CANCEL_APPOINTMENT_STATE",
+          DONE: "MAIN_MENU",
+        },
+      },
+
+      RESCHEDULE_APPOINTMENT: {
+        on: {
+          SELECT_SLOT: {
+            target: "PROCESS_RESCHEDULE",
+            actions: assign({
+              selectedDate: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).date; } catch { return undefined; }
+              },
+              selectedSlotStart: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).startTime; } catch { return undefined; }
+              },
+              selectedSlotEnd: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).endTime; } catch { return undefined; }
+              },
+            }),
+          },
+          BACK_TO_MENU: "BOOKING_CONFIRMED",
+          UNKNOWN: "FALLBACK",
+        },
+      },
+
+      PROCESS_RESCHEDULE: {
+        on: {
+          RESCHEDULE_DONE: {
+            target: "BOOKING_CONFIRMED",
+            actions: assign({ appointmentId: ({ event }) => event.value }),
+          },
+          RESCHEDULE_FAILED: "RESCHEDULE_FAILED_STATE",
+          BACK_TO_MENU: "MAIN_MENU",
+        },
+      },
+
+      RESCHEDULE_FAILED_STATE: {
+        on: {
+          RETRY: "RESCHEDULE_APPOINTMENT",
+          BACK_TO_MENU: "BOOKING_CONFIRMED",
+        },
+      },
+
+      CANCEL_APPOINTMENT_STATE: {
+        on: {
+          CONFIRM_CANCEL: "PROCESS_CANCEL",
+          CANCEL: "BOOKING_CONFIRMED",
+          BACK_TO_MENU: "MAIN_MENU",
+        },
+      },
+
+      PROCESS_CANCEL: {
+        on: {
+          CANCEL_DONE: "MAIN_MENU",
+          CANCEL_FAILED: "CANCEL_FAILED_STATE",
+          BACK_TO_MENU: "MAIN_MENU",
+        },
+      },
+
+      CANCEL_FAILED_STATE: {
+        on: {
+          RETRY: "CANCEL_APPOINTMENT_STATE",
+          BACK_TO_MENU: "BOOKING_CONFIRMED",
         },
       },
 
@@ -655,6 +884,17 @@ export const apolloMachine = createMachine(
       FALLBACK: {
         on: {
           RETRY: "MAIN_MENU",
+          BACK_TO_MENU: "MAIN_MENU",
+          AI_PREFILL: {
+            target: "SEARCH_DOCTORS_BY_CRITERIA",
+            actions: assign({
+              specialty:        ({ event }) => parsePrefill(event.value).specialty,
+              city:             ({ event }) => parsePrefill(event.value).city,
+              branch:           ({ event }) => parsePrefill(event.value).branch,
+              doctorName:       ({ event }) => parsePrefill(event.value).doctorName,
+              searchByLocation: ({ event }) => !!(parsePrefill(event.value).city),
+            }),
+          },
         },
       },
 

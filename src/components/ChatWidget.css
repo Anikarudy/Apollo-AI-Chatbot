@@ -376,6 +376,19 @@
   font-weight: 700;
 }
 
+.appt-day-btn small {
+  font-size: 10px;
+  font-weight: 500;
+  opacity: 0.75;
+  text-transform: uppercase;
+}
+
+.appt-resource-id {
+  font-size: 10px;
+  color: #8fa3b3;
+  margin: 2px 0 0;
+}
+
 .appt-day-btn.active {
   border-color: #0d86ad;
   background: #c5e4ef;
