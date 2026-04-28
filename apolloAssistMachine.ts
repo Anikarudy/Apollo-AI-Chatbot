@@ -48,6 +48,18 @@ function normalizeDoctorName(value: string): string {
     .trim();
 }
 
+/** Maps the broad category button values used in SELECT_SYMPTOM_CATEGORY to a
+ *  concrete symptom keyword that mapSymptomToSpecialty() can resolve. */
+const CATEGORY_TO_SYMPTOM: Record<string, string> = {
+  heart:  "chest pain",
+  neuro:  "headache",
+  ortho:  "joint pain",
+  skin:   "skin rash",
+  gastro: "stomach pain",
+  gynae:  "pcos",
+  paeds:  "child fever",
+};
+
 function findDoctorMatches(query: string) {
   const matches = getDoctorsByName(query, 8);
   const normalizedQuery = normalizeDoctorName(query);
@@ -110,6 +122,22 @@ export const apolloMachine = createMachine(
       },
 
       MAIN_MENU: {
+        // Clear all search context whenever we return to the main menu
+        entry: assign({
+          specialty:        () => undefined,
+          city:             () => undefined,
+          branch:           () => undefined,
+          doctorName:       () => undefined,
+          symptomText:      () => undefined,
+          doctorSuggestions:() => undefined,
+          searchByLocation: () => undefined,
+          resourceId:       () => undefined,
+          locationId:       () => undefined,
+          serviceId:        () => undefined,
+          selectedDate:     () => undefined,
+          selectedSlotStart:() => undefined,
+          selectedSlotEnd:  () => undefined,
+        }),
         on: {
           BOOK_APPOINTMENT: {
             target: "BOOK_APPT_OPTIONS",
@@ -293,28 +321,33 @@ export const apolloMachine = createMachine(
       // ── Symptom flow ───────────────────────────────────────
       ASK_BASIC_DETAILS: {
         on: {
+          // Pre-defined symptom button → skip category picker, map immediately
           ENTER_SYMPTOM: {
-            target: "SELECT_SYMPTOM_CATEGORY",
+            target: "MAP_TO_SPECIALTY",
             actions: assign({ symptomText: ({ event }) => event.value }),
           },
+          // User wants to browse by broad category
           SELECT_CATEGORY: "SELECT_SYMPTOM_CATEGORY",
           BACK_TO_MENU: "MAIN_MENU",
         },
       },
 
+      // Reached only when no auto-mapping found, or user browses categories
       SELECT_SYMPTOM_CATEGORY: {
         on: {
-          SELECT_CATEGORY: "PROCESS_SYMPTOM_CATEGORY",
-          ENTER_SYMPTOM_TEXT: "PROCESS_SYMPTOM_CATEGORY",
-          BACK_TO_MENU: "MAIN_MENU",
-          // AI mapped symptom → skip category drill-down, jump straight to specialty search
-          AI_SYMPTOM_MAPPED: {
-            target: "SEARCH_DOCTORS_BY_CRITERIA",
+          // Category button → convert to concrete symptom keyword, then map
+          SELECT_CATEGORY: {
+            target: "MAP_TO_SPECIALTY",
             actions: assign({
-              specialty: ({ event }) => event.value,
-              searchByLocation: () => false,
+              symptomText: ({ event }) =>
+                CATEGORY_TO_SYMPTOM[(event.value as string) ?? ""] ?? (event.value as string) ?? "",
             }),
           },
+          ENTER_SYMPTOM_TEXT: {
+            target: "MAP_TO_SPECIALTY",
+            actions: assign({ symptomText: ({ event }) => event.value }),
+          },
+          BACK_TO_MENU: "MAIN_MENU",
           UNKNOWN: "FALLBACK",
         },
       },
@@ -335,13 +368,22 @@ export const apolloMachine = createMachine(
       },
 
       MAP_TO_SPECIALTY: {
-        always: {
-          target: "SHOW_SPECIALTY_RESULT",
-          actions: assign({
-            specialty: ({ context }) =>
-              mapSymptomToSpecialty(context.symptomText ?? "") ?? context.specialty,
-          }),
-        },
+        always: [
+          {
+            // Symptom mapped to a specialty → show doctors immediately
+            guard: ({ context }) =>
+              (mapSymptomToSpecialty(context.symptomText ?? "") ?? context.specialty ?? "").length > 0,
+            target: "SEARCH_DOCTORS_BY_CRITERIA",
+            actions: assign({
+              specialty: ({ context }) =>
+                mapSymptomToSpecialty(context.symptomText ?? "") ?? context.specialty,
+            }),
+          },
+          {
+            // No mapping found → let user pick a category
+            target: "SELECT_SYMPTOM_CATEGORY",
+          },
+        ],
       },
 
       SHOW_SPECIALTY_RESULT: {

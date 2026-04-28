@@ -312,34 +312,13 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
     }
   }
 
-  // ── 2. Fallback: scrape Apollo website ─────────────────────────────────
-  try {
-    const url = buildDoctorSearchUrl(specialty, city, branch);
-    const response = await axios.get<string>(url, {
-      timeout: 12000,
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      },
-    });
-
-    const doctors = scrapeDoctorsFromHtml(response.data);
-    res.json({
-      url,
-      source: "scrape",
-      doctors: doctors.map((d) => ({
-        ...d,
-        resourceId: extractResourceId(d.profileUrl),
-      })),
-    });
-  } catch (err: unknown) {
-    const error = err as { message?: string };
-    console.error("Doctor scrape error:", error.message ?? err);
-    res.status(500).json({
-      error: "Failed to fetch doctor names",
-      doctors: [],
-    });
-  }
+  // ── 2. Nothing found locally — do NOT scrape (scraper returns wrong doctors) ─
+  res.json({
+    url: buildDoctorSearchUrl(specialty, city, branch),
+    source: "local",
+    notFound: true,
+    doctors: [],
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

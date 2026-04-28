@@ -83,7 +83,16 @@ const ChatWidget: React.FC = () => {
           </p>
         </div>
         <div className="chat-header-actions">
-          <button aria-label="New conversation" title="New conversation" onClick={() => resetMachine()}>＋</button>
+          <button
+            aria-label="New conversation"
+            title="New conversation"
+            onClick={() => {
+              setInputText("");
+              setSelectedDateIdxByDoctor({});
+              setSelectedSlotByDoctor({});
+              resetMachine();
+            }}
+          >＋</button>
           <button aria-label="Expand" title="Expand">⤢</button>
           <button aria-label="Close" title="Close">✕</button>
         </div>

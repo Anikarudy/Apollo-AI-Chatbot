@@ -170,9 +170,12 @@ export function useChatMachine() {
           regionId:   "5",
         }));
 
-        setDoctorCards(cards.length > 0
-          ? cards
-          : [{ name: fallbackName, specialty: machineCtx.specialty, hospital }]);
+        if (cards.length > 0) {
+          setDoctorCards(cards);
+        } else {
+          // No doctors found — show a single "no results" placeholder
+          setDoctorCards([{ name: "No doctors found", specialty: machineCtx.specialty, hospital: "Try a different search or visit apollohospitals.com" }]);
+        }
       } catch {
         setDoctorCards([{ name: fallbackName, specialty: machineCtx.specialty, hospital }]);
       }
@@ -532,41 +535,6 @@ export function useChatMachine() {
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pushStaticBotMessage]);
-
-  // ── AI: symptom → specialty (SELECT_SYMPTOM_CATEGORY) ────────────────────
-  useEffect(() => {
-    if (currentState !== "SELECT_SYMPTOM_CATEGORY") return;
-    const symptom = machineCtx.symptomText;
-    if (!symptom) return;
-
-    const controller = new AbortController();
-    (async () => {
-      try {
-        const { specialities } = await import("../knowledgeBase.js");
-        const res = await fetch("/api/symptom-specialty", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ symptom, specialties: specialities }),
-          signal: controller.signal,
-        });
-        if (!res.ok) return;
-        const data = await res.json() as { specialty: string | null };
-        if (data.specialty) {
-          // AI found a specialty — skip the multi-step category drill-down
-          const runner = runnerRef.current;
-          if (!runner) return;
-          runner.sendEvent({ type: "AI_SYMPTOM_MAPPED", value: data.specialty });
-          const nextState = runner.currentState;
-          const nextCtx = runner.context as ChatContext;
-          setCurrentState(nextState);
-          setMachineCtx(nextCtx);
-          pushStaticBotMessage(nextState, nextCtx);
-        }
-      } catch { /* AI unavailable — let user pick manually */ }
-    })();
-    return () => controller.abort();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentState, machineCtx.symptomText]);
 
   // ── Free-text input ────────────────────────────────────────────────────────
   const sendUserText = useCallback(
