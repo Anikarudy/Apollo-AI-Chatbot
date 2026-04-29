@@ -14,16 +14,57 @@ const frontendOrigin = process.env.FRONTEND_ORIGIN ?? "http://localhost:5173";
 app.use(cors({ origin: frontendOrigin }));
 app.use(express.json());
 
-// ── LLM clients (use whichever key is set; Groq takes priority over Gemini) ──
+// ── LLM clients (DeepSeek -> Groq -> Gemini priority) ──
+const deepseekKey = (process.env.DEEPSEEK_API_KEY ?? "").trim();
 const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY ?? "");
+const hasAnyLlm = !!(deepseekKey || groq || process.env.GEMINI_API_KEY);
+const NO_LLM_ERROR = "No LLM configured. Set DEEPSEEK_API_KEY, GROQ_API_KEY, or GEMINI_API_KEY in .env";
 
 /**
- * Unified LLM call — tries Groq first (if key set), then Gemini, then throws.
+ * Unified LLM call — tries DeepSeek first, then Groq, then Gemini.
  * Returns the response text string.
  */
 async function callLlm(systemPrompt: string, userContent: string): Promise<string> {
-  // ── 1. Groq ──────────────────────────────────────────────────────────────
+  // ── 1. DeepSeek ──────────────────────────────────────────────────────────
+  if (deepseekKey) {
+    try {
+      const model = process.env.DEEPSEEK_MODEL?.trim() || "deepseek-chat";
+      const response = await axios.post(
+        "https://api.deepseek.com/chat/completions",
+        {
+          model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userContent },
+          ],
+          max_tokens: 256,
+          temperature: 0.5,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${deepseekKey}`,
+            "Content-Type": "application/json",
+          },
+          timeout: 20000,
+        }
+      );
+
+      const text = (response.data as { choices?: Array<{ message?: { content?: string } }> })
+        .choices?.[0]?.message?.content ?? "";
+      if (text.trim()) return text;
+    } catch (err: unknown) {
+      const error = err as { message?: string };
+      const msg = String(error.message ?? err);
+      if (/unable to verify the first certificate|self signed certificate|CERT_/i.test(msg)) {
+        console.warn("[LLM] DeepSeek TLS certificate verification failed. Ensure Node runs with system CAs (NODE_OPTIONS=--use-system-ca). Falling back.");
+      } else {
+        console.warn("[LLM] DeepSeek failed, falling back:", msg);
+      }
+    }
+  }
+
+  // ── 2. Groq ──────────────────────────────────────────────────────────────
   if (groq) {
     const completion = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
@@ -36,13 +77,13 @@ async function callLlm(systemPrompt: string, userContent: string): Promise<strin
     });
     return completion.choices[0]?.message?.content ?? "";
   }
-  // ── 2. Gemini ─────────────────────────────────────────────────────────────
+  // ── 3. Gemini ─────────────────────────────────────────────────────────────
   if (process.env.GEMINI_API_KEY) {
     const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash", systemInstruction: systemPrompt });
     const result = await model.generateContent(userContent);
     return result.response.text();
   }
-  throw new Error("No LLM configured. Set GROQ_API_KEY or GEMINI_API_KEY in .env");
+  throw new Error(NO_LLM_ERROR);
 }
 
 // ── Apollo EDOC API config (server-side only – AuthKey never sent to browser) ──
@@ -128,8 +169,8 @@ function scrapeDoctorsFromHtml(html: string): ScrapedDoctor[] {
 app.post("/api/chat", async (req: Request, res: Response): Promise<void> => {
   const { currentState, context, userMessage } = req.body as ChatRequest;
 
-  if (!groq && !process.env.GEMINI_API_KEY) {
-    res.status(503).json({ error: "No LLM configured. Set GROQ_API_KEY or GEMINI_API_KEY in .env" });
+  if (!hasAnyLlm) {
+    res.status(503).json({ error: NO_LLM_ERROR });
     return;
   }
 
@@ -190,7 +231,7 @@ export interface ParsedIntent {
 }
 
 app.post("/api/intent", async (req: Request, res: Response): Promise<void> => {
-  if (!groq && !process.env.GEMINI_API_KEY) { res.json({ intent: "unknown" }); return; }
+  if (!hasAnyLlm) { res.json({ intent: "unknown" }); return; }
 
   const { message, cities, specialties } = req.body as IntentRequest;
   if (!message) { res.status(400).json({ error: "message required" }); return; }
@@ -227,7 +268,7 @@ Rules:
 
 // ── 1c. Symptom → Specialty ───────────────────────────────────────────────────
 app.post("/api/symptom-specialty", async (req: Request, res: Response): Promise<void> => {
-  if (!groq && !process.env.GEMINI_API_KEY) { res.json({ specialty: null }); return; }
+  if (!hasAnyLlm) { res.json({ specialty: null }); return; }
 
   const { symptom, specialties } = req.body as { symptom: string; specialties: string[] };
   if (!symptom) { res.status(400).json({ error: "symptom required" }); return; }

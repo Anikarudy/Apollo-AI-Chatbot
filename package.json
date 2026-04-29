@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "concurrently \"npm run dev:frontend\" \"npm run dev:server\"",
     "dev:frontend": "vite",
-    "dev:server": "ts-node --project tsconfig.server.json api/index.ts",
+    "dev:server": "NODE_OPTIONS=--use-system-ca ts-node --project tsconfig.server.json api/index.ts",
     "extract:data": "node scripts/extractData.js",
     "extract:web": "node scripts/extractWebData.js",
     "extract:all": "npm run extract:data && npm run extract:web",
