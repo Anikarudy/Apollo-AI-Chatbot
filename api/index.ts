@@ -5,7 +5,8 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import Groq from "groq-sdk";
 import axios from "axios";
 import * as cheerio from "cheerio";
-import { buildDoctorSearchUrl, buildLlmContext, getDoctorsForLocation, getDoctorsByName, doctors } from "../src/knowledgeBase";
+import { buildDoctorSearchUrl, buildLlmContext, getDoctorsForLocation, getDoctorsByName, doctors, hospitalsByCity } from "../src/knowledgeBase";
+import { doctors as generatedDoctors } from "../src/generatedData";
 
 dotenv.config();
 
@@ -100,6 +101,14 @@ function requireEdoc(res: Response): boolean {
   return true;
 }
 
+function logEdoc(step: string, payload: unknown): void {
+  try {
+    console.info(`[EDOC] ${step} ${JSON.stringify(payload)}`);
+  } catch {
+    console.info(`[EDOC] ${step}`, payload);
+  }
+}
+
 const MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
 
 /** Convert "1/7/2025" (D/M/YYYY) → "01-JUL-2025" */
@@ -120,6 +129,119 @@ function extractResourceId(url?: string): string | undefined {
   if (!url) return undefined;
   const m = /\/(\d{5,7})\/?(?:\?.*)?$/.exec(url);
   return m ? m[1] : undefined;
+}
+
+function normaliseNameForIdLookup(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/\bdr\.?\s*/g, "")
+    .replace(/[^a-z\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const doctorIdByName = new Map<string, string>();
+for (const d of generatedDoctors) {
+  const key = normaliseNameForIdLookup(d.name);
+  if (key && !doctorIdByName.has(key)) doctorIdByName.set(key, d.id);
+}
+
+function resolveResourceId(doctorName: string): string | undefined {
+  const key = normaliseNameForIdLookup(doctorName);
+  const exact = doctorIdByName.get(key);
+  if (exact) return exact;
+
+  // Safe fallback: use prefix matching only when it resolves to a single unique doctor.
+  const candidates = generatedDoctors
+    .filter((d) => {
+      const n = normaliseNameForIdLookup(d.name);
+      return !!n && (n.startsWith(key) || key.startsWith(n));
+    })
+    .slice(0, 3);
+
+  return candidates.length === 1 ? candidates[0]?.id : undefined;
+}
+
+function resolveLocationId(city?: string, branch?: string): string | undefined {
+  const cityInput = String(city ?? "").trim();
+  if (!cityInput) return undefined;
+  const cityKey = Object.keys(hospitalsByCity).find((k) => k.toLowerCase() === cityInput.toLowerCase());
+  if (!cityKey) return undefined;
+
+  const hospitals = hospitalsByCity[cityKey] ?? [];
+  if (hospitals.length === 0) return undefined;
+
+  const branchNorm = String(branch ?? "").toLowerCase().trim();
+  if (branchNorm) {
+    const matchedHospital = hospitals.find((h) => {
+      const hName = String(h.name ?? "").toLowerCase();
+      return hName.includes(branchNorm) || branchNorm.includes(hName);
+    });
+    if (matchedHospital?.locationId) return matchedHospital.locationId;
+  }
+
+  return hospitals.find((h) => !!h.locationId)?.locationId;
+}
+
+function getLocationCandidates(city?: string, preferred?: string): string[] {
+  const result: string[] = [];
+  const add = (v?: string) => {
+    const val = String(v ?? "").trim();
+    if (!val) return;
+    if (!result.includes(val)) result.push(val);
+  };
+
+  add(preferred);
+  const cityInput = String(city ?? "").trim();
+  if (!cityInput) return result;
+
+  const cityKey = Object.keys(hospitalsByCity).find((k) => k.toLowerCase() === cityInput.toLowerCase());
+  if (!cityKey) return result;
+  const hospitals = hospitalsByCity[cityKey] ?? [];
+  hospitals.forEach((h) => add(h.locationId));
+  return result;
+}
+
+function dateToDisplay(d: Date): string {
+  return `${d.getDate()}/${d.getMonth() + 1}/${d.getFullYear()}`;
+}
+
+async function inferLiveDatesFromRules(
+  resourceId: string,
+  locationId: string,
+  regionId: number,
+  maxProbeDays = 21,
+  maxDates = 7
+): Promise<Array<{ display: string; edoc: string }>> {
+  const inferred: Array<{ display: string; edoc: string }> = [];
+  const seen = new Set<string>();
+  const base = new Date();
+
+  for (let i = 0; i < maxProbeDays; i += 1) {
+    const d = new Date(base);
+    d.setDate(base.getDate() + i);
+    const display = dateToDisplay(d);
+    const edoc = toEdocDate(display);
+    try {
+      const r = await axios.post(
+        `${EDOC_BASE}/api/EDOC/DoctorCalenderRules`,
+        { RegionID: regionId, Locationid: locationId, ResourceID: resourceId, ID_Date: edoc },
+        { headers: edocHeaders(), timeout: 12000 }
+      );
+
+      const raw = (r.data as { getDoctorCalenderRulesDetails?: string }).getDoctorCalenderRulesDetails ?? "";
+      const slots = raw ? raw.split(",").map((s) => s.trim()).filter(Boolean) : [];
+      if (slots.length > 0 && !seen.has(edoc)) {
+        inferred.push({ display, edoc });
+        seen.add(edoc);
+      }
+      if (inferred.length >= maxDates) break;
+    } catch {
+      // Ignore per-date probe failures; this helper is best-effort.
+    }
+  }
+
+  return inferred;
 }
 
 
@@ -343,11 +465,13 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
       url,
       source: "local",
       doctors: matched.slice(0, 12).map((d) => ({
-        name:      d.name,
-        specialty: d.speciality,
-        hospital:  d.branch ? `Apollo ${d.branch}, ${d.location}` : `Apollo Hospitals, ${d.location}`,
+        name:       d.name,
+        specialty:  d.speciality,
+        hospital:   d.branch ? `Apollo ${d.branch}, ${d.location}` : `Apollo Hospitals, ${d.location}`,
         profileUrl: undefined,
-        resourceId: undefined,
+        resourceId: resolveResourceId(d.name),
+        locationId: resolveLocationId(d.location, d.branch),
+        regionId:   "5",
       })),
     });
     return;
@@ -368,11 +492,13 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
         url,
         source: "local",
         doctors: finalDocs.slice(0, 12).map((d) => ({
-          name: d.name,
-          specialty: d.speciality,
-          hospital: d.branch ? `Apollo ${d.branch}, ${d.location}` : `Apollo Hospitals, ${d.location}`,
+          name:       d.name,
+          specialty:  d.speciality,
+          hospital:   d.branch ? `Apollo ${d.branch}, ${d.location}` : `Apollo Hospitals, ${d.location}`,
           profileUrl: undefined,
-          resourceId: undefined,
+          resourceId: resolveResourceId(d.name),
+          locationId: resolveLocationId(d.location, d.branch),
+          regionId:   "5",
         })),
       });
       return;
@@ -392,11 +518,13 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
         url: buildDoctorSearchUrl(specialty),
         source: "local",
         doctors: specDocs.map((d) => ({
-          name:      d.name,
-          specialty: d.speciality,
-          hospital:  d.branch ? `Apollo ${d.branch}, ${d.location}` : `Apollo Hospitals, ${d.location}`,
+          name:       d.name,
+          specialty:  d.speciality,
+          hospital:   d.branch ? `Apollo ${d.branch}, ${d.location}` : `Apollo Hospitals, ${d.location}`,
           profileUrl: undefined,
-          resourceId: undefined,
+          resourceId: resolveResourceId(d.name),
+          locationId: resolveLocationId(d.location, d.branch),
+          regionId:   "5",
         })),
       });
       return;
@@ -425,10 +553,13 @@ app.post("/api/edoc/book-appointment", async (req: Request, res: Response): Prom
     return;
   }
   try {
+    logEdoc("BookAppointment.request", b);
     const r = await axios.post(`${EDOC_BASE}/api/EDOC/BookAppointment`, b, { headers: edocHeaders(), timeout: 15000 });
+    logEdoc("BookAppointment.response", r.data);
     res.json(r.data);
   } catch (err: unknown) {
     const e = err as { message?: string; response?: { data: unknown } };
+    logEdoc("BookAppointment.error", { message: e.message, response: e.response?.data });
     res.status(500).json({ error: e.response?.data ?? e.message ?? "BookAppointment failed" });
   }
 });
@@ -470,66 +601,229 @@ app.post("/api/edoc/cancel-appointment", async (req: Request, res: Response): Pr
 // 5. Fetch Real-time Slots (DoctorCalenderRules)
 app.post("/api/edoc/slots", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
-  const { resourceId, locationId, regionId, date } = req.body as Record<string, string>;
-  if (!resourceId || !locationId || !date) {
-    res.status(400).json({ error: "resourceId, locationId, date required" });
+  const { resourceId, locationId, regionId, date, city } = req.body as Record<string, string>;
+  if (!resourceId || !date) {
+    res.status(400).json({ error: "resourceId and date required" });
     return;
   }
+
+  const locationCandidates = getLocationCandidates(city, locationId);
+  if (locationCandidates.length === 0) {
+    res.status(200).json({ slots: [], retcode: -1, error: "No valid locationId available" });
+    return;
+  }
+
   try {
-    const r = await axios.post(
-      `${EDOC_BASE}/api/EDOC/DoctorCalenderRules`,
-      { RegionID: Number(regionId ?? "5"), Locationid: locationId, ResourceID: resourceId, ID_Date: date },
-      { headers: edocHeaders(), timeout: 15000 }
-    );
-    const raw = (r.data as { getDoctorCalenderRulesDetails?: string; retcode?: number }).getDoctorCalenderRulesDetails ?? "";
-    const slots = raw ? raw.split(",").map((s) => s.trim()).filter(Boolean) : [];
-    res.json({ slots, retcode: (r.data as { retcode?: number }).retcode ?? 0 });
+    let lastError = "";
+    for (const locId of locationCandidates) {
+      try {
+        logEdoc("DoctorCalenderRules.request", { resourceId, locationId: locId, regionId: Number(regionId ?? "5"), date });
+        const r = await axios.post(
+          `${EDOC_BASE}/api/EDOC/DoctorCalenderRules`,
+          { RegionID: Number(regionId ?? "5"), Locationid: locId, ResourceID: resourceId, ID_Date: date },
+          { headers: edocHeaders(), timeout: 15000 }
+        );
+        logEdoc("DoctorCalenderRules.response", r.data);
+        const raw = (r.data as { getDoctorCalenderRulesDetails?: string; retcode?: number }).getDoctorCalenderRulesDetails ?? "";
+        const slots = raw ? raw.split(",").map((s) => s.trim()).filter(Boolean) : [];
+        res.status(200).json({ slots, retcode: (r.data as { retcode?: number }).retcode ?? 0, locationId: locId });
+        return;
+      } catch (innerErr: unknown) {
+        const ie = innerErr as { message?: string };
+        logEdoc("DoctorCalenderRules.error", { message: ie.message, resourceId, locationId: locId, date });
+        lastError = ie.message ?? "DoctorCalenderRules failed";
+      }
+    }
+
+    res.status(200).json({ slots: [], retcode: -1, error: lastError || "DoctorCalenderRules failed" });
   } catch (err: unknown) {
     const e = err as { message?: string };
-    res.status(500).json({ error: e.message ?? "DoctorCalenderRules failed", slots: [] });
+    res.status(200).json({ error: e.message ?? "DoctorCalenderRules failed", slots: [], retcode: -1 });
   }
 });
 
 // 6. Fetch Real-time Slots V2 (DoctorCalenderRules_V2)
 app.post("/api/edoc/slots-v2", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
-  const { resourceId, locationId, regionId, date } = req.body as Record<string, string>;
-  if (!resourceId || !locationId || !date) {
-    res.status(400).json({ error: "resourceId, locationId, date required" });
+  const { resourceId, locationId, regionId, date, city } = req.body as Record<string, string>;
+  if (!resourceId || !date) {
+    res.status(400).json({ error: "resourceId and date required" });
     return;
   }
+
+  const locationCandidates = getLocationCandidates(city, locationId);
+  if (locationCandidates.length === 0) {
+    res.status(200).json({
+      services: [],
+      allSlots: [],
+      slotToServiceId: {},
+      defaultServiceId: null,
+      retcode: -1,
+      error: "No valid locationId available",
+    });
+    return;
+  }
+
   try {
-    const r = await axios.post(
-      `${EDOC_BASE}/api/EDOC/DoctorCalenderRules_V2`,
-      { RegionID: Number(regionId ?? "5"), Locationid: locationId, ResourceID: resourceId, ID_Date: date },
-      { headers: edocHeaders(), timeout: 15000 }
-    );
-    res.json(r.data);
+    let lastError = "";
+    for (const locId of locationCandidates) {
+      try {
+        logEdoc("DoctorCalenderRules_V2.request", { resourceId, locationId: locId, regionId: Number(regionId ?? "5"), date });
+        const r = await axios.post(
+          `${EDOC_BASE}/api/EDOC/DoctorCalenderRules_V2`,
+          { RegionID: Number(regionId ?? "5"), Locationid: locId, ResourceID: resourceId, ID_Date: date },
+          { headers: edocHeaders(), timeout: 15000 }
+        );
+        logEdoc("DoctorCalenderRules_V2.response", r.data);
+
+        const body = r.data as {
+          getDoctorNewRulesDetails?: Array<{
+            serviceid?: string | number;
+            servicedetail?: Array<{
+              requestdate?: string;
+              starttime?: string;
+              endtime?: string;
+              slotinterval?: string | number;
+              maxslot?: string | number;
+              split_slots?: string;
+            }>;
+          }>;
+          retcode?: number;
+          Message?: string | null;
+        };
+
+        const serviceRows = Array.isArray(body.getDoctorNewRulesDetails) ? body.getDoctorNewRulesDetails : [];
+        const services = serviceRows
+          .map((row) => {
+            const serviceId = String(row.serviceid ?? "").trim();
+            const details = Array.isArray(row.servicedetail) ? row.servicedetail : [];
+            const requestDate = String(details[0]?.requestdate ?? "").trim();
+            const startTime = String(details[0]?.starttime ?? "").trim();
+            const endTime = String(details[0]?.endtime ?? "").trim();
+            const slotInterval = String(details[0]?.slotinterval ?? "").trim();
+            const maxSlot = String(details[0]?.maxslot ?? "").trim();
+
+            const slotSet = new Set<string>();
+            details.forEach((d) => {
+              const split = String(d.split_slots ?? "");
+              split.split(",").forEach((value) => {
+                const slot = value.trim();
+                if (slot) slotSet.add(slot);
+              });
+            });
+
+            return {
+              serviceId,
+              requestDate,
+              startTime,
+              endTime,
+              slotInterval,
+              maxSlot,
+              slots: Array.from(slotSet),
+            };
+          })
+          .filter((row) => row.serviceId.length > 0);
+
+        const slotToServiceId: Record<string, string> = {};
+        const allSlotsSet = new Set<string>();
+        services.forEach((service) => {
+          service.slots.forEach((slot) => {
+            allSlotsSet.add(slot);
+            if (!slotToServiceId[slot]) slotToServiceId[slot] = service.serviceId;
+          });
+        });
+
+        const allSlots = Array.from(allSlotsSet).sort((a, b) => a.localeCompare(b));
+        res.status(200).json({
+          services,
+          allSlots,
+          slotToServiceId,
+          defaultServiceId: services[0]?.serviceId ?? null,
+          retcode: body.retcode ?? 0,
+          locationId: locId,
+          message: body.Message ?? null,
+        });
+        return;
+      } catch (innerErr: unknown) {
+        const ie = innerErr as { message?: string };
+        logEdoc("DoctorCalenderRules_V2.error", { message: ie.message, resourceId, locationId: locId, date });
+        lastError = ie.message ?? "DoctorCalenderRules_V2 failed";
+      }
+    }
+
+    res.status(200).json({
+      services: [],
+      allSlots: [],
+      slotToServiceId: {},
+      defaultServiceId: null,
+      retcode: -1,
+      error: lastError || "DoctorCalenderRules_V2 failed",
+    });
   } catch (err: unknown) {
     const e = err as { message?: string };
-    res.status(500).json({ error: e.message ?? "DoctorCalenderRules_V2 failed" });
+    res.status(200).json({
+      services: [],
+      allSlots: [],
+      slotToServiceId: {},
+      defaultServiceId: null,
+      retcode: -1,
+      error: e.message ?? "DoctorCalenderRules_V2 failed",
+    });
   }
 });
 
 // 7. Get Calendar Details for Online (Medmantra sync)
 app.post("/api/edoc/calendar-details", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
-  const { resourceId, locationId, regionId, date } = req.body as Record<string, string>;
-  if (!resourceId || !locationId) {
-    res.status(400).json({ error: "resourceId and locationId required" });
+  const { resourceId, locationId, regionId, date, city } = req.body as Record<string, string>;
+  if (!resourceId) {
+    res.status(400).json({ error: "resourceId required" });
     return;
   }
-  const xmlReq = `<ResourceDetails><Resource ResourceID = '${resourceId}' LocationID='${locationId}' /></ResourceDetails>`;
+
+  const locationCandidates = getLocationCandidates(city, locationId);
+  if (locationCandidates.length === 0) {
+    res.status(200).json({ calendar: [], retcode: -1, error: "No valid locationId available" });
+    return;
+  }
+
   try {
-    const r = await axios.post(
-      `${EDOC_BASE}/api/EDOC/GetCalendardetailsforOnline`,
-      { ixmlcalendarrequest: xmlReq, ID_Date: date ?? "", RegionID: Number(regionId ?? "5") },
-      { headers: edocHeaders(), timeout: 15000 }
-    );
-    res.json(r.data);
+    let lastError = "";
+    for (const locId of locationCandidates) {
+      try {
+        const xmlReq = `<ResourceDetails><Resource ResourceID = '${resourceId}' LocationID='${locId}' /></ResourceDetails>`;
+        logEdoc("GetCalendardetailsforOnline.request", {
+          resourceId,
+          locationId: locId,
+          regionId: Number(regionId ?? "5"),
+          date: date ?? "",
+        });
+        const r = await axios.post(
+          `${EDOC_BASE}/api/EDOC/GetCalendardetailsforOnline`,
+          { ixmlcalendarrequest: xmlReq, ID_Date: date ?? "", RegionID: Number(regionId ?? "5") },
+          { headers: edocHeaders(), timeout: 15000 }
+        );
+        logEdoc("GetCalendardetailsforOnline.response", r.data);
+        const body = r.data as { getCalendarList?: unknown[]; retcode?: number; Message?: string | null };
+        const calendar = Array.isArray(body.getCalendarList) ? body.getCalendarList : [];
+        res.status(200).json({
+          calendar,
+          retcode: body.retcode ?? 0,
+          locationId: locId,
+          message: body.Message ?? null,
+        });
+        return;
+      } catch (innerErr: unknown) {
+        const ie = innerErr as { message?: string };
+        logEdoc("GetCalendardetailsforOnline.error", { message: ie.message, resourceId, locationId: locId, date });
+        lastError = ie.message ?? "GetCalendardetailsforOnline failed";
+      }
+    }
+
+    res.status(200).json({ calendar: [], retcode: -1, error: lastError || "GetCalendardetailsforOnline failed" });
   } catch (err: unknown) {
     const e = err as { message?: string };
-    res.status(500).json({ error: e.message ?? "GetCalendardetailsforOnline failed" });
+    res.status(200).json({ calendar: [], retcode: -1, error: e.message ?? "GetCalendardetailsforOnline failed" });
   }
 });
 
@@ -537,19 +831,20 @@ app.post("/api/edoc/calendar-details", async (req: Request, res: Response): Prom
 app.post("/api/edoc/uhid-search", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const { phone, regionId, uhidNumber } = req.body as Record<string, string>;
-  if (!phone) {
+  const normalizedPhone = String(phone ?? "").replace(/[^0-9+]/g, "");
+  if (!normalizedPhone) {
     res.status(400).json({ error: "phone required" });
     return;
   }
   // Validate phone – only digits and optional leading +
-  if (!/^\+?[0-9]{10,13}$/.test(phone.replace(/\s/g, ""))) {
+  if (!/^\+?[0-9]{10,13}$/.test(normalizedPhone)) {
     res.status(400).json({ error: "Invalid phone number format" });
     return;
   }
   try {
     const r = await axios.post(
       `${EDOC_BASE}/api/EDOC/GetUHID`,
-      { MobileNumber: phone, RegionID: Number(regionId ?? "5"), UHIDNumber: uhidNumber ?? "" },
+      { MobileNumber: normalizedPhone, RegionID: Number(regionId ?? "5"), UHIDNumber: uhidNumber ?? "" },
       { headers: edocHeaders(), timeout: 15000 }
     );
     const data = r.data as { getUHIDList?: unknown[]; retcode?: number };
@@ -563,26 +858,100 @@ app.post("/api/edoc/uhid-search", async (req: Request, res: Response): Promise<v
 // 9. Doctor Calendar Live Dates
 app.post("/api/edoc/calendar-dates", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
-  const { resourceId, locationId, regionId } = req.body as Record<string, string>;
-  if (!resourceId || !locationId) {
-    res.status(400).json({ error: "resourceId and locationId required" });
+  const { resourceId, locationId, regionId, city } = req.body as Record<string, string>;
+  if (!resourceId) {
+    res.status(400).json({ error: "resourceId required" });
     return;
   }
+
+  const locationCandidates = getLocationCandidates(city, locationId);
+  if (locationCandidates.length === 0) {
+    res.status(200).json({ dates: [], retcode: -1, error: "No valid locationId available" });
+    return;
+  }
+
   try {
-    const r = await axios.post(
-      `${EDOC_BASE}/api/EDOC/DoctorCalenderLiveDates`,
-      { RegionID: Number(regionId ?? "5"), Locationid: locationId, ResourceID: resourceId },
-      { headers: edocHeaders(), timeout: 15000 }
-    );
-    const raw = (r.data as { Dates?: string; retcode?: number }).Dates ?? "";
-    // Convert D/M/YYYY format → EDOC format "DD-MON-YYYY" + keep original for display
-    const dates = raw
-      ? raw.split(",").map((d) => ({ display: d.trim(), edoc: toEdocDate(d.trim()) })).slice(0, 30)
-      : [];
-    res.json({ dates, retcode: (r.data as { retcode?: number }).retcode ?? 0 });
+    let lastError = "";
+    for (const locId of locationCandidates) {
+      try {
+        logEdoc("DoctorCalenderLiveDates.request", { resourceId, locationId: locId, regionId: Number(regionId ?? "5") });
+        const r = await axios.post(
+          `${EDOC_BASE}/api/EDOC/DoctorCalenderLiveDates`,
+          { RegionID: Number(regionId ?? "5"), Locationid: locId, ResourceID: resourceId },
+          { headers: edocHeaders(), timeout: 15000 }
+        );
+        logEdoc("DoctorCalenderLiveDates.response", r.data);
+        const raw = (r.data as { Dates?: string; retcode?: number }).Dates ?? "";
+        const retcode = (r.data as { retcode?: number }).retcode ?? 0;
+        // Convert D/M/YYYY format → EDOC format "DD-MON-YYYY" + keep original for display
+        let dates = raw
+          ? raw.split(",").map((d) => ({ display: d.trim(), edoc: toEdocDate(d.trim()) })).slice(0, 30)
+          : [];
+
+        if (dates.length === 0) {
+          logEdoc("DoctorCalenderLiveDates.fallback_probe.start", {
+            resourceId,
+            locationId: locId,
+            regionId: Number(regionId ?? "5"),
+            maxProbeDays: 21,
+            maxDates: 7,
+          });
+
+          const inferredDates = await inferLiveDatesFromRules(
+            resourceId,
+            locId,
+            Number(regionId ?? "5"),
+            21,
+            7
+          );
+
+          if (inferredDates.length > 0) {
+            dates = inferredDates;
+            logEdoc("DoctorCalenderLiveDates.fallback_probe.success", {
+              resourceId,
+              locationId: locId,
+              inferredDatesCount: inferredDates.length,
+              firstDate: inferredDates[0]?.edoc ?? null,
+            });
+          } else {
+            logEdoc("DoctorCalenderLiveDates.fallback_probe.empty", {
+              resourceId,
+              locationId: locId,
+              reason: "No slots found in probed date window",
+            });
+          }
+        }
+
+        if (dates.length === 0) {
+          logEdoc("DoctorCalenderLiveDates.no_live_dates", {
+            resourceId,
+            requestedLocationId: locationId ?? null,
+            resolvedLocationId: locId,
+            regionId: Number(regionId ?? "5"),
+            city: city ?? null,
+            retcode,
+            rawDates: raw,
+            reason: "EDOC returned empty Dates",
+          });
+        }
+        res.status(200).json({
+          dates,
+          retcode,
+          locationId: locId,
+          datesSource: raw ? "DoctorCalenderLiveDates" : (dates.length > 0 ? "DoctorCalenderRulesProbe" : "None"),
+        });
+        return;
+      } catch (innerErr: unknown) {
+        const ie = innerErr as { message?: string };
+        logEdoc("DoctorCalenderLiveDates.error", { message: ie.message, resourceId, locationId: locId });
+        lastError = ie.message ?? "DoctorCalenderLiveDates failed";
+      }
+    }
+
+    res.status(200).json({ dates: [], retcode: -1, error: lastError || "DoctorCalenderLiveDates failed" });
   } catch (err: unknown) {
     const e = err as { message?: string };
-    res.status(500).json({ error: e.message ?? "DoctorCalenderLiveDates failed", dates: [] });
+    res.status(200).json({ error: e.message ?? "DoctorCalenderLiveDates failed", dates: [], retcode: -1 });
   }
 });
 

@@ -35,6 +35,54 @@ export interface LiveDate {
   month: string;     // "JUL"
 }
 
+interface AvailableDatesResponse {
+  dates?: Array<{ display: string; edoc: string }>;
+  retcode?: number;
+  error?: string;
+  locationId?: string;
+}
+
+interface SlotsResponse {
+  slots?: string[];
+  retcode?: number;
+  error?: string;
+  locationId?: string;
+}
+
+interface SlotsV2Response {
+  services?: Array<{
+    serviceId: string;
+    requestDate?: string;
+    startTime?: string;
+    endTime?: string;
+    slotInterval?: string;
+    maxSlot?: string;
+    slots: string[];
+  }>;
+  allSlots?: string[];
+  slotToServiceId?: Record<string, string>;
+  defaultServiceId?: string | null;
+  retcode?: number;
+  error?: string;
+  locationId?: string;
+  message?: string | null;
+}
+
+interface CalendarDetailsResponse {
+  calendar?: Array<Record<string, unknown>>;
+  retcode?: number;
+  error?: string;
+  locationId?: string;
+  message?: string | null;
+}
+
+interface BookAppointmentResponse {
+  AppointmentID?: string | number;
+  retcode?: number;
+  Message?: string | null;
+  error?: unknown;
+}
+
 let msgId = 0;
 const nextId = () => ++msgId;
 
@@ -93,7 +141,11 @@ export function useChatMachine() {
   const [liveDates, setLiveDates] = useState<Record<string, LiveDate[]>>({});
   // Live slots: key = `${doctorKey}||${edocDate}`, value = string[] (times like "08:00")
   const [liveSlots, setLiveSlots] = useState<Record<string, string[]>>({});
+  // Key = `${doctorKey}||${edocDate}||${slot}`; value = serviceId from DoctorCalenderRules_V2
+  const [slotServiceByKey, setSlotServiceByKey] = useState<Record<string, string>>({});
   const [slotsLoading, setSlotsLoading] = useState<Record<string, boolean>>({});
+  const liveDateRequestsInFlight = useRef<Set<string>>(new Set());
+  const liveDateRequestsDone = useRef<Set<string>>(new Set());
 
   // Initialize runner once
   useEffect(() => {
@@ -111,6 +163,206 @@ export function useChatMachine() {
     const resp = getStateResponse(state, ctx);
     setMessages((prev) => [...prev, { id: nextId(), sender: "bot", text: resp.message }]);
   }, []);
+
+  const logEdoc = useCallback((step: string, payload: Record<string, unknown>) => {
+    // Keep logs verbose by design for EDOC diagnostics.
+    console.info(`[EDOC] ${step}`, payload);
+  }, []);
+
+  const getAvailableDates = useCallback(async (
+    params: {
+      resourceId: string;
+      locationId: string;
+      regionId: string;
+      city?: string;
+      signal?: AbortSignal;
+    }
+  ): Promise<AvailableDatesResponse> => {
+    logEdoc("DoctorCalenderLiveDates.request", params as unknown as Record<string, unknown>);
+    const res = await fetch("/api/edoc/calendar-dates", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        resourceId: params.resourceId,
+        locationId: params.locationId,
+        regionId: params.regionId,
+        city: params.city,
+      }),
+      signal: params.signal,
+    });
+    const data = (await res.json()) as AvailableDatesResponse;
+    const datesCount = (data.dates ?? []).length;
+    logEdoc("DoctorCalenderLiveDates.response", { status: res.status, data });
+    logEdoc("DoctorCalenderLiveDates.summary", {
+      resourceId: params.resourceId,
+      locationId: data.locationId ?? params.locationId,
+      retcode: data.retcode ?? null,
+      datesCount,
+      error: data.error ?? null,
+    });
+    if (datesCount === 0) {
+      logEdoc("DoctorCalenderLiveDates.no_live_dates", {
+        resourceId: params.resourceId,
+        requestedLocationId: params.locationId,
+        resolvedLocationId: data.locationId ?? params.locationId,
+        regionId: params.regionId,
+        city: params.city ?? null,
+        retcode: data.retcode ?? null,
+        error: data.error ?? null,
+        reason: data.error ? "calendar-dates returned an error" : "calendar-dates returned an empty dates array",
+      });
+    }
+    if (!res.ok) {
+      throw new Error(String(data.error ?? "DoctorCalenderLiveDates failed"));
+    }
+    return data;
+  }, [logEdoc]);
+
+  const getSlots = useCallback(async (
+    params: {
+      resourceId: string;
+      locationId: string;
+      regionId: string;
+      date: string;
+      city?: string;
+      signal?: AbortSignal;
+    }
+  ): Promise<SlotsResponse> => {
+    logEdoc("DoctorCalenderRules.request", params as unknown as Record<string, unknown>);
+    const res = await fetch("/api/edoc/slots", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        resourceId: params.resourceId,
+        locationId: params.locationId,
+        regionId: params.regionId,
+        date: params.date,
+        city: params.city,
+      }),
+      signal: params.signal,
+    });
+    const data = (await res.json()) as SlotsResponse;
+    logEdoc("DoctorCalenderRules.response", { status: res.status, data });
+    logEdoc("DoctorCalenderRules.summary", {
+      resourceId: params.resourceId,
+      locationId: data.locationId ?? params.locationId,
+      date: params.date,
+      retcode: data.retcode ?? null,
+      slotsCount: (data.slots ?? []).length,
+      error: data.error ?? null,
+    });
+    if (!res.ok) {
+      throw new Error(String(data.error ?? "DoctorCalenderRules failed"));
+    }
+    return data;
+  }, [logEdoc]);
+
+  const getSlotsV2 = useCallback(async (
+    params: {
+      resourceId: string;
+      locationId: string;
+      regionId: string;
+      date: string;
+      city?: string;
+      signal?: AbortSignal;
+    }
+  ): Promise<SlotsV2Response> => {
+    logEdoc("DoctorCalenderRules_V2.request", params as unknown as Record<string, unknown>);
+    const res = await fetch("/api/edoc/slots-v2", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        resourceId: params.resourceId,
+        locationId: params.locationId,
+        regionId: params.regionId,
+        date: params.date,
+        city: params.city,
+      }),
+      signal: params.signal,
+    });
+    const data = (await res.json()) as SlotsV2Response;
+    logEdoc("DoctorCalenderRules_V2.response", { status: res.status, data });
+    logEdoc("DoctorCalenderRules_V2.summary", {
+      resourceId: params.resourceId,
+      locationId: data.locationId ?? params.locationId,
+      date: params.date,
+      retcode: data.retcode ?? null,
+      servicesCount: (data.services ?? []).length,
+      slotsCount: (data.allSlots ?? []).length,
+      defaultServiceId: data.defaultServiceId ?? null,
+      error: data.error ?? null,
+    });
+    if (!res.ok) {
+      throw new Error(String(data.error ?? "DoctorCalenderRules_V2 failed"));
+    }
+    return data;
+  }, [logEdoc]);
+
+  const getCalendarDetails = useCallback(async (
+    params: {
+      resourceId: string;
+      locationId: string;
+      regionId: string;
+      date: string;
+      city?: string;
+      signal?: AbortSignal;
+    }
+  ): Promise<CalendarDetailsResponse> => {
+    logEdoc("GetCalendardetailsforOnline.request", params as unknown as Record<string, unknown>);
+    const res = await fetch("/api/edoc/calendar-details", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        resourceId: params.resourceId,
+        locationId: params.locationId,
+        regionId: params.regionId,
+        date: params.date,
+        city: params.city,
+      }),
+      signal: params.signal,
+    });
+    const data = (await res.json()) as CalendarDetailsResponse;
+    logEdoc("GetCalendardetailsforOnline.response", { status: res.status, data });
+    logEdoc("GetCalendardetailsforOnline.summary", {
+      resourceId: params.resourceId,
+      locationId: data.locationId ?? params.locationId,
+      date: params.date,
+      retcode: data.retcode ?? null,
+      calendarRows: (data.calendar ?? []).length,
+      error: data.error ?? null,
+    });
+    if (!res.ok) {
+      throw new Error(String(data.error ?? "GetCalendardetailsforOnline failed"));
+    }
+    return data;
+  }, [logEdoc]);
+
+  const formatSlot = useCallback((edocDate: string, selectedSlot: string): { StartDateTime: string; EndDateTime: string } => {
+    if (!/^\d{2}-[A-Z]{3}-\d{4}$/.test(edocDate)) {
+      throw new Error(`Invalid EDOC date format: ${edocDate}`);
+    }
+    if (!/^\d{2}:\d{2}$/.test(selectedSlot)) {
+      throw new Error(`Invalid slot format: ${selectedSlot}`);
+    }
+    const StartDateTime = `${edocDate} ${selectedSlot}:00`;
+    const EndDateTime = `${edocDate} ${addFifteenMin(selectedSlot)}:00`;
+    return { StartDateTime, EndDateTime };
+  }, []);
+
+  const bookAppointment = useCallback(async (payload: Record<string, unknown>): Promise<BookAppointmentResponse> => {
+    logEdoc("BookAppointment.request", payload);
+    const res = await fetch("/api/edoc/book-appointment", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = (await res.json()) as BookAppointmentResponse;
+    logEdoc("BookAppointment.response", { status: res.status, data });
+    if (!res.ok) {
+      throw new Error(String((data as { error?: string }).error ?? "BookAppointment failed"));
+    }
+    return data;
+  }, [logEdoc]);
 
   // Fire event silently (no bot message — used for async EDOC transitions)
   const sendSilentEvent = useCallback((eventType: string, value?: string) => {
@@ -160,7 +412,16 @@ export function useChatMachine() {
         const res = await fetch(`/api/doctors?${params.toString()}`, { signal: controller.signal });
         if (!res.ok) throw new Error("doctor fetch failed");
         const data = (await res.json()) as {
-          doctors?: Array<{ name: string; specialty?: string; hospital?: string; profileUrl?: string; resourceId?: string }>;
+          doctors?: Array<{
+            name: string;
+            specialty?: string;
+            hospital?: string;
+            profileUrl?: string;
+            resourceId?: string;
+            locationId?: string;
+            regionId?: string;
+            serviceId?: string;
+          }>;
         };
 
         const cards = (data.doctors ?? []).slice(0, 6).map((d) => ({
@@ -169,8 +430,9 @@ export function useChatMachine() {
           hospital:   d.hospital  ?? hospital,
           profileUrl: d.profileUrl,
           resourceId: d.resourceId,
-          locationId: undefined as string | undefined,
-          regionId:   "5",
+          locationId: d.locationId,
+          regionId:   d.regionId ?? "5",
+          serviceId:  d.serviceId,
         }));
 
         if (cards.length > 0) {
@@ -194,29 +456,142 @@ export function useChatMachine() {
     if (currentState !== "SHOW_DOCTORS" && currentState !== "RESCHEDULE_APPOINTMENT") return;
     if (doctorCards.length === 0) return;
     setLiveDates({});
+    setLiveSlots({});
+    setSlotServiceByKey({});
 
     const controller = new AbortController();
     doctorCards.forEach((doctor, idx) => {
       if (!doctor.resourceId || !doctor.locationId) return;
+      const resourceId = doctor.resourceId;
+      const locationId = doctor.locationId;
       const key = `${doctor.name}-${idx}`;
+      const requestKey = `${resourceId}|${locationId}|${doctor.regionId ?? "5"}|${machineCtx.city ?? ""}`;
+      if (liveDateRequestsInFlight.current.has(requestKey) || liveDateRequestsDone.current.has(requestKey)) return;
+      liveDateRequestsInFlight.current.add(requestKey);
 
-      fetch("/api/edoc/calendar-dates", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ resourceId: doctor.resourceId, locationId: doctor.locationId, regionId: doctor.regionId ?? "5" }),
-        signal: controller.signal,
-      })
-        .then((r) => r.json())
-        .then((data: unknown) => {
-          const d = data as { dates?: Array<{ display: string; edoc: string }> };
+      const loadLiveSchedule = async () => {
+        try {
+          const d = await getAvailableDates({
+            resourceId,
+            locationId,
+            regionId: doctor.regionId ?? "5",
+            city: machineCtx.city,
+            signal: controller.signal,
+          });
           const parsed: LiveDate[] = (d.dates ?? []).slice(0, 7).map((e) => parseLiveDate(e.display));
           setLiveDates((prev) => ({ ...prev, [key]: parsed }));
-        })
-        .catch(() => {/* no live dates – UI falls back to static */});
+
+          const resolvedLocationId = d.locationId ?? locationId;
+          if (d.locationId && d.locationId !== locationId) {
+            setDoctorCards((prev) =>
+              {
+                let changed = false;
+                const next = prev.map((card, cardIdx) => {
+                  if (cardIdx !== idx) return card;
+                  if (card.locationId === d.locationId) return card;
+                  changed = true;
+                  return { ...card, locationId: d.locationId };
+                });
+                return changed ? next : prev;
+              }
+            );
+          }
+
+          // Auto-load slots for the first available date so live slot API is used immediately.
+          const firstDate = parsed[0];
+          if (!firstDate) return;
+          const slotKey = `${key}||${firstDate.edoc}`;
+          setSlotsLoading((prev) => ({ ...prev, [slotKey]: true }));
+          try {
+            try {
+              await getCalendarDetails({
+                resourceId,
+                locationId: resolvedLocationId,
+                regionId: doctor.regionId ?? "5",
+                date: firstDate.edoc,
+                city: machineCtx.city,
+                signal: controller.signal,
+              });
+            } catch {
+              // Keep booking flow alive even if sync-calendar endpoint fails.
+            }
+
+            let resolvedServiceId = doctor.serviceId;
+            let slotList: string[] = [];
+            try {
+              const s2 = await getSlotsV2({
+                resourceId,
+                locationId: resolvedLocationId,
+                regionId: doctor.regionId ?? "5",
+                date: firstDate.edoc,
+                city: machineCtx.city,
+                signal: controller.signal,
+              });
+              slotList = s2.allSlots ?? [];
+              if (s2.defaultServiceId) resolvedServiceId = s2.defaultServiceId;
+              const slotToServiceId = s2.slotToServiceId ?? {};
+              if (Object.keys(slotToServiceId).length > 0) {
+                setSlotServiceByKey((prev) => {
+                  const next = { ...prev };
+                  Object.entries(slotToServiceId).forEach(([slot, serviceId]) => {
+                    next[`${slotKey}||${slot}`] = serviceId;
+                  });
+                  return next;
+                });
+              }
+            } catch {
+              slotList = [];
+            }
+
+            if (slotList.length === 0) {
+              const s = await getSlots({
+                resourceId,
+                locationId: resolvedLocationId,
+                regionId: doctor.regionId ?? "5",
+                date: firstDate.edoc,
+                city: machineCtx.city,
+                signal: controller.signal,
+              });
+              slotList = s.slots ?? [];
+            }
+
+            setLiveSlots((prev) => ({ ...prev, [slotKey]: slotList }));
+            if (resolvedServiceId && resolvedServiceId !== doctor.serviceId) {
+              setDoctorCards((prev) => {
+                let changed = false;
+                const next = prev.map((card, cardIdx) => {
+                  if (cardIdx !== idx) return card;
+                  if (card.serviceId === resolvedServiceId) return card;
+                  changed = true;
+                  return { ...card, serviceId: resolvedServiceId };
+                });
+                return changed ? next : prev;
+              });
+            }
+          } catch {
+            setLiveSlots((prev) => ({ ...prev, [slotKey]: [] }));
+          } finally {
+            setSlotsLoading((prev) => ({ ...prev, [slotKey]: false }));
+          }
+        } catch {
+          setLiveDates((prev) => ({ ...prev, [key]: [] }));
+        } finally {
+          liveDateRequestsInFlight.current.delete(requestKey);
+          liveDateRequestsDone.current.add(requestKey);
+        }
+      };
+
+      void loadLiveSchedule();
     });
 
     return () => controller.abort();
-  }, [currentState, doctorCards]);
+  }, [currentState, doctorCards, machineCtx.city, getAvailableDates, getCalendarDetails, getSlots, getSlotsV2]);
+
+  useEffect(() => {
+    if (currentState === "SHOW_DOCTORS" || currentState === "RESCHEDULE_APPOINTMENT") return;
+    liveDateRequestsInFlight.current.clear();
+    liveDateRequestsDone.current.clear();
+  }, [currentState]);
 
   // ── Fetch slots on demand ────────────────────────────────────────────────
   const fetchSlotsForDate = useCallback(async (
@@ -230,19 +605,46 @@ export function useChatMachine() {
     if (liveSlots[cacheKey] !== undefined) return; // already cached
     setSlotsLoading((prev) => ({ ...prev, [cacheKey]: true }));
     try {
-      const res = await fetch("/api/edoc/slots", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ resourceId, locationId, regionId, date: edocDate }),
-      });
-      const data = (await res.json()) as { slots?: string[] };
-      setLiveSlots((prev) => ({ ...prev, [cacheKey]: data.slots ?? [] }));
+      try {
+        await getCalendarDetails({ resourceId, locationId, regionId, date: edocDate, city: machineCtx.city });
+      } catch {
+        // Keep booking flow alive even if sync-calendar endpoint fails.
+      }
+
+      let slotList: string[] = [];
+      try {
+        const dataV2 = await getSlotsV2({ resourceId, locationId, regionId, date: edocDate, city: machineCtx.city });
+        slotList = dataV2.allSlots ?? [];
+        const slotToServiceId = dataV2.slotToServiceId ?? {};
+        if (Object.keys(slotToServiceId).length > 0) {
+          setSlotServiceByKey((prev) => {
+            const next = { ...prev };
+            Object.entries(slotToServiceId).forEach(([slot, serviceId]) => {
+              next[`${cacheKey}||${slot}`] = serviceId;
+            });
+            return next;
+          });
+        }
+      } catch {
+        slotList = [];
+      }
+
+      if (slotList.length === 0) {
+        const data = await getSlots({ resourceId, locationId, regionId, date: edocDate, city: machineCtx.city });
+        slotList = data.slots ?? [];
+      }
+
+      setLiveSlots((prev) => ({ ...prev, [cacheKey]: slotList }));
     } catch {
       setLiveSlots((prev) => ({ ...prev, [cacheKey]: [] }));
     } finally {
       setSlotsLoading((prev) => ({ ...prev, [cacheKey]: false }));
     }
-  }, [liveSlots]);
+  }, [liveSlots, machineCtx.city, getCalendarDetails, getSlots, getSlotsV2]);
+
+  const getServiceIdForSlot = useCallback((doctorKey: string, edocDate: string, slot: string): string | undefined => {
+    return slotServiceByKey[`${doctorKey}||${edocDate}||${slot}`];
+  }, [slotServiceByKey]);
 
   // ── EDOC async state side-effects ────────────────────────────────────────
 
@@ -325,56 +727,57 @@ export function useChatMachine() {
     if (currentState !== "PROCESS_BOOKING") return;
     if (edocFiredForState.current === currentState) return;
     edocFiredForState.current = currentState;
-    const { resourceId, locationId, regionId, serviceId, uhid, selectedDate, selectedSlotStart, selectedSlotEnd, phoneNumber, doctorName, specialty } = machineCtx;
+    const { resourceId, locationId, regionId, serviceId, uhid, selectedDate, selectedSlotStart, phoneNumber } = machineCtx;
     if (!resourceId || !locationId || !selectedDate || !selectedSlotStart || !uhid) {
       sendSilentEvent("BOOKING_FAILED");
       return;
     }
-    const startDT = `${selectedDate} ${selectedSlotStart}:00`;
-    const endDT   = `${selectedDate} ${selectedSlotEnd ?? addFifteenMin(selectedSlotStart)}:00`;
 
-    fetch("/api/edoc/book-appointment", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        RegistrationType: "QuickUHID",
-        LocationID: locationId,
-        RegionID: Number(regionId ?? "5"),
-        ResourceID: resourceId,
-        UHIDNumber: uhid,
-        ServiceID: serviceId ?? "0",
-        FirstName: machineCtx.patientFirstName ?? "Patient",
-        LastName: machineCtx.patientLastName ?? "User",
-        SpecialityID: "0",
-        Country: "0",
-        State: "0",
-        StatusCheck: "102",
-        MobileNumber: phoneNumber ?? "0000000000",
-        District: "0",
-        Gender: "71",
-        City: "0",
-        AddressTypeID: "0",
-        Flag: "0",
-        REGULARIZATIONCHECK: "0",
-        StartDateTime: startDT,
-        EndDateTime: endDT,
-        InternationalPatientFlag: false,
-        logID: crypto.randomUUID(),
-        ModeofAppointment: "Apollo Assist Web",
-      }),
-    })
-      .then((r) => r.json())
-      .then((data: unknown) => {
-        const d = data as { AppointmentID?: string | number; retcode?: number };
+    const runBookAppointment = async () => {
+      try {
+        const { StartDateTime, EndDateTime } = formatSlot(selectedDate, selectedSlotStart);
+        const payload: Record<string, unknown> = {
+          RegistrationType: "QuickUHID",
+          LocationID: locationId,
+          RegionID: Number(regionId ?? "5"),
+          ResourceID: resourceId,
+          UHIDNumber: uhid,
+          ServiceID: serviceId ?? "0",
+          FirstName: machineCtx.patientFirstName ?? "Patient",
+          LastName: machineCtx.patientLastName ?? "User",
+          SpecialityID: "0",
+          Country: "0",
+          State: "0",
+          StatusCheck: "102",
+          MobileNumber: phoneNumber ?? "0000000000",
+          District: "0",
+          Gender: "71",
+          City: "0",
+          AddressTypeID: "0",
+          Flag: "0",
+          REGULARIZATIONCHECK: "0",
+          StartDateTime,
+          EndDateTime,
+          InternationalPatientFlag: false,
+          logID: crypto.randomUUID(),
+          ModeofAppointment: "Ask Apollo Web",
+        };
+        const d = await bookAppointment(payload);
         if (d.AppointmentID !== undefined && d.retcode === 0) {
           sendSilentEvent("BOOKING_DONE", String(d.AppointmentID));
         } else {
+          logEdoc("BookAppointment.retcode_failure", { response: d });
           sendSilentEvent("BOOKING_FAILED");
         }
-      })
-      .catch(() => sendSilentEvent("BOOKING_FAILED"));
+      } catch (err: unknown) {
+        logEdoc("BookAppointment.exception", { error: String(err) });
+        sendSilentEvent("BOOKING_FAILED");
+      }
+    };
+
+    void runBookAppointment();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentState]);
+  }, [currentState, formatSlot, bookAppointment, logEdoc]);
 
   // PROCESS_RESCHEDULE: call ResheduleAppointment
   useEffect(() => {
@@ -581,7 +984,7 @@ export function useChatMachine() {
    * Encodes slot details as JSON and fires SELECT_SLOT.
    */
   const selectDoctorForBooking = useCallback(
-    (doctor: DoctorCardData, edocDate: string, startTime: string) => {
+    (doctor: DoctorCardData, edocDate: string, startTime: string, serviceIdOverride?: string) => {
       const endTime = addFifteenMin(startTime);
       const payload = JSON.stringify({
         date:       edocDate,
@@ -590,7 +993,7 @@ export function useChatMachine() {
         resourceId: doctor.resourceId,
         locationId: doctor.locationId,
         regionId:   doctor.regionId ?? "5",
-        serviceId:  doctor.serviceId,
+        serviceId:  serviceIdOverride ?? doctor.serviceId,
       });
       setMessages((prev) => [
         ...prev,
@@ -614,6 +1017,7 @@ export function useChatMachine() {
     setDoctorCards([]);
     setLiveDates({});
     setLiveSlots({});
+    setSlotServiceByKey({});
     setSlotsLoading({});
     setMessages([{ id: nextId(), sender: "bot", text: getStateResponse(initial).message }]);
   }, []);
@@ -627,6 +1031,7 @@ export function useChatMachine() {
     liveDates,
     liveSlots,
     slotsLoading,
+    getServiceIdForSlot,
     fetchSlotsForDate,
     selectDoctorForBooking,
     sendUserText,

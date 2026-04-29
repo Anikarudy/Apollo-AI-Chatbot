@@ -1,36 +1,13 @@
 import React, { useEffect, useRef, useState, KeyboardEvent } from "react";
 import "./ChatWidget.css";
 import { useChatMachine } from "../hooks/useChatMachine";
-import type { LiveDate } from "../hooks/useChatMachine";
 import { getStateResponse } from "../stateResponses";
-
-/** Next 3 calendar days as a static fallback when live dates unavailable */
-function staticFallbackDates(): LiveDate[] {
-  const MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
-  const DAYS   = ["SUN","MON","TUE","WED","THU","FRI","SAT"];
-  return Array.from({ length: 3 }, (_, i) => {
-    const dt = new Date();
-    dt.setDate(dt.getDate() + i + 1);
-    const d  = String(dt.getDate());
-    const m  = MONTHS[dt.getMonth()];
-    const y  = String(dt.getFullYear());
-    return {
-      display: `${d}/${dt.getMonth() + 1}/${y}`,
-      edoc:    `${d.padStart(2, "0")}-${m}-${y}`,
-      label:   DAYS[dt.getDay()],
-      date:    d,
-      month:   m,
-    };
-  });
-}
-
-const STATIC_SLOTS = ["10:30", "12:00", "14:00", "15:30", "17:00"];
 
 const ChatWidget: React.FC = () => {
   const {
     messages, currentState, machineCtx, isLlmLoading, doctorCards,
     liveDates, liveSlots, slotsLoading,
-    fetchSlotsForDate, selectDoctorForBooking,
+    getServiceIdForSlot, fetchSlotsForDate, selectDoctorForBooking,
     sendUserText, sendQuickReply, resetMachine,
   } = useChatMachine();
 
@@ -144,15 +121,18 @@ const ChatWidget: React.FC = () => {
           <div className="appt-card-wrap" aria-live="polite">
             {doctorCards.map((doctor, idx) => {
               const doctorKey = `${doctor.name}-${idx}`;
-              const dates        = liveDates[doctorKey] ?? staticFallbackDates();
+              const hasLiveSchedule = !!doctor.resourceId && !!doctor.locationId;
+              const dates        = liveDates[doctorKey] ?? [];
+              const hasDatesLoaded = Object.prototype.hasOwnProperty.call(liveDates, doctorKey);
+              const liveDatesCount = dates.length;
               const selectedIdx  = selectedDateIdxByDoctor[doctorKey] ?? 0;
               const selectedDate = dates[selectedIdx];
               const selectedSlot = selectedSlotByDoctor[doctorKey] ?? null;
               const slotKey      = `${doctorKey}||${selectedDate?.edoc ?? ""}`;
               const slots        = selectedDate
-                ? (doctor.resourceId && doctor.locationId
+                ? (hasLiveSchedule
                     ? (liveSlots[slotKey] ?? null)
-                    : STATIC_SLOTS)
+                    : [])
                 : [];
               const isLoadingSlots = slotsLoading[slotKey] ?? false;
 
@@ -174,36 +154,49 @@ const ChatWidget: React.FC = () => {
                   <div className="appt-meta">
                     <p>🏥 {doctor.hospital}</p>
                     {doctor.resourceId && <p className="appt-resource-id">Resource ID: {doctor.resourceId}</p>}
+                    {hasLiveSchedule && (
+                      <p className="appt-resource-id">
+                        EDOC live dates: {hasDatesLoaded ? liveDatesCount : "checking..."}
+                      </p>
+                    )}
                   </div>
 
                   {/* Date tabs */}
-                  <div className="appt-day-tabs" role="tablist" aria-label={`Choose a day for ${doctor.name}`}>
-                    {dates.map((day, dayIdx) => (
-                      <button
-                        key={`${doctorKey}-${day.edoc}`}
-                        type="button"
-                        role="tab"
-                        aria-selected={selectedIdx === dayIdx}
-                        className={`appt-day-btn ${selectedIdx === dayIdx ? "active" : ""}`}
-                        onClick={() => {
-                          setSelectedDateIdxByDoctor((prev) => ({ ...prev, [doctorKey]: dayIdx }));
-                          setSelectedSlotByDoctor((prev) => ({ ...prev, [doctorKey]: null }));
-                          if (doctor.resourceId && doctor.locationId) {
-                            void fetchSlotsForDate(doctorKey, doctor.resourceId, doctor.locationId, doctor.regionId ?? "5", day.edoc);
-                          }
-                        }}
-                      >
-                        <span>{day.label}</span>
-                        <strong>{day.date}</strong>
-                        <small>{day.month}</small>
-                      </button>
-                    ))}
-                  </div>
+                  {hasLiveSchedule && dates.length > 0 ? (
+                    <div className="appt-day-tabs" role="tablist" aria-label={`Choose a day for ${doctor.name}`}>
+                      {dates.map((day, dayIdx) => (
+                        <button
+                          key={`${doctorKey}-${day.edoc}`}
+                          type="button"
+                          role="tab"
+                          aria-selected={selectedIdx === dayIdx}
+                          className={`appt-day-btn ${selectedIdx === dayIdx ? "active" : ""}`}
+                          onClick={() => {
+                            setSelectedDateIdxByDoctor((prev) => ({ ...prev, [doctorKey]: dayIdx }));
+                            setSelectedSlotByDoctor((prev) => ({ ...prev, [doctorKey]: null }));
+                            if (doctor.resourceId && doctor.locationId) {
+                              void fetchSlotsForDate(doctorKey, doctor.resourceId, doctor.locationId, doctor.regionId ?? "5", day.edoc);
+                            }
+                          }}
+                        >
+                          <span>{day.label}</span>
+                          <strong>{day.date}</strong>
+                          <small>{day.month}</small>
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="appt-no-slots">
+                      {hasLiveSchedule ? "No live dates available for this doctor." : "Live booking is unavailable for this doctor right now."}
+                    </p>
+                  )}
 
                   {/* Time slots */}
                   <div className="appt-slots" role="group" aria-label={`Available slots for ${doctor.name}`}>
                     {isLoadingSlots ? (
                       <p className="appt-no-slots">Loading slots…</p>
+                    ) : !hasLiveSchedule ? (
+                      <p className="appt-no-slots">Real-time slots unavailable for this doctor.</p>
                     ) : slots === null ? (
                       <p className="appt-no-slots">Select a date to view slots.</p>
                     ) : slots.length > 0 ? (
@@ -225,10 +218,11 @@ const ChatWidget: React.FC = () => {
                   <button
                     type="button"
                     className="appt-book-btn"
-                    disabled={!selectedSlot || !selectedDate}
+                    disabled={!hasLiveSchedule || !selectedSlot || !selectedDate}
                     onClick={() => {
-                      if (!selectedSlot || !selectedDate) return;
-                      selectDoctorForBooking(doctor, selectedDate.edoc, selectedSlot);
+                      if (!hasLiveSchedule || !selectedSlot || !selectedDate) return;
+                      const serviceId = getServiceIdForSlot(doctorKey, selectedDate.edoc, selectedSlot) ?? doctor.serviceId;
+                      selectDoctorForBooking(doctor, selectedDate.edoc, selectedSlot, serviceId);
                     }}
                   >
                     Book appointment
