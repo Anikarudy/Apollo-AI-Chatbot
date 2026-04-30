@@ -121,6 +121,7 @@ const ChatWidget: React.FC = () => {
           <div className="appt-card-wrap" aria-live="polite">
             {doctorCards.map((doctor, idx) => {
               const doctorKey = `${doctor.name}-${idx}`;
+              const hasLiveResource = !!doctor.resourceId || (doctor.resourceIds?.length ?? 0) > 0;
               const hasLiveSchedule = !!doctor.resourceId && !!doctor.locationId;
               const dates        = liveDates[doctorKey] ?? [];
               const hasDatesLoaded = Object.prototype.hasOwnProperty.call(liveDates, doctorKey);
@@ -187,7 +188,11 @@ const ChatWidget: React.FC = () => {
                     </div>
                   ) : (
                     <p className="appt-no-slots">
-                      {hasLiveSchedule ? "No live dates available for this doctor." : "Live booking is unavailable for this doctor right now."}
+                      {!hasLiveResource
+                        ? "Live booking is unavailable for this doctor right now."
+                        : !doctor.locationId
+                        ? "Checking doctor location for live booking..."
+                        : "No live dates available for this doctor."}
                     </p>
                   )}
 
@@ -196,7 +201,13 @@ const ChatWidget: React.FC = () => {
                     {isLoadingSlots ? (
                       <p className="appt-no-slots">Loading slots…</p>
                     ) : !hasLiveSchedule ? (
-                      <p className="appt-no-slots">Real-time slots unavailable for this doctor.</p>
+                      <p className="appt-no-slots">
+                        {!hasLiveResource
+                          ? "Real-time slots unavailable for this doctor."
+                          : !doctor.locationId
+                          ? "Waiting for doctor location before loading slots..."
+                          : "Real-time slots unavailable for this doctor."}
+                      </p>
                     ) : slots === null ? (
                       <p className="appt-no-slots">Select a date to view slots.</p>
                     ) : slots.length > 0 ? (

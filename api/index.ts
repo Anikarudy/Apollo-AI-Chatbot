@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import Groq from "groq-sdk";
 import axios from "axios";
-import { buildDoctorSearchUrl, buildLlmContext, getDoctorsForLocation, getDoctorsByName, getLocationFallbacksForCity, doctors, hospitalsByCity } from "../src/knowledgeBase";
+import { buildDoctorSearchUrl, contacts, getDoctorsForLocation, getDoctorsByName, getLocationFallbacksForCity, doctors, hospitalsByCity } from "../src/knowledgeBase";
 import {
   mapBookAppointmentForAgent,
   mapCalendarDatesForAgent,
@@ -98,6 +98,12 @@ async function callLlm(systemPrompt: string, userContent: string): Promise<strin
 // ── Apollo EDOC API config (server-side only – AuthKey never sent to browser) ──
 const EDOC_BASE = (process.env.APOLLO_EDOC_BASE_URL ?? "").replace(/\/$/, "");
 const EDOC_AUTH = process.env.APOLLO_EDOC_AUTH_KEY ?? "";
+const DEFAULT_DOCTOR_LOCATION_PATHS = [
+  "/api/EDOC/GetDoctorLocations",
+  "/api/EDOC/GetLocationByResource",
+  "/api/EDOC/GetLocationsByResource",
+  "/api/EDOC/GetResourceLocations",
+];
 function edocHeaders() {
   return { AuthKey: EDOC_AUTH, "Content-Type": "application/json" };
 }
@@ -156,6 +162,26 @@ function getResourceCandidatesForDoctor(doctorName: string, city: string): strin
   return Array.from(new Set(candidates)).slice(0, 8);
 }
 
+type LocalDoctor = (typeof doctors)[number];
+
+function dedupeDoctorsForCards(items: LocalDoctor[]): LocalDoctor[] {
+  const seen = new Set<string>();
+  const result: LocalDoctor[] = [];
+  for (const doctor of items) {
+    const nameKey = normaliseNameForIdLookup(doctor.name);
+    const locationId = String(doctor.locationId ?? "").trim();
+    const regionId = String(doctor.regionId ?? "5").trim();
+    const city = String(doctor.location ?? "").trim().toLowerCase();
+    const branch = String(doctor.branch ?? "").trim().toLowerCase();
+    const locationKey = locationId || `${city}|${branch}`;
+    const key = `${nameKey}|${locationKey}|${regionId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(doctor);
+  }
+  return result;
+}
+
 function getLocationCandidates(city?: string, preferred?: string, resourceId?: string): string[] {
   const result: string[] = [];
   const add = (v?: string) => {
@@ -185,6 +211,95 @@ function getLocationCandidates(city?: string, preferred?: string, resourceId?: s
 
   // Final fallback for corrupted source IDs: use city-level legacy location mapping.
   getLocationFallbacksForCity(cityInput).forEach((locationId) => add(locationId));
+  return result;
+}
+
+interface DoctorLocationOption {
+  locationId: string;
+  locationName: string;
+}
+
+function getDoctorLocationApiPaths(): string[] {
+  const configured = String(process.env.APOLLO_EDOC_DOCTOR_LOCATIONS_PATH ?? "")
+    .split(",")
+    .map((path) => path.trim())
+    .filter((path) => path.length > 0);
+  return configured.length > 0 ? configured : DEFAULT_DOCTOR_LOCATION_PATHS;
+}
+
+function buildEdocUrl(pathOrUrl: string): string {
+  if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
+  const normalized = pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`;
+  return `${EDOC_BASE}${normalized}`;
+}
+
+function getStringFromKeys(source: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = asNonEmptyString(source[key]);
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function normaliseDoctorLocationsResponse(raw: unknown): DoctorLocationOption[] {
+  const locationIdKeys = [
+    "locationId",
+    "LocationID",
+    "LocationId",
+    "locationid",
+    "LocID",
+    "LocId",
+    "locid",
+    "locationCode",
+    "LocationCode",
+  ];
+  const locationNameKeys = [
+    "locationName",
+    "LocationName",
+    "location",
+    "Location",
+    "branch",
+    "Branch",
+    "branchName",
+    "BranchName",
+    "hospitalName",
+    "HospitalName",
+    "name",
+    "Name",
+  ];
+
+  const objects: Array<Record<string, unknown>> = [];
+  const walk = (value: unknown, depth: number): void => {
+    if (depth > 4 || value === null || value === undefined) return;
+    if (Array.isArray(value)) {
+      value.forEach((entry) => walk(entry, depth + 1));
+      return;
+    }
+    if (typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      objects.push(record);
+      Object.values(record).forEach((nested) => walk(nested, depth + 1));
+    }
+  };
+  walk(raw, 0);
+
+  const result: DoctorLocationOption[] = [];
+  const seen = new Set<string>();
+
+  for (const record of objects) {
+    const locationId = getStringFromKeys(record, locationIdKeys);
+    if (!locationId || !isNumericLocationId(locationId)) continue;
+    const normalizedLocationId = String(locationId).trim();
+    if (seen.has(normalizedLocationId)) continue;
+    seen.add(normalizedLocationId);
+
+    const locationName = getStringFromKeys(record, locationNameKeys) ?? `Location ${normalizedLocationId}`;
+    result.push({
+      locationId: normalizedLocationId,
+      locationName,
+    });
+  }
+
   return result;
 }
 
@@ -299,7 +414,16 @@ app.post("/api/chat", async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  const kbContext = buildLlmContext(currentState, context);
+  const kbContext = [
+    "=== Apollo Assist Context ===",
+    `Current bot state: ${currentState}`,
+    `Selected city: ${String(context.city ?? "N/A")}`,
+    `Selected branch: ${String(context.branch ?? "N/A")}`,
+    `Selected specialty: ${String(context.specialty ?? "N/A")}`,
+    `Selected doctor: ${String(context.doctorName ?? "N/A")}`,
+    `Emergency: ${contacts.emergency} | Health Helpline: ${contacts.healthHelpLine}`,
+    `International services: ${contacts.internationalEmail} | ${contacts.apolloLifelineInternational}`,
+  ].join("\n");
 
   // ── Hard guardrail: deflect meta/internal questions ──────────────────────
   const INTERNAL_RE = [
@@ -463,11 +587,12 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
       const ds = normaliseSpecialty(d.speciality);
       return ds === specNorm || ds === specialty.toLowerCase();
     });
+    const uniqueMatched = dedupeDoctorsForCards(matched);
     const url = buildDoctorSearchUrl(specialty, city, branch);
     res.json({
       url,
       source: "local",
-      doctors: matched.slice(0, 12).map((d) => ({
+      doctors: uniqueMatched.slice(0, 12).map((d) => ({
         resourceIds: getResourceCandidatesForDoctor(d.name, d.location),
         name:       d.name,
         specialty:  d.speciality,
@@ -492,11 +617,12 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
         ? getDoctorsForLocation(city, branch || undefined, specNorm)
         : [];
     if (finalDocs.length > 0) {
+      const uniqueDocs = dedupeDoctorsForCards(finalDocs);
       const url = buildDoctorSearchUrl(specialty, city, branch);
       res.json({
         url,
         source: "local",
-        doctors: finalDocs.slice(0, 12).map((d) => ({
+        doctors: uniqueDocs.slice(0, 12).map((d) => ({
           resourceIds: getResourceCandidatesForDoctor(d.name, d.location),
           name:       d.name,
           specialty:  d.speciality,
@@ -514,17 +640,17 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
 
   // ── 1c. Specialty-only (no city/branch): search local KB ─────────────────
   if (specialty && !city && !branch) {
-    const specDocs = doctors
+    const specDocs = dedupeDoctorsForCards(doctors
       .filter(d => {
         const ds = normaliseSpecialty(d.speciality);
         return ds === specNorm || ds === specialty.toLowerCase();
       })
-      .slice(0, 12);
+      .slice(0, 50));
     if (specDocs.length > 0) {
       res.json({
         url: buildDoctorSearchUrl(specialty),
         source: "local",
-        doctors: specDocs.map((d) => ({
+        doctors: specDocs.slice(0, 12).map((d) => ({
           resourceIds: getResourceCandidatesForDoctor(d.name, d.location),
           name:       d.name,
           specialty:  d.speciality,
@@ -602,6 +728,22 @@ app.post("/api/agent/query", async (req: Request, res: Response): Promise<void> 
       if (!resourceId) {
         res.status(400).json({ error: "resourceId missing and no matching doctor found" });
         return;
+      }
+
+      if (!locationIdInput) {
+        const locationsRaw = await localPost(
+          "/api/doctor/locations",
+          {
+            resourceId,
+            regionId: regionIdInput,
+          },
+          INTERNAL_EDOC_TOOL_TIMEOUT_MS
+        );
+        const locations = (locationsRaw as { locations?: Array<{ locationId?: string }> }).locations ?? [];
+        const firstLocation = locations
+          .map((location) => asNonEmptyString(location.locationId))
+          .find((locationId): locationId is string => !!locationId);
+        if (firstLocation) locationIdInput = firstLocation;
       }
 
       const city = asNonEmptyString(params.city) ?? asNonEmptyString(context?.city);
@@ -700,7 +842,87 @@ app.post("/api/agent/book-appointment", async (req: Request, res: Response): Pro
 // ── Apollo EDOC API proxy routes  (AuthKey stays server-side) ────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 
-// 2. Book Appointment
+// 2. Fetch doctor locations by resourceId (locationId is now resolved dynamically)
+app.post("/api/doctor/locations", async (req: Request, res: Response): Promise<void> => {
+  if (!requireEdoc(res)) return;
+
+  const { resourceId, regionId } = req.body as Record<string, string>;
+  const normalizedResourceId = String(resourceId ?? "").trim();
+  const normalizedRegionId = String(regionId ?? "5").trim() || "5";
+
+  if (!normalizedResourceId) {
+    res.status(400).json({ error: "resourceId required" });
+    return;
+  }
+
+  const candidatePaths = getDoctorLocationApiPaths();
+  let lastError = "";
+  let sawTimeout = false;
+
+  for (const path of candidatePaths) {
+    try {
+      const targetUrl = buildEdocUrl(path);
+      logEdoc("DoctorLocations.request", {
+        path,
+        resourceId: normalizedResourceId,
+        regionId: Number(normalizedRegionId),
+      });
+
+      const response = await axios.post(
+        targetUrl,
+        {
+          ResourceID: normalizedResourceId,
+          RegionID: Number(normalizedRegionId),
+          resourceId: normalizedResourceId,
+          regionId: Number(normalizedRegionId),
+        },
+        {
+          headers: edocHeaders(),
+          timeout: 15000,
+        }
+      );
+
+      const body = response.data as { retcode?: number; Message?: string | null };
+      const locations = normaliseDoctorLocationsResponse(response.data);
+      logEdoc("DoctorLocations.response", {
+        path,
+        retcode: body.retcode ?? null,
+        message: body.Message ?? null,
+        locationsCount: locations.length,
+      });
+
+      res.status(200).json({
+        locations,
+        retcode: body.retcode ?? 0,
+        message: body.Message ?? null,
+      });
+      return;
+    } catch (err: unknown) {
+      const e = err as { message?: string; code?: string; response?: { status?: number; data?: unknown } };
+      const msg = String(e.message ?? "Doctor locations lookup failed");
+      lastError = msg;
+      if (e.code === "ECONNABORTED" || /timeout/i.test(msg)) sawTimeout = true;
+
+      logEdoc("DoctorLocations.error", {
+        path,
+        code: e.code ?? null,
+        status: e.response?.status ?? null,
+        message: msg,
+      });
+    }
+  }
+
+  const status = sawTimeout ? 504 : 500;
+  res.status(status).json({
+    error: sawTimeout
+      ? "Doctor locations request timed out"
+      : (lastError || "Doctor locations request failed"),
+    locations: [],
+    retcode: -1,
+  });
+});
+
+// 3. Book Appointment
 app.post("/api/edoc/book-appointment", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const b = req.body as Record<string, unknown>;
@@ -724,7 +946,7 @@ app.post("/api/edoc/book-appointment", async (req: Request, res: Response): Prom
   }
 });
 
-// 3. Reschedule Appointment
+// 4. Reschedule Appointment
 app.post("/api/edoc/reschedule-appointment", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const b = req.body as Record<string, unknown>;
@@ -745,7 +967,7 @@ app.post("/api/edoc/reschedule-appointment", async (req: Request, res: Response)
   }
 });
 
-// 4. Cancel Appointment
+// 5. Cancel Appointment
 app.post("/api/edoc/cancel-appointment", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const b = req.body as Record<string, unknown>;
@@ -766,7 +988,7 @@ app.post("/api/edoc/cancel-appointment", async (req: Request, res: Response): Pr
   }
 });
 
-// 5. Fetch Real-time Slots (DoctorCalenderRules)
+// 6. Fetch Real-time Slots (DoctorCalenderRules)
 app.post("/api/edoc/slots", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const { resourceId, locationId, regionId, date, city } = req.body as Record<string, string>;
@@ -810,7 +1032,7 @@ app.post("/api/edoc/slots", async (req: Request, res: Response): Promise<void> =
   }
 });
 
-// 6. Fetch Real-time Slots V2 (DoctorCalenderRules_V2)
+// 7. Fetch Real-time Slots V2 (DoctorCalenderRules_V2)
 app.post("/api/edoc/slots-v2", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const { resourceId, locationId, regionId, date, city } = req.body as Record<string, string>;
@@ -940,7 +1162,7 @@ app.post("/api/edoc/slots-v2", async (req: Request, res: Response): Promise<void
   }
 });
 
-// 7. Get Calendar Details for Online (Medmantra sync)
+// 8. Get Calendar Details for Online (Medmantra sync)
 app.post("/api/edoc/calendar-details", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const { resourceId, locationId, regionId, date, city } = req.body as Record<string, string>;
@@ -995,7 +1217,7 @@ app.post("/api/edoc/calendar-details", async (req: Request, res: Response): Prom
   }
 });
 
-// 8. Pull UHID by mobile number
+// 9. Pull UHID by mobile number
 app.post("/api/edoc/uhid-search", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const { phone, regionId, uhidNumber } = req.body as Record<string, string>;
@@ -1023,7 +1245,7 @@ app.post("/api/edoc/uhid-search", async (req: Request, res: Response): Promise<v
   }
 });
 
-// 9. Doctor Calendar Live Dates
+// 10. Doctor Calendar Live Dates
 app.post("/api/edoc/calendar-dates", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const { resourceId, locationId, regionId, city } = req.body as Record<string, string>;
@@ -1083,7 +1305,7 @@ app.post("/api/edoc/calendar-dates", async (req: Request, res: Response): Promis
   }
 });
 
-// 10. Generate UHID Online
+// 11. Generate UHID Online
 app.post("/api/edoc/generate-uhid", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const b = req.body as Record<string, unknown>;
