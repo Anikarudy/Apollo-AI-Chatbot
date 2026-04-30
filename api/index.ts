@@ -4,9 +4,13 @@ import dotenv from "dotenv";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import Groq from "groq-sdk";
 import axios from "axios";
-import * as cheerio from "cheerio";
-import { buildDoctorSearchUrl, buildLlmContext, getDoctorsForLocation, getDoctorsByName, doctors, hospitalsByCity } from "../src/knowledgeBase";
-import { doctors as generatedDoctors } from "../src/generatedData";
+import { buildDoctorSearchUrl, buildLlmContext, getDoctorsForLocation, getDoctorsByName, getLocationFallbacksForCity, doctors, hospitalsByCity } from "../src/knowledgeBase";
+import {
+  mapBookAppointmentForAgent,
+  mapCalendarDatesForAgent,
+  mapDoctorsForAgent,
+  mapSlotsForAgent,
+} from "./agentHandlers";
 
 dotenv.config();
 
@@ -14,6 +18,10 @@ const app = express();
 const frontendOrigin = process.env.FRONTEND_ORIGIN ?? "http://localhost:5173";
 app.use(cors({ origin: frontendOrigin }));
 app.use(express.json());
+const PORT = Number(process.env.PORT ?? 3001);
+const LOCAL_API_BASE = `http://127.0.0.1:${PORT}`;
+const INTERNAL_TOOL_TIMEOUT_MS = 30000;
+const INTERNAL_EDOC_TOOL_TIMEOUT_MS = 90000;
 
 // ── LLM clients (DeepSeek -> Groq -> Gemini priority) ──
 const deepseekKey = (process.env.DEEPSEEK_API_KEY ?? "").trim();
@@ -124,11 +132,8 @@ function addMinutes(time: string, minutes: number): string {
   return `${String(Math.floor(total / 60) % 24).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
 }
 
-/** Extract resourceId from Apollo profile URL, e.g. /doctors/dr-name-714950/ */
-function extractResourceId(url?: string): string | undefined {
-  if (!url) return undefined;
-  const m = /\/(\d{5,7})\/?(?:\?.*)?$/.exec(url);
-  return m ? m[1] : undefined;
+function isNumericLocationId(value: unknown): boolean {
+  return /^\d+$/.test(String(value ?? "").trim());
 }
 
 function normaliseNameForIdLookup(value: string): string {
@@ -140,156 +145,154 @@ function normaliseNameForIdLookup(value: string): string {
     .trim();
 }
 
-const doctorIdByName = new Map<string, string>();
-for (const d of generatedDoctors) {
-  const key = normaliseNameForIdLookup(d.name);
-  if (key && !doctorIdByName.has(key)) doctorIdByName.set(key, d.id);
+function getResourceCandidatesForDoctor(doctorName: string, city: string): string[] {
+  const nameKey = normaliseNameForIdLookup(doctorName);
+  const cityKey = city.toLowerCase();
+  const candidates = doctors
+    .filter((d) => d.location.toLowerCase() === cityKey)
+    .filter((d) => normaliseNameForIdLookup(d.name) === nameKey)
+    .map((d) => String(d.resourceId ?? "").trim())
+    .filter((v) => v.length > 0);
+  return Array.from(new Set(candidates)).slice(0, 8);
 }
 
-function resolveResourceId(doctorName: string): string | undefined {
-  const key = normaliseNameForIdLookup(doctorName);
-  const exact = doctorIdByName.get(key);
-  if (exact) return exact;
-
-  // Safe fallback: use prefix matching only when it resolves to a single unique doctor.
-  const candidates = generatedDoctors
-    .filter((d) => {
-      const n = normaliseNameForIdLookup(d.name);
-      return !!n && (n.startsWith(key) || key.startsWith(n));
-    })
-    .slice(0, 3);
-
-  return candidates.length === 1 ? candidates[0]?.id : undefined;
-}
-
-function resolveLocationId(city?: string, branch?: string): string | undefined {
-  const cityInput = String(city ?? "").trim();
-  if (!cityInput) return undefined;
-  const cityKey = Object.keys(hospitalsByCity).find((k) => k.toLowerCase() === cityInput.toLowerCase());
-  if (!cityKey) return undefined;
-
-  const hospitals = hospitalsByCity[cityKey] ?? [];
-  if (hospitals.length === 0) return undefined;
-
-  const branchNorm = String(branch ?? "").toLowerCase().trim();
-  if (branchNorm) {
-    const matchedHospital = hospitals.find((h) => {
-      const hName = String(h.name ?? "").toLowerCase();
-      return hName.includes(branchNorm) || branchNorm.includes(hName);
-    });
-    if (matchedHospital?.locationId) return matchedHospital.locationId;
-  }
-
-  return hospitals.find((h) => !!h.locationId)?.locationId;
-}
-
-function getLocationCandidates(city?: string, preferred?: string): string[] {
+function getLocationCandidates(city?: string, preferred?: string, resourceId?: string): string[] {
   const result: string[] = [];
   const add = (v?: string) => {
     const val = String(v ?? "").trim();
     if (!val) return;
+    if (!isNumericLocationId(val)) return;
     if (!result.includes(val)) result.push(val);
   };
 
   add(preferred);
+
+  const resourceInput = String(resourceId ?? "").trim();
+  if (resourceInput) {
+    doctors
+      .filter((doctor) => String(doctor.resourceId ?? "").trim() === resourceInput)
+      .forEach((doctor) => add(doctor.locationId));
+  }
+
   const cityInput = String(city ?? "").trim();
   if (!cityInput) return result;
 
   const cityKey = Object.keys(hospitalsByCity).find((k) => k.toLowerCase() === cityInput.toLowerCase());
-  if (!cityKey) return result;
-  const hospitals = hospitalsByCity[cityKey] ?? [];
-  hospitals.forEach((h) => add(h.locationId));
-  return result;
-}
-
-function dateToDisplay(d: Date): string {
-  return `${d.getDate()}/${d.getMonth() + 1}/${d.getFullYear()}`;
-}
-
-async function inferLiveDatesFromRules(
-  resourceId: string,
-  locationId: string,
-  regionId: number,
-  maxProbeDays = 21,
-  maxDates = 7
-): Promise<Array<{ display: string; edoc: string }>> {
-  const inferred: Array<{ display: string; edoc: string }> = [];
-  const seen = new Set<string>();
-  const base = new Date();
-
-  for (let i = 0; i < maxProbeDays; i += 1) {
-    const d = new Date(base);
-    d.setDate(base.getDate() + i);
-    const display = dateToDisplay(d);
-    const edoc = toEdocDate(display);
-    try {
-      const r = await axios.post(
-        `${EDOC_BASE}/api/EDOC/DoctorCalenderRules`,
-        { RegionID: regionId, Locationid: locationId, ResourceID: resourceId, ID_Date: edoc },
-        { headers: edocHeaders(), timeout: 12000 }
-      );
-
-      const raw = (r.data as { getDoctorCalenderRulesDetails?: string }).getDoctorCalenderRulesDetails ?? "";
-      const slots = raw ? raw.split(",").map((s) => s.trim()).filter(Boolean) : [];
-      if (slots.length > 0 && !seen.has(edoc)) {
-        inferred.push({ display, edoc });
-        seen.add(edoc);
-      }
-      if (inferred.length >= maxDates) break;
-    } catch {
-      // Ignore per-date probe failures; this helper is best-effort.
-    }
+  if (cityKey) {
+    const hospitals = hospitalsByCity[cityKey] ?? [];
+    hospitals.forEach((h) => add(h.locationId));
   }
 
-  return inferred;
+  // Final fallback for corrupted source IDs: use city-level legacy location mapping.
+  getLocationFallbacksForCity(cityInput).forEach((locationId) => add(locationId));
+  return result;
 }
 
 
 interface ChatRequest {
-  currentState: string;
-  context: Record<string, string | undefined>;
+  currentState?: string;
+  context?: Record<string, string | undefined>;
   userMessage?: string;
 }
 
-interface ScrapedDoctor {
-  name: string;
-  profileUrl?: string;
+type AgentAction = "fetch_doctors" | "get_live_slots" | "book_appointment" | "unknown";
+
+interface AgentToolRequest {
+  message: string;
+  context?: Record<string, unknown>;
 }
 
-function scrapeDoctorsFromHtml(html: string): ScrapedDoctor[] {
-  const $ = cheerio.load(html);
-  const results: ScrapedDoctor[] = [];
-  const seen = new Set<string>();
+interface AgentToolDecision {
+  action: AgentAction;
+  params?: Record<string, unknown>;
+}
 
-  $("a[href*='/doctors/']").each((_, el) => {
-    const raw = $(el).text().replace(/\s+/g, " ").trim();
-    const href = $(el).attr("href");
-    if (!raw) return;
+function stripMarkdownJson(raw: string): string {
+  return raw.trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/, "").trim();
+}
 
-    // Keep plausible doctor names only (must start with Dr/Mr/Ms/Prof, or contain 'Dr.')
-    const looksLikeDoctor = /^(dr\.?|mr\.?|ms\.?|mrs\.?|prof\.?)\s/i.test(raw) || /\bdr\.\s/i.test(raw);
-    if (!looksLikeDoctor) return;
+function asNonEmptyString(value: unknown): string | undefined {
+  const normalized = String(value ?? "").trim();
+  return normalized.length > 0 ? normalized : undefined;
+}
 
-    const clean = raw.replace(/\s+/g, " ").trim();
-    const key = clean.toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
+function inferActionFromMessage(message: string): AgentAction {
+  const lower = message.toLowerCase();
+  if (/book|appointment|reserve|schedule/i.test(lower)) return "book_appointment";
+  if (/slot|live date|availability|available/i.test(lower)) return "get_live_slots";
+  if (/doctor|specialist|consult/i.test(lower)) return "fetch_doctors";
+  return "unknown";
+}
 
-    const profileUrl = href
-      ? href.startsWith("http")
-        ? href
-        : `https://www.apollohospitals.com${href.startsWith("/") ? "" : "/"}${href}`
-      : undefined;
+async function getAgentDecision(message: string, context?: Record<string, unknown>): Promise<AgentToolDecision> {
+  if (!hasAnyLlm) {
+    return { action: inferActionFromMessage(message), params: context ?? {} };
+  }
 
-    results.push({ name: clean, profileUrl });
-  });
+  const systemPrompt = `You are an Apollo API tool router.
+Return ONLY a valid JSON object.
 
-  return results.filter((d) => d.name.length >= 6 && d.name.length <= 80).slice(0, 12);
+Schema:
+{
+  "action": "fetch_doctors" | "get_live_slots" | "book_appointment" | "unknown",
+  "params": {
+    "city": string | null,
+    "specialty": string | null,
+    "doctorName": string | null,
+    "resourceId": string | null,
+    "locationId": string | null,
+    "regionId": string | null,
+    "date": string | null,
+    "bookingPayload": object | null
+  }
+}
+
+Rules:
+- Use "get_live_slots" only if user asks availability/live slots/dates.
+- Use "book_appointment" only if user asks to book/reserve/schedule.
+- Use "fetch_doctors" for doctor search intent.
+- If value is unknown, set it to null.
+- Return ONLY raw JSON, no markdown.`;
+
+  const userPrompt = JSON.stringify({ message, context: context ?? {} });
+
+  try {
+    const raw = stripMarkdownJson(await callLlm(systemPrompt, userPrompt));
+    const parsed = JSON.parse(raw) as AgentToolDecision;
+    if (!parsed || !parsed.action) {
+      return { action: inferActionFromMessage(message), params: context ?? {} };
+    }
+
+    const inferred = inferActionFromMessage(message);
+    const allowedActions: AgentAction[] = ["fetch_doctors", "get_live_slots", "book_appointment", "unknown"];
+    const parsedAction = allowedActions.includes(parsed.action) ? parsed.action : "unknown";
+    const action = parsedAction === "unknown" && inferred !== "unknown" ? inferred : parsedAction;
+
+    return {
+      action,
+      params: parsed.params ?? context ?? {},
+    };
+  } catch {
+    return { action: inferActionFromMessage(message), params: context ?? {} };
+  }
+}
+
+async function localGet(path: string, params: Record<string, unknown>, timeoutMs = INTERNAL_TOOL_TIMEOUT_MS): Promise<unknown> {
+  const response = await axios.get(`${LOCAL_API_BASE}${path}`, { params, timeout: timeoutMs });
+  return response.data;
+}
+
+async function localPost(path: string, body: Record<string, unknown>, timeoutMs = INTERNAL_TOOL_TIMEOUT_MS): Promise<unknown> {
+  const response = await axios.post(`${LOCAL_API_BASE}${path}`, body, { timeout: timeoutMs });
+  return response.data;
 }
 
 // ── 1. LLM chat ───────────────────────────────────────────────────────────────
 app.post("/api/chat", async (req: Request, res: Response): Promise<void> => {
-  const { currentState, context, userMessage } = req.body as ChatRequest;
+  const payload = (req.body ?? {}) as ChatRequest;
+  const currentState = String(payload.currentState ?? "MAIN_MENU");
+  const context = payload.context ?? {};
+  const userMessage = payload.userMessage;
 
   if (!hasAnyLlm) {
     res.status(503).json({ error: NO_LLM_ERROR });
@@ -465,13 +468,15 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
       url,
       source: "local",
       doctors: matched.slice(0, 12).map((d) => ({
+        resourceIds: getResourceCandidatesForDoctor(d.name, d.location),
         name:       d.name,
         specialty:  d.speciality,
         hospital:   d.branch ? `Apollo ${d.branch}, ${d.location}` : `Apollo Hospitals, ${d.location}`,
         profileUrl: undefined,
-        resourceId: resolveResourceId(d.name),
-        locationId: resolveLocationId(d.location, d.branch),
-        regionId:   "5",
+        resourceId: d.resourceId,
+        locationId: d.locationId,
+        regionId:   d.regionId || "5",
+        serviceId: d.serviceId,
       })),
     });
     return;
@@ -492,13 +497,15 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
         url,
         source: "local",
         doctors: finalDocs.slice(0, 12).map((d) => ({
+          resourceIds: getResourceCandidatesForDoctor(d.name, d.location),
           name:       d.name,
           specialty:  d.speciality,
           hospital:   d.branch ? `Apollo ${d.branch}, ${d.location}` : `Apollo Hospitals, ${d.location}`,
           profileUrl: undefined,
-          resourceId: resolveResourceId(d.name),
-          locationId: resolveLocationId(d.location, d.branch),
-          regionId:   "5",
+          resourceId: d.resourceId,
+          locationId: d.locationId,
+          regionId:   d.regionId || "5",
+          serviceId: d.serviceId,
         })),
       });
       return;
@@ -518,13 +525,15 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
         url: buildDoctorSearchUrl(specialty),
         source: "local",
         doctors: specDocs.map((d) => ({
+          resourceIds: getResourceCandidatesForDoctor(d.name, d.location),
           name:       d.name,
           specialty:  d.speciality,
           hospital:   d.branch ? `Apollo ${d.branch}, ${d.location}` : `Apollo Hospitals, ${d.location}`,
           profileUrl: undefined,
-          resourceId: resolveResourceId(d.name),
-          locationId: resolveLocationId(d.location, d.branch),
-          regionId:   "5",
+          resourceId: d.resourceId,
+          locationId: d.locationId,
+          regionId:   d.regionId || "5",
+          serviceId: d.serviceId,
         })),
       });
       return;
@@ -540,6 +549,153 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
   });
 });
 
+// 1d. LLM agent query endpoint (handler-first orchestration)
+app.post("/api/agent/query", async (req: Request, res: Response): Promise<void> => {
+  const { message, context } = req.body as AgentToolRequest;
+  if (!message) {
+    res.status(400).json({ error: "message required" });
+    return;
+  }
+
+  let attemptedAction: AgentAction = inferActionFromMessage(message);
+
+  try {
+    const decision = await getAgentDecision(message, context);
+    const params = (decision.params ?? {}) as Record<string, unknown>;
+    const action = decision.action;
+    attemptedAction = action;
+
+    if (action === "fetch_doctors") {
+      const doctorsRaw = await localGet("/api/doctors", {
+        city: asNonEmptyString(params.city) ?? asNonEmptyString(context?.city) ?? "",
+        specialty: asNonEmptyString(params.specialty) ?? asNonEmptyString(context?.specialty) ?? "",
+        name: asNonEmptyString(params.doctorName) ?? asNonEmptyString(context?.doctorName) ?? "",
+      });
+
+      res.json({
+        action,
+        mapped: mapDoctorsForAgent(doctorsRaw),
+      });
+      return;
+    }
+
+    if (action === "get_live_slots") {
+      const resourceIdInput = asNonEmptyString(params.resourceId) ?? asNonEmptyString(context?.resourceId);
+      let locationIdInput = asNonEmptyString(params.locationId) ?? asNonEmptyString(context?.locationId);
+      let regionIdInput = asNonEmptyString(params.regionId) ?? asNonEmptyString(context?.regionId) ?? "5";
+
+      let resourceId = resourceIdInput;
+
+      if (!resourceId) {
+        const doctorsRaw = await localGet("/api/doctors", {
+          city: asNonEmptyString(params.city) ?? asNonEmptyString(context?.city) ?? "",
+          specialty: asNonEmptyString(params.specialty) ?? asNonEmptyString(context?.specialty) ?? "",
+          name: asNonEmptyString(params.doctorName) ?? asNonEmptyString(context?.doctorName) ?? "",
+        });
+        const mappedDoctors = mapDoctorsForAgent(doctorsRaw);
+        const firstDoctor = mappedDoctors.doctors[0];
+        resourceId = firstDoctor?.resourceId ?? firstDoctor?.resourceIds?.[0];
+        locationIdInput = locationIdInput ?? firstDoctor?.locationId;
+        regionIdInput = regionIdInput ?? firstDoctor?.regionId ?? "5";
+      }
+
+      if (!resourceId) {
+        res.status(400).json({ error: "resourceId missing and no matching doctor found" });
+        return;
+      }
+
+      const city = asNonEmptyString(params.city) ?? asNonEmptyString(context?.city);
+      const datesRaw = await localPost("/api/edoc/calendar-dates", {
+        resourceId,
+        locationId: locationIdInput,
+        regionId: regionIdInput,
+        city,
+      }, INTERNAL_EDOC_TOOL_TIMEOUT_MS);
+      const mappedDates = mapCalendarDatesForAgent(datesRaw);
+      const selectedDate = asNonEmptyString(params.date) ?? mappedDates.dates[0]?.edoc;
+
+      if (!selectedDate) {
+        res.json({
+          action,
+          resourceId,
+          locationId: mappedDates.locationId ?? locationIdInput,
+          liveDates: mappedDates,
+          liveSlots: { slots: [], serviceBySlot: {}, defaultServiceId: null },
+          note: "No live dates available for this doctor",
+        });
+        return;
+      }
+
+      const slotsRaw = await localPost("/api/edoc/slots-v2", {
+        resourceId,
+        locationId: mappedDates.locationId ?? locationIdInput,
+        regionId: regionIdInput,
+        date: selectedDate,
+        city,
+      }, INTERNAL_EDOC_TOOL_TIMEOUT_MS);
+
+      res.json({
+        action,
+        resourceId,
+        locationId: mappedDates.locationId ?? locationIdInput,
+        liveDates: mappedDates,
+        selectedDate,
+        liveSlots: mapSlotsForAgent(slotsRaw),
+      });
+      return;
+    }
+
+    if (action === "book_appointment") {
+      const bookingPayload = (params.bookingPayload as Record<string, unknown>) ??
+        (context?.bookingPayload as Record<string, unknown>) ??
+        {};
+      const bookingRaw = await localPost("/api/agent/book-appointment", bookingPayload);
+      res.json({
+        action,
+        mapped: mapBookAppointmentForAgent(bookingRaw),
+        raw: bookingRaw,
+      });
+      return;
+    }
+
+    res.json({ action: "unknown", note: "Could not infer a supported tool action from this message" });
+  } catch (err: unknown) {
+    const e = err as { message?: string; response?: { data?: unknown } };
+    const errorText = String(e.message ?? "");
+    const inferredAction = inferActionFromMessage(message);
+    const contextResource = asNonEmptyString(context?.resourceId);
+    const contextLocation = asNonEmptyString(context?.locationId);
+    const action = attemptedAction !== "unknown"
+      ? attemptedAction
+      : inferredAction !== "unknown"
+      ? inferredAction
+      : contextResource || contextLocation
+      ? "get_live_slots"
+      : "unknown";
+
+    const status = /timeout/i.test(errorText) ? 504 : 500;
+    res.status(status).json({
+      error: e.response?.data ?? e.message ?? "agent query failed",
+      action,
+    });
+  }
+});
+
+// 1e. Book appointment tool for LLM agent (POST wrapper)
+app.post("/api/agent/book-appointment", async (req: Request, res: Response): Promise<void> => {
+  const payload = req.body as Record<string, unknown>;
+  try {
+    const bookingRaw = await localPost("/api/edoc/book-appointment", payload);
+    res.json(bookingRaw);
+  } catch (err: unknown) {
+    const e = err as { message?: string; response?: { data?: unknown; status?: number } };
+    const status = e.response?.status ?? 500;
+    res.status(status).json({
+      error: e.response?.data ?? e.message ?? "book appointment tool failed",
+    });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ── Apollo EDOC API proxy routes  (AuthKey stays server-side) ────────────────
 // ─────────────────────────────────────────────────────────────────────────────
@@ -550,6 +706,10 @@ app.post("/api/edoc/book-appointment", async (req: Request, res: Response): Prom
   const b = req.body as Record<string, unknown>;
   if (!b.ResourceID || !b.StartDateTime || !b.LocationID || !b.UHIDNumber) {
     res.status(400).json({ error: "ResourceID, StartDateTime, LocationID, UHIDNumber required" });
+    return;
+  }
+  if (!isNumericLocationId(b.LocationID)) {
+    res.status(400).json({ error: "LocationID must be numeric" });
     return;
   }
   try {
@@ -572,6 +732,10 @@ app.post("/api/edoc/reschedule-appointment", async (req: Request, res: Response)
     res.status(400).json({ error: "AppointmentID and StartDateTime required" });
     return;
   }
+  if (b.LocationID !== undefined && b.LocationID !== null && !isNumericLocationId(b.LocationID)) {
+    res.status(400).json({ error: "LocationID must be numeric" });
+    return;
+  }
   try {
     const r = await axios.post(`${EDOC_BASE}/api/EDOC/ResheduleAppointment`, b, { headers: edocHeaders(), timeout: 15000 });
     res.json(r.data);
@@ -587,6 +751,10 @@ app.post("/api/edoc/cancel-appointment", async (req: Request, res: Response): Pr
   const b = req.body as Record<string, unknown>;
   if (!b.AppointmentID || !b.LocationID) {
     res.status(400).json({ error: "AppointmentID and LocationID required" });
+    return;
+  }
+  if (!isNumericLocationId(b.LocationID)) {
+    res.status(400).json({ error: "LocationID must be numeric" });
     return;
   }
   try {
@@ -607,7 +775,7 @@ app.post("/api/edoc/slots", async (req: Request, res: Response): Promise<void> =
     return;
   }
 
-  const locationCandidates = getLocationCandidates(city, locationId);
+  const locationCandidates = getLocationCandidates(city, locationId, resourceId);
   if (locationCandidates.length === 0) {
     res.status(200).json({ slots: [], retcode: -1, error: "No valid locationId available" });
     return;
@@ -651,7 +819,7 @@ app.post("/api/edoc/slots-v2", async (req: Request, res: Response): Promise<void
     return;
   }
 
-  const locationCandidates = getLocationCandidates(city, locationId);
+  const locationCandidates = getLocationCandidates(city, locationId, resourceId);
   if (locationCandidates.length === 0) {
     res.status(200).json({
       services: [],
@@ -781,7 +949,7 @@ app.post("/api/edoc/calendar-details", async (req: Request, res: Response): Prom
     return;
   }
 
-  const locationCandidates = getLocationCandidates(city, locationId);
+  const locationCandidates = getLocationCandidates(city, locationId, resourceId);
   if (locationCandidates.length === 0) {
     res.status(200).json({ calendar: [], retcode: -1, error: "No valid locationId available" });
     return;
@@ -864,7 +1032,7 @@ app.post("/api/edoc/calendar-dates", async (req: Request, res: Response): Promis
     return;
   }
 
-  const locationCandidates = getLocationCandidates(city, locationId);
+  const locationCandidates = getLocationCandidates(city, locationId, resourceId);
   if (locationCandidates.length === 0) {
     res.status(200).json({ dates: [], retcode: -1, error: "No valid locationId available" });
     return;
@@ -884,44 +1052,9 @@ app.post("/api/edoc/calendar-dates", async (req: Request, res: Response): Promis
         const raw = (r.data as { Dates?: string; retcode?: number }).Dates ?? "";
         const retcode = (r.data as { retcode?: number }).retcode ?? 0;
         // Convert D/M/YYYY format → EDOC format "DD-MON-YYYY" + keep original for display
-        let dates = raw
+        const dates = raw
           ? raw.split(",").map((d) => ({ display: d.trim(), edoc: toEdocDate(d.trim()) })).slice(0, 30)
           : [];
-
-        if (dates.length === 0) {
-          logEdoc("DoctorCalenderLiveDates.fallback_probe.start", {
-            resourceId,
-            locationId: locId,
-            regionId: Number(regionId ?? "5"),
-            maxProbeDays: 21,
-            maxDates: 7,
-          });
-
-          const inferredDates = await inferLiveDatesFromRules(
-            resourceId,
-            locId,
-            Number(regionId ?? "5"),
-            21,
-            7
-          );
-
-          if (inferredDates.length > 0) {
-            dates = inferredDates;
-            logEdoc("DoctorCalenderLiveDates.fallback_probe.success", {
-              resourceId,
-              locationId: locId,
-              inferredDatesCount: inferredDates.length,
-              firstDate: inferredDates[0]?.edoc ?? null,
-            });
-          } else {
-            logEdoc("DoctorCalenderLiveDates.fallback_probe.empty", {
-              resourceId,
-              locationId: locId,
-              reason: "No slots found in probed date window",
-            });
-          }
-        }
-
         if (dates.length === 0) {
           logEdoc("DoctorCalenderLiveDates.no_live_dates", {
             resourceId,
@@ -934,12 +1067,7 @@ app.post("/api/edoc/calendar-dates", async (req: Request, res: Response): Promis
             reason: "EDOC returned empty Dates",
           });
         }
-        res.status(200).json({
-          dates,
-          retcode,
-          locationId: locId,
-          datesSource: raw ? "DoctorCalenderLiveDates" : (dates.length > 0 ? "DoctorCalenderRulesProbe" : "None"),
-        });
+        res.status(200).json({ dates, retcode, locationId: locId });
         return;
       } catch (innerErr: unknown) {
         const ie = innerErr as { message?: string };
@@ -963,6 +1091,10 @@ app.post("/api/edoc/generate-uhid", async (req: Request, res: Response): Promise
     res.status(400).json({ error: "FirstName, MobileNumber, LocationID required" });
     return;
   }
+  if (!isNumericLocationId(b.LocationID)) {
+    res.status(400).json({ error: "LocationID must be numeric" });
+    return;
+  }
   try {
     const r = await axios.post(`${EDOC_BASE}/api/EDOC/GenerateUHIDOnline`, b, { headers: edocHeaders(), timeout: 15000 });
     const data = r.data as { result?: string; retcode?: number };
@@ -975,7 +1107,6 @@ app.post("/api/edoc/generate-uhid", async (req: Request, res: Response): Promise
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PORT = process.env.PORT ?? 3001;
 app.listen(PORT, () => {
   console.log(`Apollo Assist backend running on http://localhost:${PORT}`);
 });

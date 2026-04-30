@@ -21,6 +21,7 @@ export interface DoctorCardData {
   hospital: string;
   profileUrl?: string;
   resourceId?: string;    // EDOC ResourceID
+  resourceIds?: string[]; // Alternate EDOC ResourceIDs for same doctor-name mapping
   locationId?: string;    // EDOC LocationID
   regionId?: string;      // EDOC RegionID
   serviceId?: string;     // EDOC ServiceID
@@ -129,6 +130,14 @@ function addFifteenMin(time: string): string {
   return `${String(Math.floor(total / 60) % 24).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
 }
 
+function isValidLocationId(locationId?: string): boolean {
+  return /^\d+$/.test(String(locationId ?? "").trim());
+}
+
+function getSafeLocationId(locationId?: string, fallback = "10551"): string {
+  return isValidLocationId(locationId) ? String(locationId).trim() : fallback;
+}
+
 export function useChatMachine() {
   const runnerRef = useRef<ApolloAssistRunner | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -146,6 +155,7 @@ export function useChatMachine() {
   const [slotsLoading, setSlotsLoading] = useState<Record<string, boolean>>({});
   const liveDateRequestsInFlight = useRef<Set<string>>(new Set());
   const liveDateRequestsDone = useRef<Set<string>>(new Set());
+  const noLiveDatesNoticeKey = useRef<string>("");
 
   // Initialize runner once
   useEffect(() => {
@@ -418,6 +428,7 @@ export function useChatMachine() {
             hospital?: string;
             profileUrl?: string;
             resourceId?: string;
+            resourceIds?: string[];
             locationId?: string;
             regionId?: string;
             serviceId?: string;
@@ -430,6 +441,7 @@ export function useChatMachine() {
           hospital:   d.hospital  ?? hospital,
           profileUrl: d.profileUrl,
           resourceId: d.resourceId,
+          resourceIds: d.resourceIds,
           locationId: d.locationId,
           regionId:   d.regionId ?? "5",
           serviceId:  d.serviceId,
@@ -461,36 +473,73 @@ export function useChatMachine() {
 
     const controller = new AbortController();
     doctorCards.forEach((doctor, idx) => {
-      if (!doctor.resourceId || !doctor.locationId) return;
-      const resourceId = doctor.resourceId;
+      if (!doctor.locationId) return;
       const locationId = doctor.locationId;
       const key = `${doctor.name}-${idx}`;
-      const requestKey = `${resourceId}|${locationId}|${doctor.regionId ?? "5"}|${machineCtx.city ?? ""}`;
+      const resourceCandidates = Array.from(new Set(
+        [doctor.resourceId, ...(doctor.resourceIds ?? [])]
+          .map((value) => String(value ?? "").trim())
+          .filter((value): value is string => value.length > 0)
+      ));
+      if (resourceCandidates.length === 0) return;
+
+      const requestKey = `${resourceCandidates.join(",")}|${locationId}|${doctor.regionId ?? "5"}|${machineCtx.city ?? ""}`;
       if (liveDateRequestsInFlight.current.has(requestKey) || liveDateRequestsDone.current.has(requestKey)) return;
       liveDateRequestsInFlight.current.add(requestKey);
 
       const loadLiveSchedule = async () => {
         try {
-          const d = await getAvailableDates({
-            resourceId,
-            locationId,
-            regionId: doctor.regionId ?? "5",
-            city: machineCtx.city,
-            signal: controller.signal,
-          });
-          const parsed: LiveDate[] = (d.dates ?? []).slice(0, 7).map((e) => parseLiveDate(e.display));
+          let selectedResourceId: string | undefined;
+          let selectedDatesResponse: AvailableDatesResponse | undefined;
+
+          for (const candidateResourceId of resourceCandidates) {
+            try {
+              const d = await getAvailableDates({
+                resourceId: candidateResourceId,
+                locationId,
+                regionId: doctor.regionId ?? "5",
+                city: machineCtx.city,
+                signal: controller.signal,
+              });
+              if ((d.dates ?? []).length > 0) {
+                selectedResourceId = candidateResourceId;
+                selectedDatesResponse = d;
+                break;
+              }
+              if (!selectedDatesResponse) selectedDatesResponse = d;
+            } catch {
+              // Try next candidate resource ID.
+            }
+          }
+
+          const parsed: LiveDate[] = (selectedDatesResponse?.dates ?? []).slice(0, 7).map((e) => parseLiveDate(e.display));
           setLiveDates((prev) => ({ ...prev, [key]: parsed }));
 
-          const resolvedLocationId = d.locationId ?? locationId;
-          if (d.locationId && d.locationId !== locationId) {
+          const effectiveResourceId = selectedResourceId ?? resourceCandidates[0];
+          const resolvedLocationId = selectedDatesResponse?.locationId ?? locationId;
+
+          if (effectiveResourceId !== doctor.resourceId) {
+            setDoctorCards((prev) => {
+              let changed = false;
+              const next = prev.map((card, cardIdx) => {
+                if (cardIdx !== idx) return card;
+                if (card.resourceId === effectiveResourceId) return card;
+                changed = true;
+                return { ...card, resourceId: effectiveResourceId };
+              });
+              return changed ? next : prev;
+            });
+          }
+
+          if (selectedDatesResponse?.locationId && selectedDatesResponse.locationId !== locationId) {
             setDoctorCards((prev) =>
               {
                 let changed = false;
                 const next = prev.map((card, cardIdx) => {
                   if (cardIdx !== idx) return card;
-                  if (card.locationId === d.locationId) return card;
+                  if (card.locationId === selectedDatesResponse?.locationId) return card;
                   changed = true;
-                  return { ...card, locationId: d.locationId };
+                  return { ...card, locationId: selectedDatesResponse?.locationId };
                 });
                 return changed ? next : prev;
               }
@@ -505,7 +554,7 @@ export function useChatMachine() {
           try {
             try {
               await getCalendarDetails({
-                resourceId,
+                resourceId: effectiveResourceId,
                 locationId: resolvedLocationId,
                 regionId: doctor.regionId ?? "5",
                 date: firstDate.edoc,
@@ -520,7 +569,7 @@ export function useChatMachine() {
             let slotList: string[] = [];
             try {
               const s2 = await getSlotsV2({
-                resourceId,
+                resourceId: effectiveResourceId,
                 locationId: resolvedLocationId,
                 regionId: doctor.regionId ?? "5",
                 date: firstDate.edoc,
@@ -545,7 +594,7 @@ export function useChatMachine() {
 
             if (slotList.length === 0) {
               const s = await getSlots({
-                resourceId,
+                resourceId: effectiveResourceId,
                 locationId: resolvedLocationId,
                 regionId: doctor.regionId ?? "5",
                 date: firstDate.edoc,
@@ -591,7 +640,41 @@ export function useChatMachine() {
     if (currentState === "SHOW_DOCTORS" || currentState === "RESCHEDULE_APPOINTMENT") return;
     liveDateRequestsInFlight.current.clear();
     liveDateRequestsDone.current.clear();
+    noLiveDatesNoticeKey.current = "";
   }, [currentState]);
+
+  useEffect(() => {
+    if (currentState !== "SHOW_DOCTORS" && currentState !== "RESCHEDULE_APPOINTMENT") return;
+    if (doctorCards.length === 0) return;
+
+    const liveScheduleCards = doctorCards
+      .map((doctor, idx) => ({ doctor, idx }))
+      .filter(({ doctor }) => !!doctor.locationId && (!!doctor.resourceId || (doctor.resourceIds?.length ?? 0) > 0));
+    if (liveScheduleCards.length === 0) return;
+
+    const allLoaded = liveScheduleCards.every(({ doctor, idx }) =>
+      Object.prototype.hasOwnProperty.call(liveDates, `${doctor.name}-${idx}`)
+    );
+    if (!allLoaded) return;
+
+    const allEmpty = liveScheduleCards.every(({ doctor, idx }) =>
+      (liveDates[`${doctor.name}-${idx}`] ?? []).length === 0
+    );
+    if (!allEmpty) return;
+
+    const noticeKey = liveScheduleCards.map(({ doctor, idx }) => `${doctor.name}-${idx}`).join("|");
+    if (noLiveDatesNoticeKey.current === noticeKey) return;
+    noLiveDatesNoticeKey.current = noticeKey;
+
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: nextId(),
+        sender: "bot",
+        text: "I could not find live appointment dates for these doctors right now. Please use Change search to try another branch or city.",
+      },
+    ]);
+  }, [currentState, doctorCards, liveDates]);
 
   // ── Fetch slots on demand ────────────────────────────────────────────────
   const fetchSlotsForDate = useCallback(async (
@@ -685,6 +768,7 @@ export function useChatMachine() {
     edocFiredForState.current = currentState;
     const { patientFirstName, patientLastName, patientDob, phoneNumber, locationId, regionId } = machineCtx;
     if (!patientFirstName || !phoneNumber) { sendSilentEvent("UHID_FAILED"); return; }
+    const safeLocationId = getSafeLocationId(locationId);
 
     fetch("/api/edoc/generate-uhid", {
       method: "POST",
@@ -692,7 +776,7 @@ export function useChatMachine() {
       body: JSON.stringify({
         RegistrationTypes: "FreeUHID",
         Title: "1",
-        LocationID: locationId ?? "10551",
+        LocationID: safeLocationId,
         RegionID: Number(regionId ?? "5"),
         FirstName: patientFirstName,
         LastName: patientLastName ?? "User",
@@ -728,17 +812,18 @@ export function useChatMachine() {
     if (edocFiredForState.current === currentState) return;
     edocFiredForState.current = currentState;
     const { resourceId, locationId, regionId, serviceId, uhid, selectedDate, selectedSlotStart, phoneNumber } = machineCtx;
-    if (!resourceId || !locationId || !selectedDate || !selectedSlotStart || !uhid) {
+    if (!resourceId || !selectedDate || !selectedSlotStart || !uhid) {
       sendSilentEvent("BOOKING_FAILED");
       return;
     }
+    const safeLocationId = getSafeLocationId(locationId);
 
     const runBookAppointment = async () => {
       try {
         const { StartDateTime, EndDateTime } = formatSlot(selectedDate, selectedSlotStart);
         const payload: Record<string, unknown> = {
           RegistrationType: "QuickUHID",
-          LocationID: locationId,
+          LocationID: safeLocationId,
           RegionID: Number(regionId ?? "5"),
           ResourceID: resourceId,
           UHIDNumber: uhid,
@@ -789,6 +874,7 @@ export function useChatMachine() {
       sendSilentEvent("RESCHEDULE_FAILED");
       return;
     }
+    const safeLocationId = getSafeLocationId(locationId);
     const startDT = `${selectedDate} ${selectedSlotStart}:00`;
     const endDT   = `${selectedDate} ${selectedSlotEnd ?? addFifteenMin(selectedSlotStart)}:00`;
 
@@ -797,7 +883,7 @@ export function useChatMachine() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         AppointmentID: Number(appointmentId),
-        LocationID: locationId ?? "10551",
+        LocationID: safeLocationId,
         ResourceID: Number(resourceId ?? "0"),
         StartDateTime: startDT,
         EndDateTime: endDT,
@@ -827,12 +913,13 @@ export function useChatMachine() {
     edocFiredForState.current = currentState;
     const { appointmentId, locationId, regionId, resourceId } = machineCtx;
     if (!appointmentId) { sendSilentEvent("CANCEL_DONE"); return; }
+    const safeLocationId = getSafeLocationId(locationId);
 
     fetch("/api/edoc/cancel-appointment", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        LocationID: locationId ?? "10551",
+        LocationID: safeLocationId,
         RegionID: Number(regionId ?? "5"),
         ReasonforCancellation: "Patient cancelled via Apollo Assist",
         AppointmentID: Number(appointmentId),
