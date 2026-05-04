@@ -1,4 +1,4 @@
-import cleanDataRaw from "../data/clean.json";
+import finalDoctorsRaw from "../data/finalDoctors.json";
 import { getLocationFromBranch } from "../data/locationMap";
 
 export interface HealthPackage {
@@ -10,15 +10,18 @@ export interface HealthPackage {
 interface CleanDoctorRecord {
   doctorName: string;
   resourceId: string | number;
-  locationId?: string | number;
-  regionId?: string | number;
-  location: string;
-  speciality: string;
+  locationId?: string | number | null;
+  regionId?: string | number | null;
+  location?: string | null;
+  speciality?: string | null;
 }
 
-interface CleanDataFile {
-  doctors: CleanDoctorRecord[];
-}
+// finalDoctors.json is a flat array; support both array and wrapped { doctors: [] } shapes.
+const rawRecords: CleanDoctorRecord[] = (() => {
+  if (Array.isArray(finalDoctorsRaw)) return finalDoctorsRaw as CleanDoctorRecord[];
+  const wrapped = finalDoctorsRaw as { doctors?: CleanDoctorRecord[] };
+  return wrapped.doctors ?? [];
+})();
 
 function toTitleCase(value: string): string {
   const minor = new Set(["and", "of", "the", "in", "at", "by", "for", "a"]);
@@ -98,7 +101,7 @@ export interface Doctor {
   specialityId: string;
 }
 
-const cleanData = cleanDataRaw as CleanDataFile;
+const cleanData = { doctors: rawRecords };
 
 export const doctors: Doctor[] = (() => {
   const seen = new Set<string>();
@@ -107,6 +110,18 @@ export const doctors: Doctor[] = (() => {
   for (const record of cleanData.doctors ?? []) {
     const name = String(record.doctorName ?? "").trim();
     const resourceId = String(record.resourceId ?? "").trim();
+
+    // Skip records that aren't usable:
+    // - no resourceId
+    // - name too short (≤5 alphabetic chars)
+    // - initials-only pattern like "A D" or "Dr X"
+    const alphaName = name.replace(/[^a-zA-Z ]/g, "").trim();
+    if (
+      !resourceId ||
+      alphaName.length <= 5 ||
+      /^[A-Z]\s?[A-Z]$/.test(alphaName)
+    ) continue;
+
     const speciality = String(record.speciality ?? "").trim();
     const { city, branch } = parseLocation(String(record.location ?? ""));
     const mappedLoc = getLocationFromBranch(branch);
