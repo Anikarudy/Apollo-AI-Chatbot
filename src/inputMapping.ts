@@ -40,12 +40,6 @@ export type AppEvent =
   | { type: "FOUND" }
   | { type: "NOT_FOUND" }
   | { type: "SELECT_SLOT"; value?: string }  // value = JSON {date,startTime,endTime,resourceId,locationId,regionId,serviceId}
-  | { type: "DOCTOR_LOCATIONS_FETCHED"; value?: string }
-  | { type: "DOCTOR_LOCATIONS_FAILED"; value?: string }
-  | { type: "LIVE_DATES_FETCHED"; value?: string }
-  | { type: "LIVE_DATES_FAILED"; value?: string }
-  | { type: "SLOTS_FETCHED"; value?: string }
-  | { type: "SLOTS_FAILED"; value?: string }
   | { type: "CHANGE_SEARCH" }
   | { type: "CHANGE_SPECIALTY" }
   | { type: "RETRY_NAME" }

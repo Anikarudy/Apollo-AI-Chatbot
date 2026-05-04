@@ -9,7 +9,7 @@ export interface HealthPackage {
 interface CleanDoctorRecord {
   doctorName: string;
   resourceId: string | number;
-  locationId?: string | number;
+  locationId: string | number;
   regionId: string | number;
   location: string;
   speciality: string;
@@ -111,9 +111,9 @@ export const doctors: Doctor[] = (() => {
     const speciality = String(record.speciality ?? "").trim();
     const { city, branch } = parseLocation(String(record.location ?? ""));
 
-    if (!name || !resourceId || !speciality || !city) continue;
+    if (!name || !resourceId || !locationId || !speciality || !city) continue;
 
-    const dedupeKey = `${name.toLowerCase()}|${resourceId}|${regionId}`;
+    const dedupeKey = `${name.toLowerCase()}|${resourceId}|${locationId}|${regionId}`;
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
 
@@ -136,7 +136,6 @@ export const doctors: Doctor[] = (() => {
 const locationIdsByCity: Record<string, string[]> = (() => {
   const map: Record<string, string[]> = {};
   for (const doctor of doctors) {
-    if (!doctor.locationId) continue;
     if (!map[doctor.location]) map[doctor.location] = [];
     if (!map[doctor.location].includes(doctor.locationId)) {
       map[doctor.location].push(doctor.locationId);
@@ -156,7 +155,6 @@ export const hospitalsByCity: Record<string, Hospital[]> = (() => {
   const byCity: Record<string, Hospital[]> = {};
 
   for (const doctor of doctors) {
-    if (!doctor.locationId) continue;
     if (!byCity[doctor.location]) byCity[doctor.location] = [];
 
     const hospital: Hospital = {

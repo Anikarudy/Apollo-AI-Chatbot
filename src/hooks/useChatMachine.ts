@@ -43,13 +43,6 @@ interface AvailableDatesResponse {
   locationId?: string;
 }
 
-interface DoctorLocationsResponse {
-  locations?: Array<{ locationId: string; locationName: string }>;
-  retcode?: number;
-  message?: string | null;
-  error?: string;
-}
-
 interface SlotsResponse {
   slots?: string[];
   retcode?: number;
@@ -108,8 +101,6 @@ const NO_LLM_STATES = new Set([
   "SEARCH_BY_SPECIALTY_STATE", "PROCESS_SYMPTOM_CATEGORY", "PROCESS_SYMPTOM_DETAIL",
   "MAP_TO_SPECIALTY", "BOOKING_FAILED_STATE", "RESCHEDULE_FAILED_STATE",
   "CANCEL_FAILED_STATE", "UHID_GENERATE_FAILED",
-  "SELECT_DOCTOR", "FETCH_DOCTOR_LOCATIONS", "FETCH_LIVE_DATES", "FETCH_SLOTS",
-  "DOCTOR_LOCATIONS_FAILED_STATE", "LIVE_DATES_FAILED_STATE", "SLOTS_FAILED_STATE",
   "DOCTOR_NAME_SUGGESTIONS", // rendered by stateResponses with suggestion buttons
   "AI_PREFILL_ROUTE",        // transient routing state, never shown
   "SHOW_DOCTORS",            // UI is card-driven; LLM message shown before cards load
@@ -143,16 +134,8 @@ function isValidLocationId(locationId?: string): boolean {
   return /^\d+$/.test(String(locationId ?? "").trim());
 }
 
-function getSafeLocationId(locationId?: string): string | undefined {
-  return isValidLocationId(locationId) ? String(locationId).trim() : undefined;
-}
-
-function parseMachinePayload(value?: string): Record<string, string> {
-  try {
-    return JSON.parse(value ?? "{}") as Record<string, string>;
-  } catch {
-    return {};
-  }
+function getSafeLocationId(locationId?: string, fallback = "10551"): string {
+  return isValidLocationId(locationId) ? String(locationId).trim() : fallback;
 }
 
 export function useChatMachine() {
@@ -247,39 +230,6 @@ export function useChatMachine() {
     }
     if (!res.ok) {
       throw new Error(String(data.error ?? "DoctorCalenderLiveDates failed"));
-    }
-    return data;
-  }, [logEdoc]);
-
-  const getDoctorLocations = useCallback(async (
-    params: {
-      resourceId: string;
-      regionId: string;
-      signal?: AbortSignal;
-    }
-  ): Promise<DoctorLocationsResponse> => {
-    logEdoc("DoctorLocations.request", {
-      resourceId: params.resourceId,
-      regionId: params.regionId,
-    });
-    const res = await fetch("/api/doctor/locations", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        resourceId: params.resourceId,
-        regionId: params.regionId,
-      }),
-      signal: params.signal,
-    });
-    const data = (await res.json()) as DoctorLocationsResponse;
-    logEdoc("DoctorLocations.response", {
-      status: res.status,
-      locationsCount: (data.locations ?? []).length,
-      retcode: data.retcode ?? null,
-      error: data.error ?? null,
-    });
-    if (!res.ok) {
-      throw new Error(String(data.error ?? "Doctor locations lookup failed"));
     }
     return data;
   }, [logEdoc]);
@@ -519,21 +469,21 @@ export function useChatMachine() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentState, machineCtx.branch, machineCtx.city, machineCtx.doctorName, machineCtx.specialty]);
 
-  // ── Load live dates for each doctor card by resolving locationId first ───
+  // ── Load live dates for each doctor card that has a resourceId ───────────
   useEffect(() => {
     if (currentState !== "SHOW_DOCTORS" && currentState !== "RESCHEDULE_APPOINTMENT") return;
     if (doctorCards.length === 0) return;
 
     const scheduleCards = doctorCards
       .map((doctor, idx) => ({ doctor, idx }))
-      .filter(({ doctor }) => !!doctor.resourceId || (doctor.resourceIds?.length ?? 0) > 0)
+      .filter(({ doctor }) => !!doctor.locationId)
       .map(({ doctor, idx }) => {
         const stableCandidates = Array.from(new Set(
           [doctor.resourceId, ...(doctor.resourceIds ?? [])]
             .map((value) => String(value ?? "").trim())
             .filter((value): value is string => value.length > 0)
         )).sort();
-        return `${doctor.name}-${idx}|${doctor.regionId ?? "5"}|${stableCandidates.join(",")}|${machineCtx.city ?? ""}`;
+        return `${doctor.name}-${idx}|${doctor.locationId}|${doctor.regionId ?? "5"}|${stableCandidates.join(",")}|${machineCtx.city ?? ""}`;
       })
       .join("||");
 
@@ -548,6 +498,8 @@ export function useChatMachine() {
 
     const controller = new AbortController();
     doctorCards.forEach((doctor, idx) => {
+      if (!doctor.locationId) return;
+      const locationId = doctor.locationId;
       const key = `${doctor.name}-${idx}`;
       const resourceCandidates = Array.from(new Set(
         [doctor.resourceId, ...(doctor.resourceIds ?? [])]
@@ -557,50 +509,30 @@ export function useChatMachine() {
       if (resourceCandidates.length === 0) return;
 
       const stableCandidates = [...resourceCandidates].sort();
-      const requestKey = `${stableCandidates.join(",")}|${doctor.regionId ?? "5"}|${machineCtx.city ?? ""}`;
+      const requestKey = `${stableCandidates.join(",")}|${locationId}|${doctor.regionId ?? "5"}|${machineCtx.city ?? ""}`;
       if (liveDateRequestsInFlight.current.has(requestKey) || liveDateRequestsDone.current.has(requestKey)) return;
       liveDateRequestsInFlight.current.add(requestKey);
 
       const loadLiveSchedule = async () => {
         try {
           let selectedResourceId: string | undefined;
-          let selectedLocationId: string | undefined;
           let selectedDatesResponse: AvailableDatesResponse | undefined;
 
           for (const candidateResourceId of resourceCandidates) {
             try {
-              const locationResponse = await getDoctorLocations({
-                resourceId: candidateResourceId,
-                regionId: doctor.regionId ?? "5",
-                signal: controller.signal,
-              });
-
-              const locationCandidates = (locationResponse.locations ?? [])
-                .map((location) => String(location.locationId ?? "").trim())
-                .filter((locationId): locationId is string => isValidLocationId(locationId));
-              if (locationCandidates.length === 0) continue;
-
-              const preferredLocation = locationCandidates.includes(String(doctor.locationId ?? "").trim())
-                ? String(doctor.locationId ?? "").trim()
-                : locationCandidates[0];
-
               const d = await getAvailableDates({
                 resourceId: candidateResourceId,
-                locationId: preferredLocation,
+                locationId,
                 regionId: doctor.regionId ?? "5",
                 city: machineCtx.city,
                 signal: controller.signal,
               });
               if ((d.dates ?? []).length > 0) {
                 selectedResourceId = candidateResourceId;
-                selectedLocationId = d.locationId ?? preferredLocation;
                 selectedDatesResponse = d;
                 break;
               }
-              if (!selectedDatesResponse) {
-                selectedDatesResponse = d;
-                selectedLocationId = d.locationId ?? preferredLocation;
-              }
+              if (!selectedDatesResponse) selectedDatesResponse = d;
             } catch {
               // Try next candidate resource ID.
             }
@@ -610,7 +542,7 @@ export function useChatMachine() {
           setLiveDates((prev) => ({ ...prev, [key]: parsed }));
 
           const effectiveResourceId = selectedResourceId ?? resourceCandidates[0];
-          const resolvedLocationId = selectedLocationId ?? (isValidLocationId(doctor.locationId) ? String(doctor.locationId).trim() : undefined);
+          const resolvedLocationId = selectedDatesResponse?.locationId ?? locationId;
 
           if (effectiveResourceId !== doctor.resourceId) {
             setDoctorCards((prev) => {
@@ -625,15 +557,15 @@ export function useChatMachine() {
             });
           }
 
-          if (resolvedLocationId && resolvedLocationId !== doctor.locationId) {
+          if (selectedDatesResponse?.locationId && selectedDatesResponse.locationId !== locationId) {
             setDoctorCards((prev) =>
               {
                 let changed = false;
                 const next = prev.map((card, cardIdx) => {
                   if (cardIdx !== idx) return card;
-                  if (card.locationId === resolvedLocationId) return card;
+                  if (card.locationId === selectedDatesResponse?.locationId) return card;
                   changed = true;
-                  return { ...card, locationId: resolvedLocationId };
+                  return { ...card, locationId: selectedDatesResponse?.locationId };
                 });
                 return changed ? next : prev;
               }
@@ -642,7 +574,7 @@ export function useChatMachine() {
 
           // Auto-load slots for the first available date so live slot API is used immediately.
           const firstDate = parsed[0];
-          if (!firstDate || !resolvedLocationId) return;
+          if (!firstDate) return;
           const slotKey = `${key}||${firstDate.edoc}`;
           setSlotsLoading((prev) => ({ ...prev, [slotKey]: true }));
           try {
@@ -728,7 +660,7 @@ export function useChatMachine() {
     });
 
     return () => controller.abort();
-  }, [currentState, doctorCards, machineCtx.city, getAvailableDates, getCalendarDetails, getDoctorLocations, getSlots, getSlotsV2]);
+  }, [currentState, doctorCards, machineCtx.city, getAvailableDates, getCalendarDetails, getSlots, getSlotsV2]);
 
   useEffect(() => {
     if (currentState === "SHOW_DOCTORS" || currentState === "RESCHEDULE_APPOINTMENT") return;
@@ -744,7 +676,7 @@ export function useChatMachine() {
 
     const liveScheduleCards = doctorCards
       .map((doctor, idx) => ({ doctor, idx }))
-      .filter(({ doctor }) => !!doctor.resourceId || (doctor.resourceIds?.length ?? 0) > 0);
+      .filter(({ doctor }) => !!doctor.locationId && (!!doctor.resourceId || (doctor.resourceIds?.length ?? 0) > 0));
     if (liveScheduleCards.length === 0) return;
 
     const allLoaded = liveScheduleCards.every(({ doctor, idx }) =>
@@ -829,186 +761,6 @@ export function useChatMachine() {
   // Prevent EDOC async effects from double-firing on re-renders
   const edocFiredForState = useRef<string>("");
 
-  // FETCH_DOCTOR_LOCATIONS: resolve a numeric locationId for selected doctor
-  useEffect(() => {
-    if (currentState !== "FETCH_DOCTOR_LOCATIONS") return;
-    if (edocFiredForState.current === currentState) return;
-    edocFiredForState.current = currentState;
-
-    const payload = parseMachinePayload(machineCtx.pendingSlotSelection);
-    const resourceId = String(machineCtx.resourceId ?? payload.resourceId ?? "").trim();
-    const regionId = String(machineCtx.regionId ?? payload.regionId ?? "5").trim() || "5";
-    const preferredLocationId = String(machineCtx.locationId ?? payload.locationId ?? "").trim();
-
-    if (!resourceId) {
-      sendSilentEvent("DOCTOR_LOCATIONS_FAILED", JSON.stringify({ error: "Selected doctor details are incomplete." }));
-      return;
-    }
-
-    const runFetchDoctorLocations = async () => {
-      try {
-        const response = await getDoctorLocations({ resourceId, regionId });
-        const locationIds = (response.locations ?? [])
-          .map((location) => String(location.locationId ?? "").trim())
-          .filter((locationId): locationId is string => isValidLocationId(locationId));
-
-        if (locationIds.length === 0) {
-          sendSilentEvent("DOCTOR_LOCATIONS_FAILED", JSON.stringify({ error: "No locations found for this doctor." }));
-          return;
-        }
-
-        const resolvedLocationId = locationIds.includes(preferredLocationId)
-          ? preferredLocationId
-          : locationIds[0];
-        sendSilentEvent("DOCTOR_LOCATIONS_FETCHED", JSON.stringify({ locationId: resolvedLocationId, regionId }));
-      } catch (err: unknown) {
-        sendSilentEvent(
-          "DOCTOR_LOCATIONS_FAILED",
-          JSON.stringify({ error: String((err as { message?: string })?.message ?? "Unable to fetch doctor locations right now.") })
-        );
-      }
-    };
-
-    void runFetchDoctorLocations();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentState, machineCtx.locationId, machineCtx.pendingSlotSelection, machineCtx.regionId, machineCtx.resourceId, getDoctorLocations]);
-
-  // FETCH_LIVE_DATES: load available dates only after locationId is resolved
-  useEffect(() => {
-    if (currentState !== "FETCH_LIVE_DATES") return;
-    if (edocFiredForState.current === currentState) return;
-    edocFiredForState.current = currentState;
-
-    const payload = parseMachinePayload(machineCtx.pendingSlotSelection);
-    const resourceId = String(machineCtx.resourceId ?? payload.resourceId ?? "").trim();
-    const regionId = String(machineCtx.regionId ?? payload.regionId ?? "5").trim() || "5";
-    const locationId = String(machineCtx.locationId ?? payload.locationId ?? "").trim();
-    const requestedDate = String(machineCtx.selectedDate ?? payload.date ?? "").trim();
-
-    if (!resourceId || !isValidLocationId(locationId)) {
-      sendSilentEvent("LIVE_DATES_FAILED", JSON.stringify({ error: "Unable to fetch live dates without a valid location." }));
-      return;
-    }
-
-    const runFetchLiveDates = async () => {
-      try {
-        const response = await getAvailableDates({
-          resourceId,
-          locationId,
-          regionId,
-          city: machineCtx.city,
-        });
-        const dates = response.dates ?? [];
-        if (dates.length === 0) {
-          sendSilentEvent("LIVE_DATES_FAILED", JSON.stringify({ error: "No live dates are available for this doctor." }));
-          return;
-        }
-
-        const selectedDate = dates.some((date) => date.edoc === requestedDate)
-          ? requestedDate
-          : dates[0].edoc;
-        sendSilentEvent("LIVE_DATES_FETCHED", JSON.stringify({
-          selectedDate,
-          locationId: response.locationId ?? locationId,
-        }));
-      } catch (err: unknown) {
-        sendSilentEvent(
-          "LIVE_DATES_FAILED",
-          JSON.stringify({ error: String((err as { message?: string })?.message ?? "Unable to fetch live dates right now.") })
-        );
-      }
-    };
-
-    void runFetchLiveDates();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentState, machineCtx.city, machineCtx.locationId, machineCtx.pendingSlotSelection, machineCtx.regionId, machineCtx.resourceId, machineCtx.selectedDate, getAvailableDates]);
-
-  // FETCH_SLOTS: load slots only after locationId and date are available
-  useEffect(() => {
-    if (currentState !== "FETCH_SLOTS") return;
-    if (edocFiredForState.current === currentState) return;
-    edocFiredForState.current = currentState;
-
-    const payload = parseMachinePayload(machineCtx.pendingSlotSelection);
-    const resourceId = String(machineCtx.resourceId ?? payload.resourceId ?? "").trim();
-    const regionId = String(machineCtx.regionId ?? payload.regionId ?? "5").trim() || "5";
-    const locationId = String(machineCtx.locationId ?? payload.locationId ?? "").trim();
-    const selectedDate = String(machineCtx.selectedDate ?? payload.date ?? "").trim();
-    const selectedSlotStart = String(machineCtx.selectedSlotStart ?? payload.startTime ?? "").trim();
-
-    if (!resourceId || !isValidLocationId(locationId) || !selectedDate) {
-      sendSilentEvent("SLOTS_FAILED", JSON.stringify({ error: "Unable to fetch slots without doctor location and date." }));
-      return;
-    }
-
-    const runFetchSlots = async () => {
-      try {
-        try {
-          await getCalendarDetails({
-            resourceId,
-            locationId,
-            regionId,
-            date: selectedDate,
-            city: machineCtx.city,
-          });
-        } catch {
-          // Keep booking flow alive even if sync-calendar endpoint fails.
-        }
-
-        let slotList: string[] = [];
-        let defaultServiceId: string | undefined;
-        const slotToService: Record<string, string> = {};
-
-        try {
-          const slotsV2 = await getSlotsV2({
-            resourceId,
-            locationId,
-            regionId,
-            date: selectedDate,
-            city: machineCtx.city,
-          });
-          slotList = slotsV2.allSlots ?? [];
-          defaultServiceId = slotsV2.defaultServiceId ?? undefined;
-          Object.assign(slotToService, slotsV2.slotToServiceId ?? {});
-        } catch {
-          slotList = [];
-        }
-
-        if (slotList.length === 0) {
-          const fallbackSlots = await getSlots({
-            resourceId,
-            locationId,
-            regionId,
-            date: selectedDate,
-            city: machineCtx.city,
-          });
-          slotList = fallbackSlots.slots ?? [];
-        }
-
-        if (slotList.length === 0) {
-          sendSilentEvent("SLOTS_FAILED", JSON.stringify({ error: "No slots are available for this date." }));
-          return;
-        }
-
-        if (!selectedSlotStart || !slotList.includes(selectedSlotStart)) {
-          sendSilentEvent("SLOTS_FAILED", JSON.stringify({ error: "The selected slot is no longer available. Please choose another slot." }));
-          return;
-        }
-
-        const resolvedServiceId = slotToService[selectedSlotStart] ?? machineCtx.serviceId ?? defaultServiceId;
-        sendSilentEvent("SLOTS_FETCHED", JSON.stringify({ serviceId: resolvedServiceId ?? "" }));
-      } catch (err: unknown) {
-        sendSilentEvent(
-          "SLOTS_FAILED",
-          JSON.stringify({ error: String((err as { message?: string })?.message ?? "Unable to fetch slots right now.") })
-        );
-      }
-    };
-
-    void runFetchSlots();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentState, machineCtx.city, machineCtx.locationId, machineCtx.pendingSlotSelection, machineCtx.regionId, machineCtx.resourceId, machineCtx.selectedDate, machineCtx.selectedSlotStart, machineCtx.serviceId, getCalendarDetails, getSlots, getSlotsV2]);
-
   // PROCESS_UHID: look up UHID by phone
   useEffect(() => {
     if (currentState !== "PROCESS_UHID") return;
@@ -1044,7 +796,6 @@ export function useChatMachine() {
     const { patientFirstName, patientLastName, patientDob, phoneNumber, locationId, regionId } = machineCtx;
     if (!patientFirstName || !phoneNumber) { sendSilentEvent("UHID_FAILED"); return; }
     const safeLocationId = getSafeLocationId(locationId);
-    if (!safeLocationId) { sendSilentEvent("UHID_FAILED"); return; }
 
     fetch("/api/edoc/generate-uhid", {
       method: "POST",
@@ -1093,10 +844,6 @@ export function useChatMachine() {
       return;
     }
     const safeLocationId = getSafeLocationId(locationId);
-    if (!safeLocationId) {
-      sendSilentEvent("BOOKING_FAILED");
-      return;
-    }
 
     const runBookAppointment = async () => {
       try {
@@ -1155,10 +902,6 @@ export function useChatMachine() {
       return;
     }
     const safeLocationId = getSafeLocationId(locationId);
-    if (!safeLocationId) {
-      sendSilentEvent("RESCHEDULE_FAILED");
-      return;
-    }
     const startDT = `${selectedDate} ${selectedSlotStart}:00`;
     const endDT   = `${selectedDate} ${selectedSlotEnd ?? addFifteenMin(selectedSlotStart)}:00`;
 
@@ -1198,10 +941,6 @@ export function useChatMachine() {
     const { appointmentId, locationId, regionId, resourceId } = machineCtx;
     if (!appointmentId) { sendSilentEvent("CANCEL_DONE"); return; }
     const safeLocationId = getSafeLocationId(locationId);
-    if (!safeLocationId) {
-      sendSilentEvent("CANCEL_FAILED");
-      return;
-    }
 
     fetch("/api/edoc/cancel-appointment", {
       method: "POST",
@@ -1278,7 +1017,7 @@ export function useChatMachine() {
     const runner = runnerRef.current;
     if (!runner) return false;
     try {
-      const { allCities: cities, specialities } = await import("../knowledgeBase");
+      const { allCities: cities, specialities } = await import("../knowledgeBase.js");
       const res = await fetch("/api/intent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

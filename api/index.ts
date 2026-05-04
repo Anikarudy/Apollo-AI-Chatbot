@@ -98,12 +98,6 @@ async function callLlm(systemPrompt: string, userContent: string): Promise<strin
 // ── Apollo EDOC API config (server-side only – AuthKey never sent to browser) ──
 const EDOC_BASE = (process.env.APOLLO_EDOC_BASE_URL ?? "").replace(/\/$/, "");
 const EDOC_AUTH = process.env.APOLLO_EDOC_AUTH_KEY ?? "";
-const DEFAULT_DOCTOR_LOCATION_PATHS = [
-  "/api/EDOC/GetDoctorLocations",
-  "/api/EDOC/GetLocationByResource",
-  "/api/EDOC/GetLocationsByResource",
-  "/api/EDOC/GetResourceLocations",
-];
 function edocHeaders() {
   return { AuthKey: EDOC_AUTH, "Content-Type": "application/json" };
 }
@@ -211,95 +205,6 @@ function getLocationCandidates(city?: string, preferred?: string, resourceId?: s
 
   // Final fallback for corrupted source IDs: use city-level legacy location mapping.
   getLocationFallbacksForCity(cityInput).forEach((locationId) => add(locationId));
-  return result;
-}
-
-interface DoctorLocationOption {
-  locationId: string;
-  locationName: string;
-}
-
-function getDoctorLocationApiPaths(): string[] {
-  const configured = String(process.env.APOLLO_EDOC_DOCTOR_LOCATIONS_PATH ?? "")
-    .split(",")
-    .map((path) => path.trim())
-    .filter((path) => path.length > 0);
-  return configured.length > 0 ? configured : DEFAULT_DOCTOR_LOCATION_PATHS;
-}
-
-function buildEdocUrl(pathOrUrl: string): string {
-  if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
-  const normalized = pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`;
-  return `${EDOC_BASE}${normalized}`;
-}
-
-function getStringFromKeys(source: Record<string, unknown>, keys: string[]): string | undefined {
-  for (const key of keys) {
-    const value = asNonEmptyString(source[key]);
-    if (value) return value;
-  }
-  return undefined;
-}
-
-function normaliseDoctorLocationsResponse(raw: unknown): DoctorLocationOption[] {
-  const locationIdKeys = [
-    "locationId",
-    "LocationID",
-    "LocationId",
-    "locationid",
-    "LocID",
-    "LocId",
-    "locid",
-    "locationCode",
-    "LocationCode",
-  ];
-  const locationNameKeys = [
-    "locationName",
-    "LocationName",
-    "location",
-    "Location",
-    "branch",
-    "Branch",
-    "branchName",
-    "BranchName",
-    "hospitalName",
-    "HospitalName",
-    "name",
-    "Name",
-  ];
-
-  const objects: Array<Record<string, unknown>> = [];
-  const walk = (value: unknown, depth: number): void => {
-    if (depth > 4 || value === null || value === undefined) return;
-    if (Array.isArray(value)) {
-      value.forEach((entry) => walk(entry, depth + 1));
-      return;
-    }
-    if (typeof value === "object") {
-      const record = value as Record<string, unknown>;
-      objects.push(record);
-      Object.values(record).forEach((nested) => walk(nested, depth + 1));
-    }
-  };
-  walk(raw, 0);
-
-  const result: DoctorLocationOption[] = [];
-  const seen = new Set<string>();
-
-  for (const record of objects) {
-    const locationId = getStringFromKeys(record, locationIdKeys);
-    if (!locationId || !isNumericLocationId(locationId)) continue;
-    const normalizedLocationId = String(locationId).trim();
-    if (seen.has(normalizedLocationId)) continue;
-    seen.add(normalizedLocationId);
-
-    const locationName = getStringFromKeys(record, locationNameKeys) ?? `Location ${normalizedLocationId}`;
-    result.push({
-      locationId: normalizedLocationId,
-      locationName,
-    });
-  }
-
   return result;
 }
 
@@ -730,22 +635,6 @@ app.post("/api/agent/query", async (req: Request, res: Response): Promise<void> 
         return;
       }
 
-      if (!locationIdInput) {
-        const locationsRaw = await localPost(
-          "/api/doctor/locations",
-          {
-            resourceId,
-            regionId: regionIdInput,
-          },
-          INTERNAL_EDOC_TOOL_TIMEOUT_MS
-        );
-        const locations = (locationsRaw as { locations?: Array<{ locationId?: string }> }).locations ?? [];
-        const firstLocation = locations
-          .map((location) => asNonEmptyString(location.locationId))
-          .find((locationId): locationId is string => !!locationId);
-        if (firstLocation) locationIdInput = firstLocation;
-      }
-
       const city = asNonEmptyString(params.city) ?? asNonEmptyString(context?.city);
       const datesRaw = await localPost("/api/edoc/calendar-dates", {
         resourceId,
@@ -842,87 +731,7 @@ app.post("/api/agent/book-appointment", async (req: Request, res: Response): Pro
 // ── Apollo EDOC API proxy routes  (AuthKey stays server-side) ────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 
-// 2. Fetch doctor locations by resourceId (locationId is now resolved dynamically)
-app.post("/api/doctor/locations", async (req: Request, res: Response): Promise<void> => {
-  if (!requireEdoc(res)) return;
-
-  const { resourceId, regionId } = req.body as Record<string, string>;
-  const normalizedResourceId = String(resourceId ?? "").trim();
-  const normalizedRegionId = String(regionId ?? "5").trim() || "5";
-
-  if (!normalizedResourceId) {
-    res.status(400).json({ error: "resourceId required" });
-    return;
-  }
-
-  const candidatePaths = getDoctorLocationApiPaths();
-  let lastError = "";
-  let sawTimeout = false;
-
-  for (const path of candidatePaths) {
-    try {
-      const targetUrl = buildEdocUrl(path);
-      logEdoc("DoctorLocations.request", {
-        path,
-        resourceId: normalizedResourceId,
-        regionId: Number(normalizedRegionId),
-      });
-
-      const response = await axios.post(
-        targetUrl,
-        {
-          ResourceID: normalizedResourceId,
-          RegionID: Number(normalizedRegionId),
-          resourceId: normalizedResourceId,
-          regionId: Number(normalizedRegionId),
-        },
-        {
-          headers: edocHeaders(),
-          timeout: 15000,
-        }
-      );
-
-      const body = response.data as { retcode?: number; Message?: string | null };
-      const locations = normaliseDoctorLocationsResponse(response.data);
-      logEdoc("DoctorLocations.response", {
-        path,
-        retcode: body.retcode ?? null,
-        message: body.Message ?? null,
-        locationsCount: locations.length,
-      });
-
-      res.status(200).json({
-        locations,
-        retcode: body.retcode ?? 0,
-        message: body.Message ?? null,
-      });
-      return;
-    } catch (err: unknown) {
-      const e = err as { message?: string; code?: string; response?: { status?: number; data?: unknown } };
-      const msg = String(e.message ?? "Doctor locations lookup failed");
-      lastError = msg;
-      if (e.code === "ECONNABORTED" || /timeout/i.test(msg)) sawTimeout = true;
-
-      logEdoc("DoctorLocations.error", {
-        path,
-        code: e.code ?? null,
-        status: e.response?.status ?? null,
-        message: msg,
-      });
-    }
-  }
-
-  const status = sawTimeout ? 504 : 500;
-  res.status(status).json({
-    error: sawTimeout
-      ? "Doctor locations request timed out"
-      : (lastError || "Doctor locations request failed"),
-    locations: [],
-    retcode: -1,
-  });
-});
-
-// 3. Book Appointment
+// 2. Book Appointment
 app.post("/api/edoc/book-appointment", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const b = req.body as Record<string, unknown>;
@@ -946,7 +755,7 @@ app.post("/api/edoc/book-appointment", async (req: Request, res: Response): Prom
   }
 });
 
-// 4. Reschedule Appointment
+// 3. Reschedule Appointment
 app.post("/api/edoc/reschedule-appointment", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const b = req.body as Record<string, unknown>;
@@ -967,7 +776,7 @@ app.post("/api/edoc/reschedule-appointment", async (req: Request, res: Response)
   }
 });
 
-// 5. Cancel Appointment
+// 4. Cancel Appointment
 app.post("/api/edoc/cancel-appointment", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const b = req.body as Record<string, unknown>;
@@ -988,7 +797,7 @@ app.post("/api/edoc/cancel-appointment", async (req: Request, res: Response): Pr
   }
 });
 
-// 6. Fetch Real-time Slots (DoctorCalenderRules)
+// 5. Fetch Real-time Slots (DoctorCalenderRules)
 app.post("/api/edoc/slots", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const { resourceId, locationId, regionId, date, city } = req.body as Record<string, string>;
@@ -1032,7 +841,7 @@ app.post("/api/edoc/slots", async (req: Request, res: Response): Promise<void> =
   }
 });
 
-// 7. Fetch Real-time Slots V2 (DoctorCalenderRules_V2)
+// 6. Fetch Real-time Slots V2 (DoctorCalenderRules_V2)
 app.post("/api/edoc/slots-v2", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const { resourceId, locationId, regionId, date, city } = req.body as Record<string, string>;
@@ -1162,7 +971,7 @@ app.post("/api/edoc/slots-v2", async (req: Request, res: Response): Promise<void
   }
 });
 
-// 8. Get Calendar Details for Online (Medmantra sync)
+// 7. Get Calendar Details for Online (Medmantra sync)
 app.post("/api/edoc/calendar-details", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const { resourceId, locationId, regionId, date, city } = req.body as Record<string, string>;
@@ -1217,7 +1026,7 @@ app.post("/api/edoc/calendar-details", async (req: Request, res: Response): Prom
   }
 });
 
-// 9. Pull UHID by mobile number
+// 8. Pull UHID by mobile number
 app.post("/api/edoc/uhid-search", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const { phone, regionId, uhidNumber } = req.body as Record<string, string>;
@@ -1245,7 +1054,7 @@ app.post("/api/edoc/uhid-search", async (req: Request, res: Response): Promise<v
   }
 });
 
-// 10. Doctor Calendar Live Dates
+// 9. Doctor Calendar Live Dates
 app.post("/api/edoc/calendar-dates", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const { resourceId, locationId, regionId, city } = req.body as Record<string, string>;
@@ -1305,7 +1114,7 @@ app.post("/api/edoc/calendar-dates", async (req: Request, res: Response): Promis
   }
 });
 
-// 11. Generate UHID Online
+// 10. Generate UHID Online
 app.post("/api/edoc/generate-uhid", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const b = req.body as Record<string, unknown>;

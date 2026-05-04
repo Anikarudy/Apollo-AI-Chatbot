@@ -6,7 +6,7 @@
 // ============================================================
 
 import { createMachine, createActor, assign } from "xstate";
-import { allCities, getDoctorsByName, mapSymptomToSpecialty } from "./src/knowledgeBase.js";
+import { allCities, getDoctorsByName, mapSymptomToSpecialty } from "./src/knowledgeBase";
 import { AppEvent, mapInputToEvent } from "./src/inputMapping.js";
 
 // ─────────────────────────────────────────────────────────────
@@ -37,8 +37,6 @@ interface ApolloContext {
   patientFirstName?: string;
   patientLastName?: string;
   patientDob?: string;        // "03-Jun-1998"
-  pendingSlotSelection?: string;
-  lastAvailabilityError?: string;
 }
 
 function normalizeDoctorName(value: string): string {
@@ -88,20 +86,6 @@ function parsePrefill(value: string | undefined): Partial<ApolloContext> {
 function hasActionablePrefill(value: string | undefined): boolean {
   const parsed = parsePrefill(value);
   return !!((parsed.specialty ?? "").trim() || (parsed.doctorName ?? "").trim());
-}
-
-function parseEventPayload(value: string | undefined): Record<string, string> {
-  try {
-    return JSON.parse(value ?? "{}") as Record<string, string>;
-  } catch {
-    return {};
-  }
-}
-
-function readPayloadField(value: string | undefined, key: string): string | undefined {
-  const parsed = parseEventPayload(value);
-  const raw = String(parsed[key] ?? "").trim();
-  return raw.length > 0 ? raw : undefined;
 }
 
 export const apolloMachine = createMachine(
@@ -181,8 +165,6 @@ export const apolloMachine = createMachine(
           selectedDate:     () => undefined,
           selectedSlotStart:() => undefined,
           selectedSlotEnd:  () => undefined,
-          pendingSlotSelection: () => undefined,
-          lastAvailabilityError: () => undefined,
         }),
         on: {
           BOOK_APPOINTMENT: {
@@ -593,17 +575,29 @@ export const apolloMachine = createMachine(
       SHOW_DOCTORS: {
         on: {
           SELECT_SLOT: {
-            target: "SELECT_DOCTOR",
+            target: "ENTER_PHONE_FOR_BOOKING",
             actions: assign({
-              resourceId: ({ event }) => readPayloadField(event.value, "resourceId"),
-              locationId: ({ event }) => readPayloadField(event.value, "locationId"),
-              regionId: ({ event }) => readPayloadField(event.value, "regionId") ?? "5",
-              serviceId: ({ event }) => readPayloadField(event.value, "serviceId"),
-              selectedDate: ({ event }) => readPayloadField(event.value, "date"),
-              selectedSlotStart: ({ event }) => readPayloadField(event.value, "startTime"),
-              selectedSlotEnd: ({ event }) => readPayloadField(event.value, "endTime"),
-              pendingSlotSelection: ({ event }) => event.value,
-              lastAvailabilityError: () => undefined,
+              resourceId: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).resourceId; } catch { return undefined; }
+              },
+              locationId: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).locationId; } catch { return undefined; }
+              },
+              regionId: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).regionId ?? "5"; } catch { return "5"; }
+              },
+              serviceId: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).serviceId; } catch { return undefined; }
+              },
+              selectedDate: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).date; } catch { return undefined; }
+              },
+              selectedSlotStart: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).startTime; } catch { return undefined; }
+              },
+              selectedSlotEnd: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).endTime; } catch { return undefined; }
+              },
             }),
           },
           CHANGE_SEARCH: [
@@ -618,104 +612,6 @@ export const apolloMachine = createMachine(
           CHANGE_SPECIALTY: "SELECT_SPECIALTY",
           BACK_TO_MENU: "MAIN_MENU",
           UNKNOWN: "FALLBACK",
-        },
-      },
-
-      SELECT_DOCTOR: {
-        always: [
-          {
-            guard: ({ context }) => (context.resourceId ?? "").trim().length > 0,
-            target: "FETCH_DOCTOR_LOCATIONS",
-          },
-          {
-            target: "DOCTOR_LOCATIONS_FAILED_STATE",
-            actions: assign({
-              lastAvailabilityError: () => "Doctor selection is missing resourceId.",
-            }),
-          },
-        ],
-      },
-
-      FETCH_DOCTOR_LOCATIONS: {
-        on: {
-          DOCTOR_LOCATIONS_FETCHED: {
-            target: "FETCH_LIVE_DATES",
-            actions: assign({
-              locationId: ({ event, context }) => readPayloadField(event.value, "locationId") ?? context.locationId,
-              regionId: ({ event, context }) => readPayloadField(event.value, "regionId") ?? context.regionId ?? "5",
-              lastAvailabilityError: () => undefined,
-            }),
-          },
-          DOCTOR_LOCATIONS_FAILED: {
-            target: "DOCTOR_LOCATIONS_FAILED_STATE",
-            actions: assign({
-              lastAvailabilityError: ({ event }) => readPayloadField(event.value, "error") ?? "No locations found for this doctor.",
-            }),
-          },
-          BACK_TO_MENU: "SHOW_DOCTORS",
-        },
-      },
-
-      DOCTOR_LOCATIONS_FAILED_STATE: {
-        on: {
-          RETRY: "FETCH_DOCTOR_LOCATIONS",
-          CHANGE_SEARCH: "SHOW_DOCTORS",
-          BACK_TO_MENU: "SHOW_DOCTORS",
-        },
-      },
-
-      FETCH_LIVE_DATES: {
-        on: {
-          LIVE_DATES_FETCHED: {
-            target: "FETCH_SLOTS",
-            actions: assign({
-              selectedDate: ({ event, context }) => readPayloadField(event.value, "selectedDate") ?? context.selectedDate,
-              locationId: ({ event, context }) => readPayloadField(event.value, "locationId") ?? context.locationId,
-              lastAvailabilityError: () => undefined,
-            }),
-          },
-          LIVE_DATES_FAILED: {
-            target: "LIVE_DATES_FAILED_STATE",
-            actions: assign({
-              lastAvailabilityError: ({ event }) => readPayloadField(event.value, "error") ?? "No live dates are available for this doctor.",
-            }),
-          },
-          BACK_TO_MENU: "SHOW_DOCTORS",
-        },
-      },
-
-      LIVE_DATES_FAILED_STATE: {
-        on: {
-          RETRY: "FETCH_LIVE_DATES",
-          CHANGE_SEARCH: "SHOW_DOCTORS",
-          BACK_TO_MENU: "SHOW_DOCTORS",
-        },
-      },
-
-      FETCH_SLOTS: {
-        on: {
-          SLOTS_FETCHED: {
-            target: "ENTER_PHONE_FOR_BOOKING",
-            actions: assign({
-              serviceId: ({ event, context }) => readPayloadField(event.value, "serviceId") ?? context.serviceId,
-              lastAvailabilityError: () => undefined,
-            }),
-          },
-          SLOTS_FAILED: {
-            target: "SLOTS_FAILED_STATE",
-            actions: assign({
-              lastAvailabilityError: ({ event }) => readPayloadField(event.value, "error") ?? "No slots are available for the selected date.",
-            }),
-          },
-          BACK_TO_MENU: "SHOW_DOCTORS",
-        },
-      },
-
-      SLOTS_FAILED_STATE: {
-        on: {
-          RETRY: "FETCH_SLOTS",
-          CHANGE_SEARCH: "SHOW_DOCTORS",
-          BACK_TO_MENU: "SHOW_DOCTORS",
         },
       },
 

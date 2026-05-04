@@ -4,7 +4,7 @@
  * Buttons carry the exact event type to send to the machine.
  */
 
-import { allCities, specialities, contacts, getSubBranchesForCity, getDoctorsForLocation, getPackagesForCity, getDoctorsByName, buildDoctorSearchUrl, mapSymptomToSpecialty } from "./knowledgeBase.js";
+import { allCities, specialities, contacts, getSubBranchesForCity, getDoctorsForLocation, getPackagesForCity, getDoctorsByName, buildDoctorSearchUrl, mapSymptomToSpecialty } from "./knowledgeBase";
 
 export { mapSymptomToSpecialty };
 
@@ -243,53 +243,6 @@ const responses: Record<string, StateResponse> = {
     quickReplies: [
       { label: "Change search", eventType: "CHANGE_SEARCH" },
       { label: "Back to menu", eventType: "BACK_TO_MENU" },
-    ],
-  },
-
-  SELECT_DOCTOR: {
-    message: "Checking your selected doctor details…",
-    quickReplies: [],
-  },
-
-  FETCH_DOCTOR_LOCATIONS: {
-    message: "Finding the doctor's available consultation locations…",
-    quickReplies: [],
-  },
-
-  DOCTOR_LOCATIONS_FAILED_STATE: {
-    message: "I could not find a valid location for this doctor right now.",
-    quickReplies: [
-      { label: "Try again", eventType: "RETRY" },
-      { label: "Change search", eventType: "CHANGE_SEARCH" },
-      { label: "Back", eventType: "BACK_TO_MENU" },
-    ],
-  },
-
-  FETCH_LIVE_DATES: {
-    message: "Checking live appointment dates for this doctor…",
-    quickReplies: [],
-  },
-
-  LIVE_DATES_FAILED_STATE: {
-    message: "No live dates are available for this doctor right now.",
-    quickReplies: [
-      { label: "Try again", eventType: "RETRY" },
-      { label: "Change search", eventType: "CHANGE_SEARCH" },
-      { label: "Back", eventType: "BACK_TO_MENU" },
-    ],
-  },
-
-  FETCH_SLOTS: {
-    message: "Loading live slots for your selected date…",
-    quickReplies: [],
-  },
-
-  SLOTS_FAILED_STATE: {
-    message: "Slots are currently unavailable for the selected date.",
-    quickReplies: [
-      { label: "Try again", eventType: "RETRY" },
-      { label: "Change search", eventType: "CHANGE_SEARCH" },
-      { label: "Back", eventType: "BACK_TO_MENU" },
     ],
   },
 
@@ -587,42 +540,6 @@ export type ChatContext = Record<string, string | undefined>;
  * Pass `ctx` (machine context) so dynamic states can show real data.
  */
 export function getStateResponse(state: string, ctx?: ChatContext): StateResponse {
-  if (state === "DOCTOR_LOCATIONS_FAILED_STATE") {
-    const err = String(ctx?.lastAvailabilityError ?? "").trim();
-    return {
-      message: err || "I could not find a valid location for this doctor right now.",
-      quickReplies: [
-        { label: "Try again", eventType: "RETRY" },
-        { label: "Change search", eventType: "CHANGE_SEARCH" },
-        { label: "Back", eventType: "BACK_TO_MENU" },
-      ],
-    };
-  }
-
-  if (state === "LIVE_DATES_FAILED_STATE") {
-    const err = String(ctx?.lastAvailabilityError ?? "").trim();
-    return {
-      message: err || "No live dates are available for this doctor right now.",
-      quickReplies: [
-        { label: "Try again", eventType: "RETRY" },
-        { label: "Change search", eventType: "CHANGE_SEARCH" },
-        { label: "Back", eventType: "BACK_TO_MENU" },
-      ],
-    };
-  }
-
-  if (state === "SLOTS_FAILED_STATE") {
-    const err = String(ctx?.lastAvailabilityError ?? "").trim();
-    return {
-      message: err || "Slots are currently unavailable for the selected date.",
-      quickReplies: [
-        { label: "Try again", eventType: "RETRY" },
-        { label: "Change search", eventType: "CHANGE_SEARCH" },
-        { label: "Back", eventType: "BACK_TO_MENU" },
-      ],
-    };
-  }
-
   // ── Dynamic: SHOW_PACKAGES ────────────────────────────────────────────
   if (state === "SHOW_PACKAGES") {
     const city = ctx?.city ?? "";
