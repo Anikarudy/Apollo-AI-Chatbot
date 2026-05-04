@@ -1,4 +1,5 @@
 import cleanDataRaw from "../data/clean.json";
+import { getLocationFromBranch } from "../data/locationMap";
 
 export interface HealthPackage {
   name: string;
@@ -9,8 +10,8 @@ export interface HealthPackage {
 interface CleanDoctorRecord {
   doctorName: string;
   resourceId: string | number;
-  locationId: string | number;
-  regionId: string | number;
+  locationId?: string | number;
+  regionId?: string | number;
   location: string;
   speciality: string;
 }
@@ -106,12 +107,13 @@ export const doctors: Doctor[] = (() => {
   for (const record of cleanData.doctors ?? []) {
     const name = String(record.doctorName ?? "").trim();
     const resourceId = String(record.resourceId ?? "").trim();
-    const locationId = String(record.locationId ?? "").trim();
-    const regionId = String(record.regionId ?? "1").trim() || "1";
     const speciality = String(record.speciality ?? "").trim();
     const { city, branch } = parseLocation(String(record.location ?? ""));
+    const mappedLoc = getLocationFromBranch(branch);
+    const locationId = String(record.locationId ?? "").trim() || mappedLoc?.locationId || "";
+    const regionId = String(record.regionId ?? "").trim() || mappedLoc?.regionId || "1";
 
-    if (!name || !resourceId || !locationId || !speciality || !city) continue;
+    if (!name || !resourceId || !speciality || !city) continue;
 
     const dedupeKey = `${name.toLowerCase()}|${resourceId}|${locationId}|${regionId}`;
     if (seen.has(dedupeKey)) continue;

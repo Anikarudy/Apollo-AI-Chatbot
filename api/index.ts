@@ -5,6 +5,7 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import Groq from "groq-sdk";
 import axios from "axios";
 import { buildDoctorSearchUrl, contacts, getDoctorsForLocation, getDoctorsByName, getLocationFallbacksForCity, doctors, hospitalsByCity } from "../src/knowledgeBase";
+import { getLocationFromBranch } from "../data/locationMap";
 import {
   mapBookAppointmentForAgent,
   mapCalendarDatesForAgent,
@@ -176,7 +177,32 @@ function dedupeDoctorsForCards(items: LocalDoctor[]): LocalDoctor[] {
   return result;
 }
 
-function getLocationCandidates(city?: string, preferred?: string, resourceId?: string): string[] {
+/**
+ * Resolve the correct RegionID for an EDOC call.
+ * Uses the branch → regionId mapping when available, falls back to provided or "1" for Hyderabad.
+ */
+function resolveRegionId(branch: string | undefined, provided?: string): number {
+  if (provided && provided !== "5") return Number(provided);
+  if (branch) {
+    const mapped = getLocationFromBranch(branch);
+    if (mapped) return Number(mapped.regionId);
+  }
+  return Number(provided ?? "5");
+}
+
+/**
+ * Detects EDOC's "no real schedule configured" fallback response.
+ * EDOC returns a full 00:00-23:45 grid (≥90 slots, starts at midnight)
+ * when a doctor has no actual schedule at that location.
+ */
+function isFakeSchedule(slots: string[]): boolean {
+  if (!slots || slots.length === 0) return false; // empty is handled separately
+  if (slots.length >= 90) return true;            // full-day grid = fake
+  if (slots[0] === "00:00") return true;          // starts at midnight = fake
+  return false;
+}
+
+function getLocationCandidates(city?: string, preferred?: string, resourceId?: string, branch?: string): string[] {
   const result: string[] = [];
   const add = (v?: string) => {
     const val = String(v ?? "").trim();
@@ -187,8 +213,15 @@ function getLocationCandidates(city?: string, preferred?: string, resourceId?: s
 
   add(preferred);
 
+  // Branch is the most reliable source: one branch = one locationId
+  if (branch) {
+    const mapped = getLocationFromBranch(branch);
+    if (mapped) add(mapped.locationId);
+  }
+
   const resourceInput = String(resourceId ?? "").trim();
   if (resourceInput) {
+    // Fallback: check the doctors array (populated from clean.json + branch map)
     doctors
       .filter((doctor) => String(doctor.resourceId ?? "").trim() === resourceInput)
       .forEach((doctor) => add(doctor.locationId));
@@ -636,11 +669,13 @@ app.post("/api/agent/query", async (req: Request, res: Response): Promise<void> 
       }
 
       const city = asNonEmptyString(params.city) ?? asNonEmptyString(context?.city);
+      const branch = asNonEmptyString(params.branch) ?? asNonEmptyString(context?.branch);
       const datesRaw = await localPost("/api/edoc/calendar-dates", {
         resourceId,
         locationId: locationIdInput,
         regionId: regionIdInput,
         city,
+        branch,
       }, INTERNAL_EDOC_TOOL_TIMEOUT_MS);
       const mappedDates = mapCalendarDatesForAgent(datesRaw);
       const selectedDate = asNonEmptyString(params.date) ?? mappedDates.dates[0]?.edoc;
@@ -663,6 +698,7 @@ app.post("/api/agent/query", async (req: Request, res: Response): Promise<void> 
         regionId: regionIdInput,
         date: selectedDate,
         city,
+        branch,
       }, INTERNAL_EDOC_TOOL_TIMEOUT_MS);
 
       res.json({
@@ -800,13 +836,13 @@ app.post("/api/edoc/cancel-appointment", async (req: Request, res: Response): Pr
 // 5. Fetch Real-time Slots (DoctorCalenderRules)
 app.post("/api/edoc/slots", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
-  const { resourceId, locationId, regionId, date, city } = req.body as Record<string, string>;
+  const { resourceId, locationId, regionId, date, city, branch } = req.body as Record<string, string>;
   if (!resourceId || !date) {
     res.status(400).json({ error: "resourceId and date required" });
     return;
   }
 
-  const locationCandidates = getLocationCandidates(city, locationId, resourceId);
+  const locationCandidates = getLocationCandidates(city, locationId, resourceId, branch);
   if (locationCandidates.length === 0) {
     res.status(200).json({ slots: [], retcode: -1, error: "No valid locationId available" });
     return;
@@ -816,15 +852,21 @@ app.post("/api/edoc/slots", async (req: Request, res: Response): Promise<void> =
     let lastError = "";
     for (const locId of locationCandidates) {
       try {
-        logEdoc("DoctorCalenderRules.request", { resourceId, locationId: locId, regionId: Number(regionId ?? "5"), date });
+        logEdoc("DoctorCalenderRules.request", { resourceId, locationId: locId, regionId: resolveRegionId(branch, regionId), date });
         const r = await axios.post(
           `${EDOC_BASE}/api/EDOC/DoctorCalenderRules`,
-          { RegionID: Number(regionId ?? "5"), Locationid: locId, ResourceID: resourceId, ID_Date: date },
+          { RegionID: resolveRegionId(branch, regionId), Locationid: locId, ResourceID: resourceId, ID_Date: date },
           { headers: edocHeaders(), timeout: 15000 }
         );
         logEdoc("DoctorCalenderRules.response", r.data);
         const raw = (r.data as { getDoctorCalenderRulesDetails?: string; retcode?: number }).getDoctorCalenderRulesDetails ?? "";
-        const slots = raw ? raw.split(",").map((s) => s.trim()).filter(Boolean) : [];
+        const allRawSlots = raw ? raw.split(",").map((s) => s.trim()).filter(Boolean) : [];
+        if (isFakeSchedule(allRawSlots)) {
+          logEdoc("DoctorCalenderRules.fake_schedule", { resourceId, locationId: locId, slotsCount: allRawSlots.length, firstSlot: allRawSlots[0] });
+          lastError = "fake schedule";
+          continue; // try next location candidate
+        }
+        const slots = allRawSlots.filter((s) => s >= "07:00" && s <= "21:00");
         res.status(200).json({ slots, retcode: (r.data as { retcode?: number }).retcode ?? 0, locationId: locId });
         return;
       } catch (innerErr: unknown) {
@@ -844,13 +886,13 @@ app.post("/api/edoc/slots", async (req: Request, res: Response): Promise<void> =
 // 6. Fetch Real-time Slots V2 (DoctorCalenderRules_V2)
 app.post("/api/edoc/slots-v2", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
-  const { resourceId, locationId, regionId, date, city } = req.body as Record<string, string>;
+  const { resourceId, locationId, regionId, date, city, branch } = req.body as Record<string, string>;
   if (!resourceId || !date) {
     res.status(400).json({ error: "resourceId and date required" });
     return;
   }
 
-  const locationCandidates = getLocationCandidates(city, locationId, resourceId);
+  const locationCandidates = getLocationCandidates(city, locationId, resourceId, branch);
   if (locationCandidates.length === 0) {
     res.status(200).json({
       services: [],
@@ -867,10 +909,10 @@ app.post("/api/edoc/slots-v2", async (req: Request, res: Response): Promise<void
     let lastError = "";
     for (const locId of locationCandidates) {
       try {
-        logEdoc("DoctorCalenderRules_V2.request", { resourceId, locationId: locId, regionId: Number(regionId ?? "5"), date });
+        logEdoc("DoctorCalenderRules_V2.request", { resourceId, locationId: locId, regionId: resolveRegionId(branch, regionId), date });
         const r = await axios.post(
           `${EDOC_BASE}/api/EDOC/DoctorCalenderRules_V2`,
-          { RegionID: Number(regionId ?? "5"), Locationid: locId, ResourceID: resourceId, ID_Date: date },
+          { RegionID: resolveRegionId(branch, regionId), Locationid: locId, ResourceID: resourceId, ID_Date: date },
           { headers: edocHeaders(), timeout: 15000 }
         );
         logEdoc("DoctorCalenderRules_V2.response", r.data);
@@ -932,7 +974,13 @@ app.post("/api/edoc/slots-v2", async (req: Request, res: Response): Promise<void
           });
         });
 
-        const allSlots = Array.from(allSlotsSet).sort((a, b) => a.localeCompare(b));
+        const isReasonableSlot = (t: string) => t >= "07:00" && t <= "21:00";
+        const allSlots = Array.from(allSlotsSet).filter(isReasonableSlot).sort((a, b) => a.localeCompare(b));
+        if (isFakeSchedule(Array.from(allSlotsSet))) {
+          logEdoc("DoctorCalenderRules_V2.fake_schedule", { resourceId, locationId: locId, slotsCount: allSlotsSet.size, firstSlot: Array.from(allSlotsSet).sort()[0] });
+          lastError = "fake schedule";
+          continue; // try next location candidate
+        }
         res.status(200).json({
           services,
           allSlots,
@@ -974,13 +1022,13 @@ app.post("/api/edoc/slots-v2", async (req: Request, res: Response): Promise<void
 // 7. Get Calendar Details for Online (Medmantra sync)
 app.post("/api/edoc/calendar-details", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
-  const { resourceId, locationId, regionId, date, city } = req.body as Record<string, string>;
+  const { resourceId, locationId, regionId, date, city, branch } = req.body as Record<string, string>;
   if (!resourceId) {
     res.status(400).json({ error: "resourceId required" });
     return;
   }
 
-  const locationCandidates = getLocationCandidates(city, locationId, resourceId);
+  const locationCandidates = getLocationCandidates(city, locationId, resourceId, branch);
   if (locationCandidates.length === 0) {
     res.status(200).json({ calendar: [], retcode: -1, error: "No valid locationId available" });
     return;
@@ -994,12 +1042,12 @@ app.post("/api/edoc/calendar-details", async (req: Request, res: Response): Prom
         logEdoc("GetCalendardetailsforOnline.request", {
           resourceId,
           locationId: locId,
-          regionId: Number(regionId ?? "5"),
+          regionId: resolveRegionId(branch, regionId),
           date: date ?? "",
         });
         const r = await axios.post(
           `${EDOC_BASE}/api/EDOC/GetCalendardetailsforOnline`,
-          { ixmlcalendarrequest: xmlReq, ID_Date: date ?? "", RegionID: Number(regionId ?? "5") },
+          { ixmlcalendarrequest: xmlReq, ID_Date: date ?? "", RegionID: resolveRegionId(branch, regionId) },
           { headers: edocHeaders(), timeout: 15000 }
         );
         logEdoc("GetCalendardetailsforOnline.response", r.data);
@@ -1057,13 +1105,13 @@ app.post("/api/edoc/uhid-search", async (req: Request, res: Response): Promise<v
 // 9. Doctor Calendar Live Dates
 app.post("/api/edoc/calendar-dates", async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
-  const { resourceId, locationId, regionId, city } = req.body as Record<string, string>;
+  const { resourceId, locationId, regionId, city, branch } = req.body as Record<string, string>;
   if (!resourceId) {
     res.status(400).json({ error: "resourceId required" });
     return;
   }
 
-  const locationCandidates = getLocationCandidates(city, locationId, resourceId);
+  const locationCandidates = getLocationCandidates(city, locationId, resourceId, branch);
   if (locationCandidates.length === 0) {
     res.status(200).json({ dates: [], retcode: -1, error: "No valid locationId available" });
     return;
@@ -1073,10 +1121,10 @@ app.post("/api/edoc/calendar-dates", async (req: Request, res: Response): Promis
     let lastError = "";
     for (const locId of locationCandidates) {
       try {
-        logEdoc("DoctorCalenderLiveDates.request", { resourceId, locationId: locId, regionId: Number(regionId ?? "5") });
+        logEdoc("DoctorCalenderLiveDates.request", { resourceId, locationId: locId, regionId: resolveRegionId(branch, regionId) });
         const r = await axios.post(
           `${EDOC_BASE}/api/EDOC/DoctorCalenderLiveDates`,
-          { RegionID: Number(regionId ?? "5"), Locationid: locId, ResourceID: resourceId },
+          { RegionID: resolveRegionId(branch, regionId), Locationid: locId, ResourceID: resourceId },
           { headers: edocHeaders(), timeout: 15000 }
         );
         logEdoc("DoctorCalenderLiveDates.response", r.data);
@@ -1091,7 +1139,7 @@ app.post("/api/edoc/calendar-dates", async (req: Request, res: Response): Promis
             resourceId,
             requestedLocationId: locationId ?? null,
             resolvedLocationId: locId,
-            regionId: Number(regionId ?? "5"),
+            regionId: resolveRegionId(branch, regionId),
             city: city ?? null,
             retcode,
             rawDates: raw,
