@@ -109,7 +109,11 @@ const NO_LLM_STATES = new Set([
 ]);
 
 // States where free-text should first be sent to the AI intent parser.
-const AI_NAV_STATES = ["WELCOME", "MAIN_MENU", "FALLBACK"];
+const AI_NAV_STATES = [
+  "WELCOME", "MAIN_MENU", "FALLBACK",
+  "BOOK_APPT_OPTIONS", "BOOK_APPT_OPTIONS_LOCATION",
+  "FIND_DOCTOR_OPTIONS",
+];
 
 function parseLiveDate(dateStr: string): LiveDate {
   const [d, m, y] = dateStr.split("/");
@@ -141,10 +145,17 @@ function getSafeLocationId(locationId?: string, fallback = "10551"): string {
 export function useChatMachine() {
   const runnerRef = useRef<ApolloAssistRunner | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  // Keep ref in sync with state so callbacks can read current messages without dep issues
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
   const [currentState, setCurrentState] = useState<string>("WELCOME");
   const [machineCtx, setMachineCtx] = useState<ChatContext>({});
   const [isLlmLoading, setIsLlmLoading] = useState(false);
   const [doctorCards, setDoctorCards] = useState<DoctorCardData[]>([]);
+  // ID of the bot message after which doctor cards should be rendered inline
+  const [cardsAnchorMsgId, setCardsAnchorMsgId] = useState<string | null>(null);
+
+  // Mirror of messages for use inside callbacks without adding to deps arrays
+  const messagesRef = useRef<ChatMessage[]>([]);
 
   // Live dates: key = doctorKey, value = LiveDate[]
   const [liveDates, setLiveDates] = useState<Record<string, LiveDate[]>>({});
@@ -403,10 +414,32 @@ export function useChatMachine() {
   // ── Load doctor cards when entering SHOW_DOCTORS ─────────────────────────
   useEffect(() => {
     if (currentState !== "SHOW_DOCTORS" && currentState !== "RESCHEDULE_APPOINTMENT") {
-      if (currentState !== "SHOW_DOCTORS") setDoctorCards([]);
+      if (currentState !== "SHOW_DOCTORS") {
+        setDoctorCards([]);
+        setCardsAnchorMsgId(null);
+      }
       return;
     }
-    if (currentState === "RESCHEDULE_APPOINTMENT") return; // keep existing cards
+    if (currentState === "RESCHEDULE_APPOINTMENT") {
+      // Show only the originally booked doctor's card (from context)
+      const hospital = machineCtx.branch
+        ? `${machineCtx.branch}${machineCtx.city ? `, ${machineCtx.city}` : ""}`
+        : machineCtx.city
+        ? `Apollo Hospitals, ${machineCtx.city}`
+        : "Apollo Hospitals";
+      const anchorId = messagesRef.current[messagesRef.current.length - 1]?.id ?? null;
+      setDoctorCards([{
+        name:       machineCtx.doctorName ?? "Your Doctor",
+        specialty:  machineCtx.specialty,
+        hospital,
+        resourceId: machineCtx.resourceId,
+        locationId: machineCtx.locationId,
+        regionId:   machineCtx.regionId ?? "5",
+        serviceId:  machineCtx.serviceId,
+      }]);
+      setCardsAnchorMsgId(anchorId);
+      return;
+    }
 
     const hospital = machineCtx.branch
       ? `${machineCtx.branch}${machineCtx.city ? `, ${machineCtx.city}` : ""}`
@@ -453,14 +486,18 @@ export function useChatMachine() {
           serviceId:  d.serviceId,
         }));
 
+        const anchorId = messagesRef.current[messagesRef.current.length - 1]?.id ?? null;
         if (cards.length > 0) {
           setDoctorCards(cards);
         } else {
           // No doctors found — show a single "no results" placeholder
           setDoctorCards([{ name: "No doctors found", specialty: machineCtx.specialty, hospital: "Try a different search or visit apollohospitals.com" }]);
         }
+        setCardsAnchorMsgId(anchorId);
       } catch {
+        const anchorId = messagesRef.current[messagesRef.current.length - 1]?.id ?? null;
         setDoctorCards([{ name: fallbackName, specialty: machineCtx.specialty, hospital }]);
+        setCardsAnchorMsgId(anchorId);
       }
     };
 
@@ -797,6 +834,18 @@ export function useChatMachine() {
     if (!patientFirstName || !phoneNumber) { sendSilentEvent("UHID_FAILED"); return; }
     const safeLocationId = getSafeLocationId(locationId);
 
+    // Normalize DOB to DD-Mon-YYYY — EDOC rejects numeric months like "14-03-2004"
+    const MON_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    const normalizeEdocDob = (dob: string): string => {
+      const m = dob.match(/^(\d{1,2})[-/](\d{1,2}|\w{3,})[-/](\d{2,4})$/);
+      if (!m) return dob;
+      const [, d, mon, y] = m;
+      const idx = parseInt(mon) - 1;
+      const monName = !isNaN(idx) && idx >= 0 && idx < 12 ? MON_NAMES[idx] : mon;
+      return `${d.padStart(2, "0")}-${monName}-${y}`;
+    };
+    const normalizedDob = normalizeEdocDob(patientDob ?? "01-Jan-1990");
+
     fetch("/api/edoc/generate-uhid", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -807,7 +856,7 @@ export function useChatMachine() {
         RegionID: Number(regionId ?? "5"),
         FirstName: patientFirstName,
         LastName: patientLastName ?? "User",
-        DateOfBirth: patientDob ?? "01-Jan-1990",
+        DateOfBirth: normalizedDob,
         MobileNumber: phoneNumber,
         Gender: "71",
         MaritalStatus: "8",
@@ -839,7 +888,15 @@ export function useChatMachine() {
     if (edocFiredForState.current === currentState) return;
     edocFiredForState.current = currentState;
     const { resourceId, locationId, regionId, serviceId, uhid, selectedDate, selectedSlotStart, phoneNumber } = machineCtx;
-    if (!resourceId || !selectedDate || !selectedSlotStart || !uhid) {
+
+    // "Request Appointment" path — no date/slot selected, just send BOOKING_DONE
+    // with a placeholder so the user gets a confirmation message
+    if (!selectedDate || !selectedSlotStart) {
+      sendSilentEvent("BOOKING_DONE", "REQUEST");
+      return;
+    }
+
+    if (!resourceId || !uhid) {
       sendSilentEvent("BOOKING_FAILED");
       return;
     }
@@ -971,12 +1028,22 @@ export function useChatMachine() {
       pushStaticBotMessage(state, ctx as ChatContext);
       return;
     }
+    await pushLlmDirect(state, ctx, userMessage);
+  }, [pushStaticBotMessage]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** Call LLM unconditionally — bypasses NO_LLM_STATES check (used for in-place responses). */
+  const pushLlmDirect = useCallback(async (state: string, ctx: Record<string, unknown>, userMessage: string) => {
+    // Build recent conversation history (up to 8 prior turns, excluding the current user msg)
+    const recentMsgs = messagesRef.current.slice(-9, -1);
+    const history = recentMsgs
+      .filter((m) => m.text.trim().length > 0)
+      .map((m) => ({ role: m.sender === "user" ? "user" : "assistant" as "user" | "assistant", text: m.text }));
     try {
       setIsLlmLoading(true);
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ currentState: state, context: ctx, userMessage }),
+        body: JSON.stringify({ currentState: state, context: ctx, userMessage, history }),
       });
       if (res.ok) {
         const data = (await res.json()) as { text: string | null };
@@ -1012,16 +1079,21 @@ export function useChatMachine() {
     [pushStaticBotMessage]
   );
 
-  // ── AI: parse intent and auto-navigate (WELCOME / MAIN_MENU / FALLBACK) ──
+  // ── AI: parse intent and auto-navigate ────────────────────────────────────
   const tryAiIntent = useCallback(async (text: string): Promise<boolean> => {
     const runner = runnerRef.current;
     if (!runner) return false;
     try {
       const { allCities: cities, specialities } = await import("../knowledgeBase.js");
+      // Pass last 6 messages as history so intent parser can resolve "yes"/"sure"/"ok" from prior context
+      const history = messagesRef.current.slice(-6).map((m) => ({
+        role: (m.sender === "user" ? "user" : "assistant") as "user" | "assistant",
+        text: m.text,
+      }));
       const res = await fetch("/api/intent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, cities, specialties: specialities }),
+        body: JSON.stringify({ message: text, cities, specialties: specialities, history, currentState }),
       });
       if (!res.ok) return false;
       const parsed = await res.json() as {
@@ -1030,11 +1102,46 @@ export function useChatMachine() {
         city?: string | null;
         branch?: string | null;
         doctorName?: string | null;
+        symptomText?: string | null;
       };
-      // Only auto-navigate if we have a clear booking/find intent AND at least specialty or doctorName
       const isActionable = (parsed.intent === "book_appointment" || parsed.intent === "find_doctor")
-        && (parsed.specialty || parsed.doctorName);
-      if (!isActionable) return false;
+        && (parsed.specialty || parsed.doctorName || parsed.city);
+      const isSymptom = parsed.intent === "have_symptoms" && !!(parsed.symptomText || parsed.specialty);
+      if (!isActionable && !isSymptom) return false;
+
+      if (isSymptom) {
+        const symptomSpecialty = parsed.specialty;
+        const symptomText = parsed.symptomText ?? "";
+
+        if (symptomSpecialty) {
+          // Specialty known — use AI_PREFILL to route directly through specialty search.
+          // Works in WELCOME/MAIN_MENU/FALLBACK/BOOK_APPT_OPTIONS/FIND_DOCTOR_OPTIONS/BOOK_APPT_OPTIONS_LOCATION
+          const prefill = JSON.stringify({
+            specialty: symptomSpecialty,
+            city: parsed.city ?? undefined,
+          });
+          runner.sendEvent({ type: "AI_PREFILL", value: prefill } as AppEvent);
+        } else {
+          // No specialty mapping — navigate step by step:
+          // HAVE_SYMPTOMS → ASK_BASIC_DETAILS → ENTER_SYMPTOM → MAP_TO_SPECIALTY
+          const stateBefore = runner.currentState;
+          runner.sendEvent({ type: "HAVE_SYMPTOMS" } as AppEvent);
+          // FIND_DOCTOR_OPTIONS uses BY_SYMPTOMS instead of HAVE_SYMPTOMS
+          if (runner.currentState === stateBefore) {
+            runner.sendEvent({ type: "BY_SYMPTOMS" } as AppEvent);
+          }
+          if (runner.currentState === "ASK_BASIC_DETAILS") {
+            runner.sendEvent({ type: "ENTER_SYMPTOM", value: symptomText } as AppEvent);
+          }
+        }
+        const nextState = runner.currentState;
+        const nextCtx   = runner.context as ChatContext;
+        if (nextState !== edocFiredForState.current) edocFiredForState.current = "";
+        setCurrentState(nextState);
+        setMachineCtx(nextCtx);
+        pushStaticBotMessage(nextState, nextCtx);
+        return true;
+      }
 
       const payload = JSON.stringify({
         specialty:  parsed.specialty  ?? undefined,
@@ -1054,7 +1161,7 @@ export function useChatMachine() {
       return false;
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pushStaticBotMessage]);
+  }, [currentState, pushStaticBotMessage]);
 
   // ── Free-text input ────────────────────────────────────────────────────────
   const sendUserText = useCallback(
@@ -1062,6 +1169,29 @@ export function useChatMachine() {
       const runner = runnerRef.current;
       if (!runner) return;
       setMessages((prev) => [...prev, { id: nextId(), sender: "user", text }]);
+
+      // In SHOW_DOCTORS, handle text without leaving the cards view.
+      if (currentState === "SHOW_DOCTORS") {
+        const event = mapInputToEvent(text, currentState);
+        if (event.type !== "UNKNOWN") {
+          // Explicit keyword navigation (CHANGE_SEARCH / BACK_TO_MENU)
+          runner.sendEvent(event);
+          const nextState = runner.currentState;
+          const nextCtx = runner.context as ChatContext;
+          if (nextState !== edocFiredForState.current) edocFiredForState.current = "";
+          setCurrentState(nextState);
+          setMachineCtx(nextCtx);
+          await pushLlmBotMessage(nextState, nextCtx as Record<string, unknown>, text);
+        } else {
+          // Try AI intent navigation first (catches "wrong specialty", "different city", etc.)
+          const navigated = await tryAiIntent(text);
+          if (!navigated) {
+            // Purely conversational — respond in-place without leaving SHOW_DOCTORS
+            await pushLlmDirect(currentState, runner.context as Record<string, unknown>, text);
+          }
+        }
+        return;
+      }
 
       // For navigation states, first try AI intent parsing
       if (AI_NAV_STATES.includes(currentState)) {
@@ -1082,7 +1212,7 @@ export function useChatMachine() {
       await pushLlmBotMessage(nextState, runner.context as Record<string, unknown>, text);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [currentState, pushLlmBotMessage, tryAiIntent]
+    [currentState, pushLlmBotMessage, pushLlmDirect, tryAiIntent]
   );
 
   const sendQuickReply = useCallback(
@@ -1108,10 +1238,36 @@ export function useChatMachine() {
         locationId: doctor.locationId,
         regionId:   doctor.regionId ?? "5",
         serviceId:  serviceIdOverride ?? doctor.serviceId,
+        doctorName: doctor.name,
       });
       setMessages((prev) => [
         ...prev,
         { id: nextId(), sender: "user", text: `Book ${doctor.name} · ${edocDate} at ${startTime}` },
+      ]);
+      sendEvent("SELECT_SLOT", payload);
+    },
+    [sendEvent]
+  );
+
+  /**
+   * Called from the "Request Appointment" button when no slots are available.
+   * Sets doctor context and starts the phone-entry flow without a specific slot.
+   */
+  const requestAppointmentForDoctor = useCallback(
+    (doctor: DoctorCardData) => {
+      const payload = JSON.stringify({
+        date: "",
+        startTime: "",
+        endTime: "",
+        resourceId: doctor.resourceId,
+        locationId: doctor.locationId,
+        regionId:   doctor.regionId ?? "5",
+        serviceId:  doctor.serviceId,
+        doctorName: doctor.name,
+      });
+      setMessages((prev) => [
+        ...prev,
+        { id: nextId(), sender: "user", text: `Request appointment with ${doctor.name}` },
       ]);
       sendEvent("SELECT_SLOT", payload);
     },
@@ -1129,6 +1285,7 @@ export function useChatMachine() {
     setMachineCtx({});
     setIsLlmLoading(false);
     setDoctorCards([]);
+    setCardsAnchorMsgId(null);
     setLiveDates({});
     setLiveSlots({});
     setSlotServiceByKey({});
@@ -1142,12 +1299,14 @@ export function useChatMachine() {
     machineCtx,
     isLlmLoading,
     doctorCards,
+    cardsAnchorMsgId,
     liveDates,
     liveSlots,
     slotsLoading,
     getServiceIdForSlot,
     fetchSlotsForDate,
     selectDoctorForBooking,
+    requestAppointmentForDoctor,
     sendUserText,
     sendQuickReply,
     resetMachine,

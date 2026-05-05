@@ -19,6 +19,21 @@ const app = express();
 const frontendOrigin = process.env.FRONTEND_ORIGIN ?? "http://localhost:5173";
 app.use(cors({ origin: frontendOrigin }));
 app.use(express.json());
+
+// ── Request/response logging middleware ──────────────────────────────────────
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    const ms = Date.now() - start;
+    const status = res.statusCode;
+    if (status < 400) {
+      console.log(`[API] ${req.method} ${req.path} → ${status} (${ms}ms)`);
+    } else {
+      console.warn(`[API] ${req.method} ${req.path} → ${status} (${ms}ms)`);
+    }
+  });
+  next();
+});
 const PORT = Number(process.env.PORT ?? 3001);
 const LOCAL_API_BASE = `http://127.0.0.1:${PORT}`;
 const INTERNAL_TOOL_TIMEOUT_MS = 30000;
@@ -34,18 +49,31 @@ const NO_LLM_ERROR = "No LLM configured. Set DEEPSEEK_API_KEY, GROQ_API_KEY, or 
 /**
  * Unified LLM call — tries DeepSeek first, then Groq, then Gemini.
  * Returns the response text string.
+ * @param history Prior conversation turns (user/assistant alternating) for multi-turn memory.
  */
-async function callLlm(systemPrompt: string, userContent: string): Promise<string> {
+async function callLlm(
+  systemPrompt: string,
+  userContent: string,
+  history?: Array<{ role: "user" | "assistant"; text: string }>,
+): Promise<string> {
+  type OpenAIMessage = { role: "system" | "user" | "assistant"; content: string };
+  const historyMessages: OpenAIMessage[] = (history ?? []).map((h) => ({
+    role: h.role,
+    content: h.text,
+  }));
+
   // ── 1. DeepSeek ──────────────────────────────────────────────────────────
   if (deepseekKey) {
     try {
       const model = process.env.DEEPSEEK_MODEL?.trim() || "deepseek-chat";
+      console.log(`[LLM] Trying DeepSeek (${model})`);
       const response = await axios.post(
         "https://api.deepseek.com/chat/completions",
         {
           model,
           messages: [
             { role: "system", content: systemPrompt },
+            ...historyMessages,
             { role: "user", content: userContent },
           ],
           max_tokens: 256,
@@ -62,7 +90,10 @@ async function callLlm(systemPrompt: string, userContent: string): Promise<strin
 
       const text = (response.data as { choices?: Array<{ message?: { content?: string } }> })
         .choices?.[0]?.message?.content ?? "";
-      if (text.trim()) return text;
+      if (text.trim()) {
+        console.log(`[LLM] Response from DeepSeek (${model})`);
+        return text;
+      }
     } catch (err: unknown) {
       const error = err as { message?: string };
       const msg = String(error.message ?? err);
@@ -76,21 +107,35 @@ async function callLlm(systemPrompt: string, userContent: string): Promise<strin
 
   // ── 2. Groq ──────────────────────────────────────────────────────────────
   if (groq) {
+    const groqModel = "llama-3.3-70b-versatile";
+    console.log(`[LLM] Trying Groq (${groqModel})`);
     const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+      model: groqModel,
       messages: [
         { role: "system", content: systemPrompt },
+        ...historyMessages,
         { role: "user",   content: userContent },
       ],
       max_tokens: 256,
       temperature: 0.5,
     });
-    return completion.choices[0]?.message?.content ?? "";
+    const text = completion.choices[0]?.message?.content ?? "";
+    console.log(`[LLM] Response from Groq (${groqModel})`);
+    return text;
   }
   // ── 3. Gemini ─────────────────────────────────────────────────────────────
   if (process.env.GEMINI_API_KEY) {
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash", systemInstruction: systemPrompt });
-    const result = await model.generateContent(userContent);
+    const geminiModel = "gemini-2.0-flash";
+    console.log(`[LLM] Trying Gemini (${geminiModel})`);
+    const model = genAI.getGenerativeModel({ model: geminiModel, systemInstruction: systemPrompt });
+    const chat = model.startChat({
+      history: (history ?? []).map((h) => ({
+        role: h.role === "user" ? "user" : "model",
+        parts: [{ text: h.text }],
+      })),
+    });
+    const result = await chat.sendMessage(userContent);
+    console.log(`[LLM] Response from Gemini (${geminiModel})`);
     return result.response.text();
   }
   throw new Error(NO_LLM_ERROR);
@@ -246,6 +291,7 @@ interface ChatRequest {
   currentState?: string;
   context?: Record<string, string | undefined>;
   userMessage?: string;
+  history?: Array<{ role: "user" | "assistant"; text: string }>;
 }
 
 type AgentAction = "fetch_doctors" | "get_live_slots" | "book_appointment" | "unknown";
@@ -400,8 +446,12 @@ Rules:
     ? `User said: "${userMessage}"`
     : `Generate a warm, helpful response for state: ${currentState}`;
 
+  // Pass the last 8 messages as conversation history (4 user + 4 bot turns)
+  const history = (payload.history ?? []).slice(-8);
+
   try {
-    const text = await callLlm(systemPrompt, userContent);
+    console.log(`[LLM] /api/chat invoked — state: ${currentState}, message: ${userMessage ? `"${userMessage}"` : "(none)"}`);
+    const text = await callLlm(systemPrompt, userContent, history);
     res.json({ text });
   } catch (err: unknown) {
     const error = err as { message?: string };
@@ -411,37 +461,45 @@ Rules:
 });
 
 // ── 1b. Intent parsing ────────────────────────────────────────────────────────
-interface IntentRequest { message: string; cities: string[]; specialties: string[]; }
+interface IntentRequest { message: string; cities: string[]; specialties: string[]; history?: Array<{ role: "user" | "assistant"; text: string }>; currentState?: string; }
 export interface ParsedIntent {
-  intent: "book_appointment" | "find_doctor" | "health_checkup" | "emergency" | "unknown";
-  specialty?: string; city?: string; branch?: string; doctorName?: string;
+  intent: "book_appointment" | "find_doctor" | "health_checkup" | "have_symptoms" | "emergency" | "unknown";
+  specialty?: string; city?: string; branch?: string; doctorName?: string; symptomText?: string;
 }
 
 app.post("/api/intent", async (req: Request, res: Response): Promise<void> => {
   if (!hasAnyLlm) { res.json({ intent: "unknown" }); return; }
 
-  const { message, cities, specialties } = req.body as IntentRequest;
+  const { message, cities, specialties, history, currentState: intentState } = req.body as IntentRequest;
   if (!message) { res.status(400).json({ error: "message required" }); return; }
+
+  const historyBlock = (history ?? []).length > 0
+    ? `\nRecent conversation (for context resolution):\n${(history ?? []).map((h) => `${h.role === "user" ? "User" : "Bot"}: ${h.text}`).join("\n")}\n`
+    : "";
 
   const systemPrompt = `You are an intent parser for Apollo Hospitals chatbot.
 Extract booking intent from the user message and return ONLY a valid JSON object (no markdown, no explanation).
 
 Known cities: ${(cities ?? []).join(", ")}
 Known specialties: ${(specialties ?? []).join(", ")}
+Current bot state: ${intentState ?? "unknown"}${historyBlock}
 
 JSON schema:
 {
-  "intent": "book_appointment" | "find_doctor" | "health_checkup" | "emergency" | "unknown",
+  "intent": "book_appointment" | "find_doctor" | "health_checkup" | "have_symptoms" | "emergency" | "unknown",
   "specialty": string | null,
   "city": string | null,
   "branch": string | null,
-  "doctorName": string | null
+  "doctorName": string | null,
+  "symptomText": string | null
 }
 
 Rules:
-- Only set intent to book_appointment or find_doctor if user explicitly mentions doctor/appointment/booking.
-- Map symptom words to the closest specialty from the list.
-- Return null for any field not mentioned. Never guess.
+- Use "have_symptoms" when user describes a medical symptom or health complaint (e.g. "ear block", "chest pain", "my knee hurts"). Set symptomText to the exact symptom phrase. Also map to the closest specialty when possible.
+- Use "book_appointment" or "find_doctor" only if user explicitly mentions doctor/appointment/booking.
+- CONTEXT RESOLUTION: If the user's message is just an affirmation ("yes", "sure", "ok", "yeah", "proceed", "please", "correct") — look at the conversation history to understand what they are confirming, and extract specialty/city/doctorName from prior context. E.g. if the bot said "I recommend ENT specialist", and user says "yes", return { intent: "find_doctor", specialty: "ENT" }. E.g. if bot said "Would you like to book in Hyderabad?", and user says "sure", return { intent: "book_appointment", city: "Hyderabad" }.
+- Set city if a known city is mentioned in the current message OR clearly referenced from history.
+- Return null for any field not mentioned or inferable. Never guess.
 - Return ONLY the raw JSON object, nothing else.`;
 
   try {

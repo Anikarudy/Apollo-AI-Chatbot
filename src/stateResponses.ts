@@ -260,10 +260,10 @@ const responses: Record<string, StateResponse> = {
   },
 
   COLLECT_PATIENT_DETAILS: {
-    message: "No existing profile found. Please provide your name and date of birth.\nExample: Harika Sunanda 28-Apr-1990\n(Date format: DD-Mon-YYYY)",
+    message: "No existing profile found. Please provide your name and date of birth.\nExample: John Smith 28-04-1990\n(Date format: DD-MM-YYYY)",
     quickReplies: [{ label: "Back to menu", eventType: "BACK_TO_MENU" }],
     showInput: true,
-    inputPlaceholder: "Name DD-Mon-YYYY  (e.g. Harika Sunanda 28-Apr-1990)",
+    inputPlaceholder: "FirstName LastName DD-MM-YYYY",
   },
 
   GENERATE_UHID_STATE: {
@@ -577,9 +577,64 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
     };
   }
 
+  // ── Dynamic: ASK_CITY — filter to cities that actually have this doctor ──────
+  if (state === "ASK_CITY") {
+    const doctorName = ctx?.doctorName ?? "";
+    if (doctorName) {
+      const matches = getDoctorsByName(doctorName, 200);
+      const uniqueCities = Array.from(new Set(matches.map((d) => d.location))).sort();
+      if (uniqueCities.length > 0) {
+        return {
+          message: `${doctorName} is available in ${uniqueCities.length > 1 ? "multiple cities" : uniqueCities[0]}. Which city would you prefer?`,
+          quickReplies: [
+            ...uniqueCities.map((c) => ({ label: c, eventType: "SELECT_CITY", value: c })),
+            { label: "Back to menu", eventType: "BACK_TO_MENU" },
+          ],
+          showInput: false,
+        };
+      }
+    }
+    // Default city picker (specialty/symptom flow)
+    return responses["ASK_CITY"]!;
+  }
+
+  // ── Dynamic: DOCTOR_NOT_FOUND ────────────────────────────────────────────────
+  if (state === "DOCTOR_NOT_FOUND") {
+    const name = ctx?.doctorName ?? "";
+    return {
+      message: name
+        ? `Sorry, I couldn't find a doctor named "${name}" in our records. What would you like to do?`
+        : "Sorry, I couldn't find any doctors matching your search. What would you like to do?",
+      quickReplies: [
+        { label: "Try a different name", eventType: "RETRY_NAME" },
+        { label: "Search by specialty", eventType: "SEARCH_BY_SPECIALTY" },
+        { label: "Back to menu", eventType: "BACK_TO_MENU" },
+      ],
+    };
+  }
+
   // ── Dynamic: ASK_BRANCH — sub-branches from new doctor mapping ────────────
   if (state === "ASK_BRANCH") {
     const city = ctx?.city ?? "";
+    const doctorName = ctx?.doctorName ?? "";
+
+    // When searching by doctor name, only show branches where that doctor exists
+    if (doctorName && city) {
+      const cityMatches = getDoctorsByName(doctorName, 200).filter(
+        (d) => d.location.toLowerCase() === city.toLowerCase()
+      );
+      const uniqueBranches = Array.from(new Set(cityMatches.map((d) => d.branch))).sort();
+      if (uniqueBranches.length > 0) {
+        return {
+          message: `${doctorName} is available at ${uniqueBranches.length > 1 ? "multiple branches" : `the ${uniqueBranches[0]} branch`} in ${city}. Which one would you prefer?`,
+          quickReplies: [
+            ...uniqueBranches.map((b) => ({ label: b, eventType: "SELECT_BRANCH", value: b })),
+            { label: "Back to menu", eventType: "BACK_TO_MENU" },
+          ],
+        };
+      }
+    }
+
     const branches = city ? getSubBranchesForCity(city) : [];
     if (branches.length > 0) {
       return {
@@ -856,6 +911,15 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
     const doctorName = ctx?.doctorName ?? "";
     const date = ctx?.selectedDate ?? "";
     const startTime = ctx?.selectedSlotStart ?? "";
+    const isRequest = appointmentId === "REQUEST";
+    if (isRequest) {
+      return {
+        message: `✅ Appointment request received!${doctorName ? `\n👨‍⚕️ ${doctorName}` : ""}\n\nAn Apollo representative will contact you to confirm your appointment slot.\n📞 You can also call 1860-500-1066 to book directly.`,
+        quickReplies: [
+          { label: "Back to main menu", eventType: "DONE" },
+        ],
+      };
+    }
     return {
       message: `✅ Appointment confirmed!${appointmentId ? `\n\n🎫 Appointment ID: ${appointmentId}` : ""}${doctorName ? `\n👨‍⚕️ ${doctorName}` : ""}${date ? `\n📅 ${date}${startTime ? ` at ${startTime}` : ""}` : ""}\n\nYou will receive a confirmation SMS shortly.`,
       quickReplies: [

@@ -57,12 +57,68 @@ function parseLocation(rawLocation: string): { city: string; branch: string; loc
     return { city: "Unknown", branch: "Unknown", locationLabel: "Unknown" };
   }
 
+  // Explicit overrides for location strings that start with "Apollo ..." instead of a city name.
+  // Keyed by normalized (lowercase, collapsed whitespace, stripped encoding artifacts) location string.
+  const LOCATION_OVERRIDES: Record<string, { city: string; branch: string }> = {
+    "apollo hospitals - financial district":       { city: "Hyderabad",       branch: "Financial District" },
+    "apollo hospitals - pune":                     { city: "Pune",            branch: "Pune" },
+    "apollo hospitals - trichy":                   { city: "Trichy",          branch: "Trichy" },
+    "apollo hospitals indore":                     { city: "Indore",          branch: "Indore" },
+    "apollo hospitals karaikudi":                  { city: "Karaikudi",       branch: "Karaikudi" },
+    "apollo hospitals rourkela":                   { city: "Rourkela",        branch: "Rourkela" },
+    "apollo hospitals-nashik":                     { city: "Nashik",          branch: "Nashik" },
+    "apollo hospitals , narendrapur kolkata":      { city: "Kolkata",         branch: "Narendrapur" },
+    "apollo hospitals, narendrapur kolkata":       { city: "Kolkata",         branch: "Narendrapur" },
+    "apollo gleneagles hospital - main":           { city: "Kolkata",         branch: "Gleneagles" },
+    "apollo hospital bhubaneswar":                 { city: "Bhubaneswar",     branch: "Bhubaneswar" },
+    "apollo hospital sheshadripuram":              { city: "Bangalore",       branch: "Sheshadripuram" },
+    "apollo hospital visakhapatnam":               { city: "Visakhapatnam",   branch: "Visakhapatnam" },
+    "apollo hospital-health city visakhapatnam":   { city: "Visakhapatnam",   branch: "Health City" },
+    "apollo kotturpuram new project":              { city: "Chennai",         branch: "Kotturpuram" },
+    "apollo loga hospital karur":                  { city: "Karur",           branch: "Karur" },
+    "apollo medical center-karapakkam":            { city: "Chennai",         branch: "Karapakkam" },
+    "apollo one (mh)":                             { city: "Mumbai",          branch: "Mumbai" },
+    "apollo precicare ecity":                      { city: "Bangalore",       branch: "Electronic City" },
+    "apollo precicare hsr":                        { city: "Bangalore",       branch: "HSR" },
+    "apollo proton cancer centre, chennai":        { city: "Chennai",         branch: "Proton Cancer Centre" },
+    "apollo samudra hospitals - kakinada":         { city: "Kakinada",        branch: "Kakinada" },
+    "apollo speciality hospital - teynampet":      { city: "Chennai",         branch: "Teynampet" },
+    "apollo speciality hospital @ omr":            { city: "Chennai",         branch: "OMR" },
+    "apollo speciality hospital nellore":          { city: "Nellore",         branch: "Nellore" },
+    "apollo speciality hospitals vanagaram":       { city: "Chennai",         branch: "Vanagaram" },
+    "apollo womens cancer centre - new delhi":     { city: "New Delhi",       branch: "Women's Cancer Centre" },
+    "apollomedics international lifesciences limited": { city: "Lucknow",     branch: "Lucknow" },
+    "apollo adlux hospital":                       { city: "Kochi",           branch: "Adlux" },
+    "apollo bgs hospitals mysore":                 { city: "Mysore",          branch: "BGS" },
+    "apollo cvhf - ahmedabad":                     { city: "Ahmedabad",       branch: "Ahmedabad" },
+    "apollo sage hospital":                        { city: "Bhopal",          branch: "Bhopal" },
+    "apollo heart center":                         { city: "Hyderabad",       branch: "Hyderaguda" },
+  };
+
+  // Normalize for lookup: lowercase, collapse whitespace, strip unicode garbage
+  const normalizedKey = locationLabel
+    .toLowerCase()
+    .replace(/[\u00c2\u00e2\u20ac\u201c\u201d\u2013\u2014]/g, " ")  // strip encoding artifacts
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const override = LOCATION_OVERRIDES[normalizedKey];
+  if (override) {
+    return { city: override.city, branch: override.branch, locationLabel };
+  }
+
   const parts = locationLabel.split(/\s*-\s*/).map((part) => part.trim()).filter(Boolean);
   const rawCity = parts[0] ?? locationLabel;
   const rawBranch = parts.slice(1).join(" - ");
 
   const city = resolveCanonicalCity(rawCity);
-  const branch = rawBranch ? toTitleCase(rawBranch) : city;
+
+  // When the branch segment is just a generic "Apollo" or "Apollo Hospitals" label (no location info),
+  // use the rawCity as the branch so it gets a meaningful name (e.g. "Secunderabad" not "Apollo").
+  const isGenericApolloLabel = /^apollo\s*(hospitals?)?$/i.test(rawBranch.trim());
+  const branch = rawBranch && !isGenericApolloLabel
+    ? toTitleCase(rawBranch)
+    : toTitleCase(rawCity);
 
   return { city, branch, locationLabel };
 }

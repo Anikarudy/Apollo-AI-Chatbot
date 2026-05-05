@@ -123,12 +123,17 @@ export const apolloMachine = createMachine(
               guard: ({ event }) => hasActionablePrefill(event.value),
               target: "AI_PREFILL_ROUTE",
               actions: assign({
-                specialty:        ({ event }) => parsePrefill(event.value).specialty,
-                city:             ({ event }) => parsePrefill(event.value).city,
-                branch:           ({ event }) => parsePrefill(event.value).branch,
-                doctorName:       ({ event }) => parsePrefill(event.value).doctorName,
-                searchByLocation: ({ event }) => !!(parsePrefill(event.value).city),
+                specialty:        ({ event }) => parsePrefill(event.value).specialty ?? undefined,
+                city:             ({ event, context }) => parsePrefill(event.value).city ?? context.city,
+                branch:           ({ event, context }) => parsePrefill(event.value).branch ?? context.branch,
+                doctorName:       ({ event }) => parsePrefill(event.value).doctorName ?? undefined,
+                searchByLocation: ({ event, context }) => !!(parsePrefill(event.value).city) || !!(context.city),
               }),
+            },
+            {
+              guard: ({ event }) => !!(parsePrefill(event.value).city?.trim()),
+              target: "BOOK_APPT_OPTIONS",
+              actions: assign({ city: ({ event }) => parsePrefill(event.value).city }),
             },
             { target: "WELCOME" },
           ],
@@ -138,13 +143,34 @@ export const apolloMachine = createMachine(
       // Transient routing state after AI_PREFILL — determines what to ask next
       AI_PREFILL_ROUTE: {
         always: [
-          // Already have city → search directly (name+city or specialty+city)
-          { guard: ({ context }) => (context.city ?? "").length > 0, target: "SEARCH_DOCTORS_BY_CRITERIA" },
-          // Specialty but no city → ask city → branch → search
-          { guard: ({ context }) => (context.specialty ?? "").length > 0, target: "SPECIALTY_FOUND" },
-          // Doctor name but no city → ask city (ASK_CITY will skip branch for names)
-          { guard: ({ context }) => (context.doctorName ?? "").length > 0, target: "ASK_CITY" },
-          // Nothing actionable → stay at menu
+          // city + branch already known → search directly
+          {
+            guard: ({ context }) =>
+              (context.city ?? "").length > 0 && (context.branch ?? "").length > 0,
+            target: "SEARCH_DOCTORS_BY_CRITERIA",
+          },
+          // city + doctor name (no branch needed for named-doctor search) → search directly
+          {
+            guard: ({ context }) =>
+              (context.city ?? "").length > 0 && (context.doctorName ?? "").length > 0,
+            target: "SEARCH_DOCTORS_BY_CRITERIA",
+          },
+          // city known but no branch → ask branch (specialty must be set to get here)
+          {
+            guard: ({ context }) => (context.city ?? "").length > 0,
+            target: "ASK_BRANCH",
+          },
+          // specialty known, no city → ask city → branch → search
+          {
+            guard: ({ context }) => (context.specialty ?? "").length > 0,
+            target: "SPECIALTY_FOUND",
+          },
+          // doctor name, no city → ask city
+          {
+            guard: ({ context }) => (context.doctorName ?? "").length > 0,
+            target: "ASK_CITY",
+          },
+          // nothing actionable
           { target: "MAIN_MENU" },
         ],
       },
@@ -184,12 +210,17 @@ export const apolloMachine = createMachine(
               guard: ({ event }) => hasActionablePrefill(event.value),
               target: "AI_PREFILL_ROUTE",
               actions: assign({
-                specialty:        ({ event }) => parsePrefill(event.value).specialty,
-                city:             ({ event }) => parsePrefill(event.value).city,
-                branch:           ({ event }) => parsePrefill(event.value).branch,
-                doctorName:       ({ event }) => parsePrefill(event.value).doctorName,
-                searchByLocation: ({ event }) => !!(parsePrefill(event.value).city),
+                specialty:        ({ event }) => parsePrefill(event.value).specialty ?? undefined,
+                city:             ({ event, context }) => parsePrefill(event.value).city ?? context.city,
+                branch:           ({ event, context }) => parsePrefill(event.value).branch ?? context.branch,
+                doctorName:       ({ event }) => parsePrefill(event.value).doctorName ?? undefined,
+                searchByLocation: ({ event, context }) => !!(parsePrefill(event.value).city) || !!(context.city),
               }),
+            },
+            {
+              guard: ({ event }) => !!(parsePrefill(event.value).city?.trim()),
+              target: "BOOK_APPT_OPTIONS",
+              actions: assign({ city: ({ event }) => parsePrefill(event.value).city }),
             },
             { target: "MAIN_MENU" },
           ],
@@ -211,6 +242,20 @@ export const apolloMachine = createMachine(
           HAVE_SYMPTOMS: "ASK_BASIC_DETAILS",
           HEALTH_CHECKUP: "HEALTH_CHECKUP_ENTRY",
           BACK_TO_MENU: "MAIN_MENU",
+          AI_PREFILL: [
+            {
+              guard: ({ event }) => hasActionablePrefill(event.value),
+              target: "AI_PREFILL_ROUTE",
+              actions: assign({
+                specialty:        ({ event }) => parsePrefill(event.value).specialty ?? undefined,
+                city:             ({ event, context }) => parsePrefill(event.value).city ?? context.city,
+                branch:           ({ event, context }) => parsePrefill(event.value).branch ?? context.branch,
+                doctorName:       ({ event }) => parsePrefill(event.value).doctorName ?? undefined,
+                searchByLocation: ({ event, context }) => !!(parsePrefill(event.value).city) || !!(context.city),
+              }),
+            },
+            { target: "BOOK_APPT_OPTIONS" },
+          ],
           UNKNOWN: "FALLBACK",
         },
       },
@@ -227,6 +272,20 @@ export const apolloMachine = createMachine(
           },
           BY_SYMPTOMS: "ASK_BASIC_DETAILS",
           BACK_TO_MENU: "MAIN_MENU",
+          AI_PREFILL: [
+            {
+              guard: ({ event }) => hasActionablePrefill(event.value),
+              target: "AI_PREFILL_ROUTE",
+              actions: assign({
+                specialty:        ({ event }) => parsePrefill(event.value).specialty ?? undefined,
+                city:             ({ event, context }) => parsePrefill(event.value).city ?? context.city,
+                branch:           ({ event, context }) => parsePrefill(event.value).branch ?? context.branch,
+                doctorName:       ({ event }) => parsePrefill(event.value).doctorName ?? undefined,
+                searchByLocation: ({ event, context }) => !!(parsePrefill(event.value).city) || !!(context.city),
+              }),
+            },
+            { target: "FIND_DOCTOR_OPTIONS" },
+          ],
           UNKNOWN: "FALLBACK",
         },
       },
@@ -252,6 +311,7 @@ export const apolloMachine = createMachine(
       // ── Search doctor by name ──────────────────────────────
       SEARCH_DOCTOR: {
         always: [
+          // Single exact match → show card directly
           {
             guard: ({ context }) => {
               const name = context.doctorName ?? "";
@@ -265,6 +325,7 @@ export const apolloMachine = createMachine(
               doctorSuggestions: () => undefined,
             }),
           },
+          // Single non-exact match (non-generic query) → show card directly
           {
             guard: ({ context }) => {
               const name = context.doctorName ?? "";
@@ -280,6 +341,7 @@ export const apolloMachine = createMachine(
               doctorSuggestions: () => undefined,
             }),
           },
+          // City already in context → search directly
           {
             guard: ({ context }) => {
               const name = context.doctorName ?? "";
@@ -287,19 +349,33 @@ export const apolloMachine = createMachine(
                 && (context.city ?? "").length > 0;
             },
             target: "SEARCH_DOCTORS_BY_CRITERIA",
+            actions: assign({ doctorSuggestions: () => undefined }),
+          },
+          // Multiple matches, all in same city → skip city question, ask branch
+          {
+            guard: ({ context }) => {
+              const name = context.doctorName ?? "";
+              const { matches } = findDoctorMatches(name);
+              if (matches.length === 0) return false;
+              const uniqueCities = new Set(matches.map((d) => d.location.toLowerCase()));
+              return uniqueCities.size === 1;
+            },
+            target: "ASK_BRANCH",
             actions: assign({
+              city: ({ context }) =>
+                findDoctorMatches(context.doctorName ?? "").matches[0]?.location ??
+                context.city,
               doctorSuggestions: () => undefined,
             }),
           },
+          // Multiple matches in different cities → ask which city
           {
             guard: ({ context }) => {
               const name = context.doctorName ?? "";
               return findDoctorMatches(name).matches.length > 0;
             },
             target: "ASK_CITY",
-            actions: assign({
-              doctorSuggestions: () => undefined,
-            }),
+            actions: assign({ doctorSuggestions: () => undefined }),
           },
           { target: "DOCTOR_NOT_FOUND" },
         ],
@@ -382,6 +458,11 @@ export const apolloMachine = createMachine(
               return city.length > 0 && branch.length > 0;
             },
             target: "SEARCH_DOCTORS_BY_CRITERIA",
+          },
+          {
+            // City already known — skip ASK_CITY, ask only for branch
+            guard: ({ context }) => (context.city ?? "").length > 0,
+            target: "ASK_BRANCH",
           },
           { target: "ASK_CITY" },
         ],
@@ -589,6 +670,9 @@ export const apolloMachine = createMachine(
               serviceId: ({ event }) => {
                 try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).serviceId; } catch { return undefined; }
               },
+              doctorName: ({ event }) => {
+                try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).doctorName || undefined; } catch { return undefined; }
+              },
               selectedDate: ({ event }) => {
                 try { return (JSON.parse(event.value ?? "{}") as Record<string,string>).date; } catch { return undefined; }
               },
@@ -634,6 +718,20 @@ export const apolloMachine = createMachine(
             }),
           },
           BACK_TO_MENU: "MAIN_MENU",
+          AI_PREFILL: [
+            {
+              guard: ({ event }) => hasActionablePrefill(event.value),
+              target: "AI_PREFILL_ROUTE",
+              actions: assign({
+                specialty:        ({ event }) => parsePrefill(event.value).specialty ?? undefined,
+                city:             ({ event, context }) => parsePrefill(event.value).city ?? context.city,
+                branch:           ({ event, context }) => parsePrefill(event.value).branch ?? context.branch,
+                doctorName:       ({ event }) => parsePrefill(event.value).doctorName ?? undefined,
+                searchByLocation: ({ event, context }) => !!(parsePrefill(event.value).city) || !!(context.city),
+              }),
+            },
+            { target: "BOOK_APPT_OPTIONS_LOCATION" },
+          ],
           UNKNOWN: "FALLBACK",
         },
       },
@@ -835,6 +933,7 @@ export const apolloMachine = createMachine(
             }),
           },
           BACK_TO_MENU: "BOOKING_CONFIRMED",
+          CHANGE_SEARCH: "BOOK_APPT_OPTIONS",
           UNKNOWN: "FALLBACK",
         },
       },
@@ -1029,12 +1128,17 @@ export const apolloMachine = createMachine(
               guard: ({ event }) => hasActionablePrefill(event.value),
               target: "AI_PREFILL_ROUTE",
               actions: assign({
-                specialty:        ({ event }) => parsePrefill(event.value).specialty,
-                city:             ({ event }) => parsePrefill(event.value).city,
-                branch:           ({ event }) => parsePrefill(event.value).branch,
-                doctorName:       ({ event }) => parsePrefill(event.value).doctorName,
-                searchByLocation: ({ event }) => !!(parsePrefill(event.value).city),
+                specialty:        ({ event }) => parsePrefill(event.value).specialty ?? undefined,
+                city:             ({ event, context }) => parsePrefill(event.value).city ?? context.city,
+                branch:           ({ event, context }) => parsePrefill(event.value).branch ?? context.branch,
+                doctorName:       ({ event }) => parsePrefill(event.value).doctorName ?? undefined,
+                searchByLocation: ({ event, context }) => !!(parsePrefill(event.value).city) || !!(context.city),
               }),
+            },
+            {
+              guard: ({ event }) => !!(parsePrefill(event.value).city?.trim()),
+              target: "BOOK_APPT_OPTIONS",
+              actions: assign({ city: ({ event }) => parsePrefill(event.value).city }),
             },
             { target: "MAIN_MENU" },
           ],

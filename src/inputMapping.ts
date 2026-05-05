@@ -182,6 +182,14 @@ export function mapInputToEvent(message: string, currentState?: string): AppEven
     return { type: "ENTER_PATIENT_DETAILS", value: message.trim() };
   }
 
+  // In SHOW_DOCTORS, typing "book" / "I want to book" maps to Change Search so the
+  // AI layer can handle the intent via tryAiIntent (SHOW_DOCTORS is in AI_NAV_STATES)
+  if (state === "SHOW_DOCTORS") {
+    if (/(change|search|different|another|new search|more doctor|wrong|not right|other doctor|different specialty|change specialty)/i.test(text)) return { type: "CHANGE_SEARCH" };
+    if (/(back|menu|home|start over)/i.test(text)) return { type: "BACK_TO_MENU" };
+    // Everything else falls through to UNKNOWN — handled by tryAiIntent then in-place LLM
+  }
+
   // ── Greetings / Start ──────────────────────────────────────
   const greetings = ["hi", "hello", "hey", "start", "begin", "help"];
   if (greetings.some((k) => text.includes(k))) return { type: "START" };
