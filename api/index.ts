@@ -1,10 +1,10 @@
 import express, { Request, Response } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenerativeAI, FunctionCallingMode } from "@google/generative-ai";
 import Groq from "groq-sdk";
 import axios from "axios";
-import { buildDoctorSearchUrl, contacts, getDoctorsForLocation, getDoctorsByName, getLocationFallbacksForCity, doctors, hospitalsByCity } from "../src/knowledgeBase";
+import { buildDoctorSearchUrl, contacts, getDoctorsForLocation, getLocationFallbacksForCity, doctors, hospitalsByCity } from "../src/knowledgeBase";
 import { getLocationFromBranch } from "../data/locationMap";
 import {
   mapBookAppointmentForAgent,
@@ -12,6 +12,13 @@ import {
   mapDoctorsForAgent,
   mapSlotsForAgent,
 } from "./agentHandlers";
+import { searchDoctors, SEARCH_DOCTORS_TOOL, fuzzySearchAllDoctors } from "./searchDoctors";
+import {
+  findPatient,
+  registerPatient,
+  saveAppointment,
+  getLatestPatientAppointment,
+} from "./db";
 
 dotenv.config();
 
@@ -533,18 +540,9 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
   };
   const specNorm = normaliseSpecialty(specialty);
 
-  // ── 1a. Name-based search: respect city/branch/specialty context if present ──
+  // ── 1a. Name-based search: fuzzy via Fuse.js — handles misspellings and partial names ──
   if (name) {
-    let matched = getDoctorsByName(name, 200);
-
-    // If user entered a full name (2+ tokens), prefer exact full-name matches.
-    const normName = normaliseDoctorName(name);
-    if (normName.split(" ").filter(Boolean).length >= 2) {
-      const exactByFullName = matched.filter(
-        (d) => normaliseDoctorName(d.name) === normName
-      );
-      if (exactByFullName.length > 0) matched = exactByFullName;
-    }
+    let matched = fuzzySearchAllDoctors(name, 200);
 
     if (city)    matched = matched.filter(d => d.location.toLowerCase() === city.toUpperCase().toLowerCase());
     if (branch)  matched = matched.filter(d => d.branch.toLowerCase() === branch.toUpperCase().toLowerCase());
@@ -1209,6 +1207,285 @@ app.post("/api/edoc/generate-uhid", async (req: Request, res: Response): Promise
   } catch (err: unknown) {
     const e = err as { message?: string; response?: { data: unknown } };
     res.status(500).json({ error: e.response?.data ?? e.message ?? "GenerateUHIDOnline failed" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Jubilee Hills Doctor Search via Gemini Tool Calling ──────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface DoctorSearchRequest {
+  message: string;
+  history?: Array<{ role: "user" | "assistant"; text: string }>;
+}
+
+/**
+ * POST /api/doctor-search
+ *
+ * Flow:
+ * 1. Send user message + searchDoctors tool schema to Gemini
+ * 2. If Gemini issues a tool call → execute searchDoctors(query) locally
+ * 3. Return tool result to Gemini for a grounded natural-language response
+ * 4. Respond with { text, doctors }
+ *
+ * LLM NEVER invents doctor data. All results come from jubileeDoctors.json via Fuse.js.
+ */
+app.post("/api/doctor-search", async (req: Request, res: Response): Promise<void> => {
+  const { message, history } = (req.body ?? {}) as DoctorSearchRequest;
+
+  if (!message) {
+    res.status(400).json({ error: "message required" });
+    return;
+  }
+
+  if (!process.env.GEMINI_API_KEY) {
+    // Fallback: run fuzzy search directly and return without LLM narrative
+    const fallbackDoctors = searchDoctors(message);
+    res.json({
+      text: fallbackDoctors.length > 0
+        ? `Found ${fallbackDoctors.length} doctor(s) matching your query.`
+        : "No doctors found matching your query.",
+      doctors: fallbackDoctors,
+    });
+    return;
+  }
+
+  const SYSTEM_PROMPT = `You are a hospital assistant for Apollo Hospitals, Jubilee Hills.
+
+STRICT RULES:
+- If the user mentions any doctor name, specialty, department, or medical term, you MUST call the "searchDoctors" tool.
+- NEVER answer doctor queries from your training data or memory.
+- NEVER hallucinate or invent doctor names or specialties.
+- EVEN IF the input is misspelled or partial, STILL call the tool.
+- After receiving tool results, respond naturally using ONLY those results.
+- If no results are returned, say "No matching doctors found" and suggest broadening the search.
+
+Examples of when to call the tool:
+"dr ramesh" → call searchDoctors
+"cardiologist" → call searchDoctors
+"ent doctor" → call searchDoctors
+"ramsh" (misspelled) → call searchDoctors`;
+
+  try {
+    const geminiModel = "gemini-2.0-flash";
+    console.log(`[doctor-search] Gemini tool-calling with message: "${message}"`);
+
+    const model = genAI.getGenerativeModel({
+      model: geminiModel,
+      systemInstruction: SYSTEM_PROMPT,
+      tools: [
+        {
+          functionDeclarations: [SEARCH_DOCTORS_TOOL],
+        },
+      ],
+      toolConfig: {
+        functionCallingConfig: {
+          mode: FunctionCallingMode.AUTO,
+        },
+      },
+    });
+
+    const chat = model.startChat({
+      history: (history ?? []).slice(-6).map((h) => ({
+        role: h.role === "user" ? "user" : "model",
+        parts: [{ text: h.text }],
+      })),
+    });
+
+    // Round 1: send user message; Gemini may issue a tool call
+    const round1 = await chat.sendMessage(message);
+    const round1Parts = round1.response.candidates?.[0]?.content?.parts ?? [];
+
+    // Check for a function call in the response
+    const fnCallPart = round1Parts.find((p) => p.functionCall);
+
+    if (fnCallPart?.functionCall) {
+      const fnName = fnCallPart.functionCall.name;
+      const fnArgs = (fnCallPart.functionCall.args ?? {}) as Record<string, unknown>;
+
+      console.log(`[doctor-search] Tool call: ${fnName}`, fnArgs);
+
+      let toolResult: unknown = [];
+      if (fnName === "searchDoctors") {
+        const query = String(fnArgs.query ?? "").trim();
+        toolResult = searchDoctors(query);
+      }
+
+      console.log(`[doctor-search] Tool result count:`, Array.isArray(toolResult) ? toolResult.length : "n/a");
+
+      // Round 2: return tool result to Gemini for final grounded response
+      const round2 = await chat.sendMessage([
+        {
+          functionResponse: {
+            name: fnName,
+            response: { result: toolResult },
+          },
+        },
+      ]);
+
+      const finalText = round2.response.text().trim();
+      res.json({ text: finalText, doctors: toolResult });
+      return;
+    }
+
+    // Gemini responded directly (no tool call needed — e.g., general question)
+    const directText = round1.response.text().trim();
+    res.json({ text: directText, doctors: [] });
+  } catch (err: unknown) {
+    const e = err as { message?: string };
+    console.error("[doctor-search] Error:", e.message ?? err);
+    // Graceful fallback: run fuzzy search without LLM narrative
+    const fallbackDoctors = searchDoctors(message);
+    res.json({
+      text: fallbackDoctors.length > 0
+        ? `Found ${fallbackDoctors.length} doctor(s) matching your query.`
+        : "No doctors found matching your query.",
+      doctors: fallbackDoctors,
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Patient Memory Endpoints (SQLite-backed) ──────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface PatientLookupRequest {
+  mobile?: string;
+  uhid?: string;
+  name?: string;
+  dob?: string;
+}
+
+interface PatientRegisterRequest {
+  name: string;
+  mobile: string;
+  dob: string;
+}
+
+interface SaveAppointmentRequest {
+  mobile: string;
+  appointmentId?: string;
+  doctorName?: string;
+  date?: string;
+  slot?: string;
+  status?: string;
+}
+
+/**
+ * POST /api/patient/lookup
+ * Check if a patient exists by mobile, UHID, or name+DOB.
+ * Returns { found: true, patient } or { found: false }.
+ */
+app.post("/api/patient/lookup", (req: Request, res: Response): void => {
+  const { mobile, uhid, name, dob } = (req.body ?? {}) as PatientLookupRequest;
+
+  if (!mobile && !uhid && !(name && dob)) {
+    res.status(400).json({ error: "Provide mobile, uhid, or both name and dob" });
+    return;
+  }
+
+  console.log(`[patient/lookup] mobile=${mobile ?? "-"} uhid=${uhid ?? "-"} name=${name ?? "-"}`);
+
+  const patient = findPatient(mobile, uhid, name, dob);
+  if (patient) {
+    res.json({ found: true, patient });
+  } else {
+    res.json({ found: false });
+  }
+});
+
+/**
+ * POST /api/patient/register
+ * Create a new patient record. Returns the created patient with generated UHID.
+ * If mobile already registered, returns the existing record (idempotent).
+ */
+app.post("/api/patient/register", (req: Request, res: Response): void => {
+  const { name, mobile, dob } = (req.body ?? {}) as PatientRegisterRequest;
+
+  if (!name || !mobile || !dob) {
+    res.status(400).json({ error: "name, mobile, and dob are required" });
+    return;
+  }
+
+  // Basic format validation for dob (YYYY-MM-DD)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dob.trim())) {
+    res.status(400).json({ error: "dob must be in YYYY-MM-DD format" });
+    return;
+  }
+
+  console.log(`[patient/register] name=${name} mobile=${mobile} dob=${dob}`);
+
+  try {
+    const patient = registerPatient(name, mobile, dob);
+    res.json({ patient });
+  } catch (err: unknown) {
+    const e = err as { message?: string };
+    console.error("[patient/register] Error:", e.message ?? err);
+    res.status(500).json({ error: e.message ?? "Failed to register patient" });
+  }
+});
+
+/**
+ * POST /api/patient/appointment
+ * Save a confirmed appointment for an existing patient (looked up by mobile).
+ */
+app.post("/api/patient/appointment", (req: Request, res: Response): void => {
+  const { mobile, appointmentId, doctorName, date, slot, status } = (req.body ?? {}) as SaveAppointmentRequest;
+
+  if (!mobile) {
+    res.status(400).json({ error: "mobile is required" });
+    return;
+  }
+
+  const patient = findPatient(mobile);
+  if (!patient) {
+    res.status(404).json({ error: "Patient not found. Register the patient first." });
+    return;
+  }
+
+  console.log(`[patient/appointment] patientId=${patient.id} doctor=${doctorName ?? "-"} date=${date ?? "-"}`);
+
+  try {
+    const appt = saveAppointment(
+      patient.id,
+      appointmentId ?? null,
+      doctorName ?? null,
+      date ?? null,
+      slot ?? null,
+      status ?? "confirmed"
+    );
+    res.json({ appointment: appt });
+  } catch (err: unknown) {
+    const e = err as { message?: string };
+    console.error("[patient/appointment] Error:", e.message ?? err);
+    res.status(500).json({ error: e.message ?? "Failed to save appointment" });
+  }
+});
+
+/**
+ * POST /api/patient/details
+ * Retrieve the most recent appointment + patient info.
+ * Returns { found: true, record } or { found: false }.
+ *
+ * ONLY retrieves data when user explicitly asks.
+ * NEVER returns all records.
+ */
+app.post("/api/patient/details", (req: Request, res: Response): void => {
+  const { mobile, uhid, name, dob } = (req.body ?? {}) as PatientLookupRequest;
+
+  if (!mobile && !uhid && !(name && dob)) {
+    res.status(400).json({ error: "Provide mobile, uhid, or both name and dob" });
+    return;
+  }
+
+  console.log(`[patient/details] mobile=${mobile ?? "-"} uhid=${uhid ?? "-"} name=${name ?? "-"}`);
+
+  const record = getLatestPatientAppointment(mobile, uhid, name, dob);
+
+  if (record) {
+    res.json({ found: true, record });
+  } else {
+    res.json({ found: false, message: "No appointment found. Would you like to book one?" });
   }
 });
 

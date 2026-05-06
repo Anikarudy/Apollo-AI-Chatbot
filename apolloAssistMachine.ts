@@ -66,7 +66,9 @@ const CATEGORY_TO_SYMPTOM: Record<string, string> = {
 };
 
 function findDoctorMatches(query: string) {
-  const matches = getDoctorsByName(query, 30); // wide net – normalise then exact-match below
+  // Use strict exact-match search for routing decisions.
+  // Misspelled names produce zero matches → DOCTOR_NOT_FOUND_ASK_CITY → city-scoped fuzzy search.
+  const matches = getDoctorsByName(query, 30);
   const normalizedQuery = normalizeDoctorName(query);
   const exactMatches = matches.filter(
     (d) => normalizeDoctorName(d.name) === normalizedQuery
@@ -377,7 +379,8 @@ export const apolloMachine = createMachine(
             target: "ASK_CITY",
             actions: assign({ doctorSuggestions: () => undefined }),
           },
-          { target: "DOCTOR_NOT_FOUND" },
+          // No exact match at all → ask city so we can run fuzzy search scoped to it
+          { target: "DOCTOR_NOT_FOUND_ASK_CITY" },
         ],
       },
 
@@ -633,6 +636,24 @@ export const apolloMachine = createMachine(
             },
             { target: "ASK_CITY" },
           ],
+          BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
+        },
+      },
+
+      // No exact name match: ask which city, then run city-scoped fuzzy search
+      DOCTOR_NOT_FOUND_ASK_CITY: {
+        on: {
+          SELECT_CITY: {
+            target: "SEARCH_DOCTORS_BY_CRITERIA",
+            actions: assign({ city: ({ event }) => event.value }),
+          },
+          ENTER_CITY: {
+            target: "SEARCH_DOCTORS_BY_CRITERIA",
+            actions: assign({ city: ({ event }) => event.value }),
+          },
+          RETRY_NAME: "ENTER_DOCTOR_NAME",
+          SEARCH_BY_SPECIALTY: "SELECT_SPECIALTY",
           BACK_TO_MENU: "MAIN_MENU",
           UNKNOWN: "FALLBACK",
         },

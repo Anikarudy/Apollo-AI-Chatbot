@@ -1,3 +1,4 @@
+import Fuse from "fuse.js";
 import finalDoctorsRaw from "../data/finalDoctors.json";
 import { getLocationFromBranch } from "../data/locationMap";
 
@@ -452,6 +453,69 @@ export function getDoctorsByName(query: string, limit = 8): Doctor[] {
       return normalizedName === q || normalizedName.startsWith(q);
     })
     .slice(0, limit);
+}
+
+// ── Fuzzy name search with edit-distance post-filter ─────────────────────────
+
+/** O(n) space Levenshtein edit distance between two strings */
+function levenshtein(a: string, b: string): number {
+  const m = a.length, n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  const row: number[] = Array.from({ length: n + 1 }, (_, i) => i);
+  for (let i = 1; i <= m; i++) {
+    let prev = i - 1;
+    row[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const tmp = row[j];
+      row[j] = a[i - 1] === b[j - 1] ? prev : 1 + Math.min(prev, row[j], row[j - 1]);
+      prev = tmp;
+    }
+  }
+  return row[n];
+}
+
+/**
+ * True if the normalized query is within edit distance of ANY token in the doctor's name.
+ * Budget: floor(queryLen * 0.3), minimum 1.
+ * e.g. "shamila"(7) → max 2 edits:  "sharmila" dist=1 ✓  "ashmita" dist=3 ✗  "lakshmi" dist=6 ✗
+ */
+function isEditClose(doctorName: string, query: string): boolean {
+  const normQ = normaliseDoctorName(query);
+  if (!normQ) return false;
+  const maxEdits = Math.max(1, Math.floor(normQ.length * 0.3));
+  const tokens = normaliseDoctorName(doctorName).split(" ").filter(Boolean);
+  return tokens.some((tok) => levenshtein(normQ, tok) <= maxEdits);
+}
+
+let _fuseAll: Fuse<Doctor> | null = null;
+function getFuseAll(): Fuse<Doctor> {
+  if (!_fuseAll) {
+    _fuseAll = new Fuse<Doctor>(doctors, {
+      keys: [{ name: "name", weight: 1.0 }],
+      threshold: 0.25,
+      includeScore: true,
+      ignoreLocation: true,
+      minMatchCharLength: 2,
+    });
+  }
+  return _fuseAll;
+}
+
+/**
+ * Fuzzy doctor name search with edit-distance post-filter.
+ * Replaces getDoctorsByName for user-facing queries — handles misspellings and partial names.
+ */
+export function fuzzyDoctorsByName(query: string, limit = 200): Doctor[] {
+  const trimmed = (query ?? "").trim();
+  if (!trimmed || trimmed.length < 2) return [];
+
+  const candidates = getFuseAll()
+    .search(trimmed)
+    .sort((a, b) => (a.score ?? 1) - (b.score ?? 1))
+    .map((r) => r.item);
+
+  return candidates.filter((d) => isEditClose(d.name, trimmed)).slice(0, limit);
 }
 
 /** Return the sub-branch names for a given city. */

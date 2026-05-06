@@ -129,7 +129,7 @@ export function mapInputToEvent(message: string, currentState?: string): AppEven
     return { type: "ENTER_SYMPTOM", value: message.trim() };
   }
 
-  if (state === "ASK_CITY" || state === "HEALTH_CHECKUP_ENTRY" || state === "ASK_CITY_FOR_LOCATION") {
+  if (state === "ASK_CITY" || state === "HEALTH_CHECKUP_ENTRY" || state === "ASK_CITY_FOR_LOCATION" || state === "DOCTOR_NOT_FOUND_ASK_CITY") {
     const cityMatch = allCities.find((city) => {
       const lower = city.toLowerCase();
       return lower === text || lower.includes(text) || text.includes(lower);

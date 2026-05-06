@@ -613,6 +613,29 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
     };
   }
 
+  // ── Dynamic: DOCTOR_NOT_FOUND_ASK_CITY ───────────────────────────────────────
+  // Triggered when the user's doctor name has no exact match.
+  // We ask which city they're in, then run a fuzzy search scoped to that city.
+  if (state === "DOCTOR_NOT_FOUND_ASK_CITY") {
+    const name = ctx?.doctorName ?? "";
+    const cityButtons: QuickReply[] = allCities
+      .filter((c) => ["Hyderabad", "Chennai", "Bangalore", "Mumbai", "Delhi"].includes(c))
+      .map((c) => ({ label: c, eventType: "SELECT_CITY", value: c }));
+    return {
+      message: name
+        ? `I wasn't able to find an exact match for "${name}". I can look for doctors with similar names — which city would you like to search in?`
+        : "I wasn't able to find an exact match. Which city would you like to search in?",
+      quickReplies: [
+        ...cityButtons,
+        { label: "Other cities", eventType: "SELECT_CITY", value: "Other" },
+        { label: "Try a different name", eventType: "RETRY_NAME" },
+        { label: "Back to menu", eventType: "BACK_TO_MENU" },
+      ],
+      showInput: true,
+      inputPlaceholder: "Or type your city…",
+    };
+  }
+
   // ── Dynamic: ASK_BRANCH — sub-branches from new doctor mapping ────────────
   if (state === "ASK_BRANCH") {
     const city = ctx?.city ?? "";
@@ -852,15 +875,13 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
       }
     }
 
-    const count = nameMatches.length > 0 ? nameMatches.length : localDocs.length;
-
     let msg = "";
     if (location || specialty || doctorName) {
       const filterParts: string[] = [];
       if (location) filterParts.push(`📍 ${location}`);
       if (specialty) filterParts.push(`🩺 ${specialty}`);
       if (doctorName) filterParts.push(`👨‍⚕️ ${doctorName}`);
-      msg = `Showing ${count > 0 ? `${Math.min(count, 6)} of ${count}` : ""} available doctors${filterParts.length ? ` for ${filterParts.join(" · ")}` : ""}.\n\nSelect a time slot below to book, or refine your search.\n\nBook online: ${searchUrl}`;
+      msg = `Showing available doctors${filterParts.length ? ` for ${filterParts.join(" · ")}` : ""}.\n\nSelect a time slot below to book, or refine your search.\n\nBook online: ${searchUrl}`;
     } else {
       msg = `Here are the available Apollo doctors. Select a time slot to book your appointment.\n\nBook online: ${searchUrl}`;
     }
