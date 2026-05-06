@@ -39,15 +39,15 @@ const LOCAL_API_BASE = `http://127.0.0.1:${PORT}`;
 const INTERNAL_TOOL_TIMEOUT_MS = 30000;
 const INTERNAL_EDOC_TOOL_TIMEOUT_MS = 90000;
 
-// ── LLM clients (DeepSeek -> Groq -> Gemini priority) ──
-const deepseekKey = (process.env.DEEPSEEK_API_KEY ?? "").trim();
+// ── LLM clients (Gemini -> Groq priority; DeepSeek commented out) ──
+// const deepseekKey = (process.env.DEEPSEEK_API_KEY ?? "").trim();
 const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY ?? "");
-const hasAnyLlm = !!(deepseekKey || groq || process.env.GEMINI_API_KEY);
-const NO_LLM_ERROR = "No LLM configured. Set DEEPSEEK_API_KEY, GROQ_API_KEY, or GEMINI_API_KEY in .env";
+const hasAnyLlm = !!(groq || process.env.GEMINI_API_KEY);
+const NO_LLM_ERROR = "No LLM configured. Set GEMINI_API_KEY or GROQ_API_KEY in .env";
 
 /**
- * Unified LLM call — tries DeepSeek first, then Groq, then Gemini.
+ * Unified LLM call — tries Gemini first, then Groq as fallback. DeepSeek commented out.
  * Returns the response text string.
  * @param history Prior conversation turns (user/assistant alternating) for multi-turn memory.
  */
@@ -62,50 +62,34 @@ async function callLlm(
     content: h.text,
   }));
 
-  // ── 1. DeepSeek ──────────────────────────────────────────────────────────
-  if (deepseekKey) {
-    try {
-      const model = process.env.DEEPSEEK_MODEL?.trim() || "deepseek-chat";
-      console.log(`[LLM] Trying DeepSeek (${model})`);
-      const response = await axios.post(
-        "https://api.deepseek.com/chat/completions",
-        {
-          model,
-          messages: [
-            { role: "system", content: systemPrompt },
-            ...historyMessages,
-            { role: "user", content: userContent },
-          ],
-          max_tokens: 256,
-          temperature: 0.5,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${deepseekKey}`,
-            "Content-Type": "application/json",
-          },
-          timeout: 20000,
-        }
-      );
+  // ── DeepSeek (commented out) ─────────────────────────────────────────────
+  // if (deepseekKey) { ... }
 
-      const text = (response.data as { choices?: Array<{ message?: { content?: string } }> })
-        .choices?.[0]?.message?.content ?? "";
+  // ── 1. Gemini (primary) ───────────────────────────────────────────────────
+  if (process.env.GEMINI_API_KEY) {
+    try {
+      const geminiModel = "gemini-2.0-flash";
+      console.log(`[LLM] Trying Gemini (${geminiModel})`);
+      const model = genAI.getGenerativeModel({ model: geminiModel, systemInstruction: systemPrompt });
+      const chat = model.startChat({
+        history: (history ?? []).map((h) => ({
+          role: h.role === "user" ? "user" : "model",
+          parts: [{ text: h.text }],
+        })),
+      });
+      const result = await chat.sendMessage(userContent);
+      const text = result.response.text();
       if (text.trim()) {
-        console.log(`[LLM] Response from DeepSeek (${model})`);
+        console.log(`[LLM] Response from Gemini (${geminiModel})`);
         return text;
       }
     } catch (err: unknown) {
       const error = err as { message?: string };
-      const msg = String(error.message ?? err);
-      if (/unable to verify the first certificate|self signed certificate|CERT_/i.test(msg)) {
-        console.warn("[LLM] DeepSeek TLS certificate verification failed. Ensure Node runs with system CAs (NODE_OPTIONS=--use-system-ca). Falling back.");
-      } else {
-        console.warn("[LLM] DeepSeek failed, falling back:", msg);
-      }
+      console.warn("[LLM] Gemini failed, falling back to Groq:", String(error.message ?? err));
     }
   }
 
-  // ── 2. Groq ──────────────────────────────────────────────────────────────
+  // ── 2. Groq (fallback) ────────────────────────────────────────────────────
   if (groq) {
     const groqModel = "llama-3.3-70b-versatile";
     console.log(`[LLM] Trying Groq (${groqModel})`);
@@ -123,21 +107,7 @@ async function callLlm(
     console.log(`[LLM] Response from Groq (${groqModel})`);
     return text;
   }
-  // ── 3. Gemini ─────────────────────────────────────────────────────────────
-  if (process.env.GEMINI_API_KEY) {
-    const geminiModel = "gemini-2.0-flash";
-    console.log(`[LLM] Trying Gemini (${geminiModel})`);
-    const model = genAI.getGenerativeModel({ model: geminiModel, systemInstruction: systemPrompt });
-    const chat = model.startChat({
-      history: (history ?? []).map((h) => ({
-        role: h.role === "user" ? "user" : "model",
-        parts: [{ text: h.text }],
-      })),
-    });
-    const result = await chat.sendMessage(userContent);
-    console.log(`[LLM] Response from Gemini (${geminiModel})`);
-    return result.response.text();
-  }
+
   throw new Error(NO_LLM_ERROR);
 }
 
