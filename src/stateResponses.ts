@@ -876,7 +876,13 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
     }
 
     let msg = "";
-    if (location || specialty || doctorName) {
+    if (doctorName && nameMatches.length === 1) {
+      const found = nameMatches[0];
+      const foundLocation = found.branch
+        ? `${found.branch}, ${found.location}`
+        : found.location;
+      msg = `Found doctor ${found.name} in ${foundLocation}.\n\nSelect a time slot below to book, or refine your search.\n\nBook online: ${searchUrl}`;
+    } else if (location || specialty || doctorName) {
       const filterParts: string[] = [];
       if (location) filterParts.push(`📍 ${location}`);
       if (specialty) filterParts.push(`🩺 ${specialty}`);

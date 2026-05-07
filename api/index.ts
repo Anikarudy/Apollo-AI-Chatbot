@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import { GoogleGenerativeAI, FunctionCallingMode } from "@google/generative-ai";
 import Groq from "groq-sdk";
 import axios from "axios";
-import { buildDoctorSearchUrl, contacts, getDoctorsForLocation, getLocationFallbacksForCity, doctors, hospitalsByCity } from "../src/knowledgeBase";
+import { buildDoctorSearchUrl, contacts, getDoctorsByName, getDoctorsForLocation, getLocationFallbacksForCity, doctors, hospitalsByCity } from "../src/knowledgeBase";
 import { getLocationFromBranch } from "../data/locationMap";
 import {
   mapBookAppointmentForAgent,
@@ -78,11 +78,18 @@ async function callLlm(
       const geminiModel = "gemini-2.0-flash";
       console.log(`[LLM] Trying Gemini (${geminiModel})`);
       const model = genAI.getGenerativeModel({ model: geminiModel, systemInstruction: systemPrompt });
-      const chat = model.startChat({
-        history: (history ?? []).map((h) => ({
+      const geminiHistory = (history ?? [])
+        .filter((h) => String(h.text ?? "").trim().length > 0)
+        .map((h) => ({
           role: h.role === "user" ? "user" : "model",
           parts: [{ text: h.text }],
-        })),
+        }));
+      // Gemini chat history must begin with a user turn.
+      while (geminiHistory.length > 0 && geminiHistory[0].role !== "user") {
+        geminiHistory.shift();
+      }
+      const chat = model.startChat({
+        history: geminiHistory,
       });
       const result = await chat.sendMessage(userContent);
       const text = result.response.text();
@@ -181,6 +188,18 @@ function getResourceCandidatesForDoctor(doctorName: string, city: string): strin
 
 type LocalDoctor = (typeof doctors)[number];
 
+interface DoctorCardPayload {
+  resourceIds: string[];
+  name: string;
+  specialty: string;
+  hospital: string;
+  profileUrl: undefined;
+  resourceId: string;
+  locationId: string;
+  regionId: string;
+  serviceId: string;
+}
+
 function dedupeDoctorsForCards(items: LocalDoctor[]): LocalDoctor[] {
   const seen = new Set<string>();
   const result: LocalDoctor[] = [];
@@ -197,6 +216,88 @@ function dedupeDoctorsForCards(items: LocalDoctor[]): LocalDoctor[] {
     result.push(doctor);
   }
   return result;
+}
+
+function toDoctorCardPayload(doctor: LocalDoctor): DoctorCardPayload {
+  return {
+    resourceIds: getResourceCandidatesForDoctor(doctor.name, doctor.location),
+    name: doctor.name,
+    specialty: doctor.speciality,
+    hospital: doctor.branch ? `Apollo ${doctor.branch}, ${doctor.location}` : `Apollo Hospitals, ${doctor.location}`,
+    profileUrl: undefined,
+    resourceId: doctor.resourceId,
+    locationId: doctor.locationId,
+    regionId: doctor.regionId || "5",
+    serviceId: doctor.serviceId,
+  };
+}
+
+function buildDoctorQueryText(params: { name?: string; specialty?: string; city?: string; branch?: string }): string {
+  const parts = [
+    String(params.name ?? "").trim(),
+    String(params.specialty ?? "").trim(),
+    String(params.branch ?? "").trim(),
+    String(params.city ?? "").trim(),
+  ].filter((v) => v.length > 0);
+  return parts.join(" | ");
+}
+
+async function rerankDoctorCandidates(
+  queryText: string,
+  candidates: LocalDoctor[],
+  limit = 12,
+): Promise<LocalDoctor[]> {
+  if (!hasAnyLlm || candidates.length <= 1) return candidates.slice(0, limit);
+
+  const shortlist = candidates.slice(0, 10);
+  const compactCandidates = shortlist.map((doctor, index) => ({
+    rank: index + 1,
+    name: doctor.name,
+    specialty: doctor.speciality,
+    city: doctor.location,
+    branch: doctor.branch,
+  }));
+
+  const systemPrompt = `You are a doctor-search ranking assistant.
+You receive a user search query and up to 10 retrieved doctor candidates.
+Return ONLY a JSON object with this exact schema:
+{
+  "selectedRanks": number[]
+}
+
+Rules:
+- Select the most relevant candidates for the query intent.
+- Prioritise semantic intent, not just literal token overlap.
+- Respect location/specialty cues when present.
+- Keep order best-first.
+- Return only rank numbers from the provided list.
+- Return at least 1 rank and at most ${Math.min(limit, 10)} ranks.
+- Return raw JSON only, no markdown.`;
+
+  const userPrompt = JSON.stringify({
+    query: queryText,
+    candidates: compactCandidates,
+  });
+
+  try {
+    const raw = stripMarkdownJson(await callLlm(systemPrompt, userPrompt));
+    const parsed = JSON.parse(raw) as { selectedRanks?: unknown };
+    const ranks = Array.isArray(parsed.selectedRanks) ? parsed.selectedRanks : [];
+    const selected = Array.from(new Set(
+      ranks
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value >= 1 && value <= shortlist.length)
+    ))
+      .slice(0, Math.min(limit, shortlist.length))
+      .map((rank) => shortlist[rank - 1]);
+
+    if (selected.length > 0) return selected;
+  } catch (err: unknown) {
+    const error = err as { message?: string };
+    console.warn("[LLM] Doctor rerank failed, falling back to retrieval order:", String(error.message ?? err));
+  }
+
+  return shortlist.slice(0, limit);
 }
 
 /**
@@ -474,6 +575,7 @@ JSON schema:
 Rules:
 - Use "have_symptoms" when user describes a medical symptom or health complaint (e.g. "ear block", "chest pain", "my knee hurts"). Set symptomText to the exact symptom phrase. Also map to the closest specialty when possible.
 - Use "book_appointment" or "find_doctor" only if user explicitly mentions doctor/appointment/booking.
+- NAME-ONLY DOCTOR QUERY: If the message looks like a person name (for example 2+ alphabetic words like "shamila pendyala"), classify as "find_doctor" and set doctorName to that text.
 - CONTEXT RESOLUTION: If the user's message is just an affirmation ("yes", "sure", "ok", "yeah", "proceed", "please", "correct") — look at the conversation history to understand what they are confirming, and extract specialty/city/doctorName from prior context. E.g. if the bot said "I recommend ENT specialist", and user says "yes", return { intent: "find_doctor", specialty: "ENT" }. E.g. if bot said "Would you like to book in Hyderabad?", and user says "sure", return { intent: "book_appointment", city: "Hyderabad" }.
 - Set city if a known city is mentioned in the current message OR clearly referenced from history.
 - Return null for any field not mentioned or inferable. Never guess.
@@ -542,7 +644,10 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
 
   // ── 1a. Name-based search: fuzzy via Fuse.js — handles misspellings and partial names ──
   if (name) {
-    let matched = fuzzySearchAllDoctors(name, 200);
+    // First try strict name lookup (same source used by state responses) so exact names
+    // like "Sharmila Pendyala" never get lost in fuzzy scoring.
+    const strictMatched = getDoctorsByName(name, 200);
+    let matched = strictMatched.length > 0 ? strictMatched : fuzzySearchAllDoctors(name, 200);
 
     if (city)    matched = matched.filter(d => d.location.toLowerCase() === city.toUpperCase().toLowerCase());
     if (branch)  matched = matched.filter(d => d.branch.toLowerCase() === branch.toUpperCase().toLowerCase());
@@ -551,22 +656,26 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
       const ds = normaliseSpecialty(d.speciality);
       return ds === specNorm || ds === specialty.toLowerCase();
     });
+
+    const normalizedRequestedName = normaliseDoctorName(name);
+    const hasExactNameMatch = matched.some((doctor) =>
+      normaliseDoctorName(doctor.name) === normalizedRequestedName
+    );
+
     const uniqueMatched = dedupeDoctorsForCards(matched);
+    const reranked = await rerankDoctorCandidates(
+      buildDoctorQueryText({ name, specialty, city, branch }),
+      uniqueMatched,
+      12,
+    );
     const url = buildDoctorSearchUrl(specialty, city, branch);
     res.json({
       url,
-      source: "local",
-      doctors: uniqueMatched.slice(0, 12).map((d) => ({
-        resourceIds: getResourceCandidatesForDoctor(d.name, d.location),
-        name:       d.name,
-        specialty:  d.speciality,
-        hospital:   d.branch ? `Apollo ${d.branch}, ${d.location}` : `Apollo Hospitals, ${d.location}`,
-        profileUrl: undefined,
-        resourceId: d.resourceId,
-        locationId: d.locationId,
-        regionId:   d.regionId || "5",
-        serviceId: d.serviceId,
-      })),
+      source: hasAnyLlm ? "local+llm-rerank" : "local",
+      nameFallback: !hasExactNameMatch && uniqueMatched.length > 0
+        ? { requestedName: name }
+        : null,
+      doctors: reranked.map(toDoctorCardPayload),
     });
     return;
   }
@@ -582,21 +691,16 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
         : [];
     if (finalDocs.length > 0) {
       const uniqueDocs = dedupeDoctorsForCards(finalDocs);
+      const reranked = await rerankDoctorCandidates(
+        buildDoctorQueryText({ specialty, city, branch }),
+        uniqueDocs,
+        12,
+      );
       const url = buildDoctorSearchUrl(specialty, city, branch);
       res.json({
         url,
-        source: "local",
-        doctors: uniqueDocs.slice(0, 12).map((d) => ({
-          resourceIds: getResourceCandidatesForDoctor(d.name, d.location),
-          name:       d.name,
-          specialty:  d.speciality,
-          hospital:   d.branch ? `Apollo ${d.branch}, ${d.location}` : `Apollo Hospitals, ${d.location}`,
-          profileUrl: undefined,
-          resourceId: d.resourceId,
-          locationId: d.locationId,
-          regionId:   d.regionId || "5",
-          serviceId: d.serviceId,
-        })),
+        source: hasAnyLlm ? "local+llm-rerank" : "local",
+        doctors: reranked.map(toDoctorCardPayload),
       });
       return;
     }
@@ -611,20 +715,15 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
       })
       .slice(0, 50));
     if (specDocs.length > 0) {
+      const reranked = await rerankDoctorCandidates(
+        buildDoctorQueryText({ specialty }),
+        specDocs,
+        12,
+      );
       res.json({
         url: buildDoctorSearchUrl(specialty),
-        source: "local",
-        doctors: specDocs.slice(0, 12).map((d) => ({
-          resourceIds: getResourceCandidatesForDoctor(d.name, d.location),
-          name:       d.name,
-          specialty:  d.speciality,
-          hospital:   d.branch ? `Apollo ${d.branch}, ${d.location}` : `Apollo Hospitals, ${d.location}`,
-          profileUrl: undefined,
-          resourceId: d.resourceId,
-          locationId: d.locationId,
-          regionId:   d.regionId || "5",
-          serviceId: d.serviceId,
-        })),
+        source: hasAnyLlm ? "local+llm-rerank" : "local",
+        doctors: reranked.map(toDoctorCardPayload),
       });
       return;
     }
@@ -809,6 +908,7 @@ app.post("/api/edoc/book-appointment", async (req: Request, res: Response): Prom
     logEdoc("BookAppointment.request", b);
     const r = await axios.post(`${EDOC_BASE}/api/EDOC/BookAppointment`, b, { headers: edocHeaders(), timeout: 15000 });
     logEdoc("BookAppointment.response", r.data);
+    console.log("[EDOC] BookAppointment succeeded (200 OK)");
     res.json(r.data);
   } catch (err: unknown) {
     const e = err as { message?: string; response?: { data: unknown } };
@@ -831,6 +931,7 @@ app.post("/api/edoc/reschedule-appointment", async (req: Request, res: Response)
   }
   try {
     const r = await axios.post(`${EDOC_BASE}/api/EDOC/ResheduleAppointment`, b, { headers: edocHeaders(), timeout: 15000 });
+    console.log("[EDOC] ResheduleAppointment succeeded (200 OK)");
     res.json(r.data);
   } catch (err: unknown) {
     const e = err as { message?: string; response?: { data: unknown } };
@@ -852,6 +953,7 @@ app.post("/api/edoc/cancel-appointment", async (req: Request, res: Response): Pr
   }
   try {
     const r = await axios.post(`${EDOC_BASE}/api/EDOC/CancelAppointment`, b, { headers: edocHeaders(), timeout: 15000 });
+    console.log("[EDOC] CancelAppointment succeeded (200 OK)");
     res.json(r.data);
   } catch (err: unknown) {
     const e = err as { message?: string; response?: { data: unknown } };
@@ -1211,7 +1313,7 @@ app.post("/api/edoc/generate-uhid", async (req: Request, res: Response): Promise
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ── Jubilee Hills Doctor Search via Gemini Tool Calling ──────────────────────
+// ── All-Branch Doctor Search via Gemini Tool Calling ─────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface DoctorSearchRequest {
@@ -1228,7 +1330,7 @@ interface DoctorSearchRequest {
  * 3. Return tool result to Gemini for a grounded natural-language response
  * 4. Respond with { text, doctors }
  *
- * LLM NEVER invents doctor data. All results come from jubileeDoctors.json via Fuse.js.
+ * LLM NEVER invents doctor data. All results come from local full-dataset retrieval.
  */
 app.post("/api/doctor-search", async (req: Request, res: Response): Promise<void> => {
   const { message, history } = (req.body ?? {}) as DoctorSearchRequest;
@@ -1250,13 +1352,14 @@ app.post("/api/doctor-search", async (req: Request, res: Response): Promise<void
     return;
   }
 
-  const SYSTEM_PROMPT = `You are a hospital assistant for Apollo Hospitals, Jubilee Hills.
+  const SYSTEM_PROMPT = `You are a hospital assistant for Apollo Hospitals India.
 
 STRICT RULES:
 - If the user mentions any doctor name, specialty, department, or medical term, you MUST call the "searchDoctors" tool.
 - NEVER answer doctor queries from your training data or memory.
 - NEVER hallucinate or invent doctor names or specialties.
 - EVEN IF the input is misspelled or partial, STILL call the tool.
+- Infer city/branch from user text when present and pass them to the tool as filters.
 - After receiving tool results, respond naturally using ONLY those results.
 - If no results are returned, say "No matching doctors found" and suggest broadening the search.
 
@@ -1264,6 +1367,7 @@ Examples of when to call the tool:
 "dr ramesh" → call searchDoctors
 "cardiologist" → call searchDoctors
 "ent doctor" → call searchDoctors
+"skin doctor in hyderabad" → call searchDoctors with city="Hyderabad"
 "ramsh" (misspelled) → call searchDoctors`;
 
   try {
@@ -1308,7 +1412,13 @@ Examples of when to call the tool:
       let toolResult: unknown = [];
       if (fnName === "searchDoctors") {
         const query = String(fnArgs.query ?? "").trim();
-        toolResult = searchDoctors(query);
+        const city = String(fnArgs.city ?? "").trim() || undefined;
+        const branch = String(fnArgs.branch ?? "").trim() || undefined;
+        const requestedLimit = Number(fnArgs.limit ?? 8);
+        const limit = Number.isFinite(requestedLimit)
+          ? Math.min(20, Math.max(1, Math.floor(requestedLimit)))
+          : 8;
+        toolResult = searchDoctors(query, city, branch, limit);
       }
 
       console.log(`[doctor-search] Tool result count:`, Array.isArray(toolResult) ? toolResult.length : "n/a");

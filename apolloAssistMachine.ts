@@ -170,7 +170,7 @@ export const apolloMachine = createMachine(
           // doctor name, no city → ask city
           {
             guard: ({ context }) => (context.doctorName ?? "").length > 0,
-            target: "ASK_CITY",
+            target: "SEARCH_DOCTOR",
           },
           // nothing actionable
           { target: "MAIN_MENU" },

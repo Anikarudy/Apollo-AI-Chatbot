@@ -169,6 +169,7 @@ export function useChatMachine() {
   const liveDateRequestsDone = useRef<Set<string>>(new Set());
   const liveScheduleListKey = useRef<string>("");
   const noLiveDatesNoticeKey = useRef<string>("");
+  const similarNameNoticeKey = useRef<string>("");
 
   // Initialize runner once
   useEffect(() => {
@@ -418,6 +419,7 @@ export function useChatMachine() {
       if (currentState !== "SHOW_DOCTORS") {
         setDoctorCards([]);
         setCardsAnchorMsgId(null);
+        similarNameNoticeKey.current = "";
       }
       return;
     }
@@ -462,6 +464,9 @@ export function useChatMachine() {
         const res = await fetch(`/api/doctors?${params.toString()}`, { signal: controller.signal });
         if (!res.ok) throw new Error("doctor fetch failed");
         const data = (await res.json()) as {
+          nameFallback?: {
+            requestedName?: string;
+          } | null;
           doctors?: Array<{
             name: string;
             specialty?: string;
@@ -487,7 +492,24 @@ export function useChatMachine() {
           serviceId:  d.serviceId,
         }));
 
-        const anchorId = messagesRef.current[messagesRef.current.length - 1]?.id ?? null;
+        let anchorId = messagesRef.current[messagesRef.current.length - 1]?.id ?? null;
+        const requestedName = String(data.nameFallback?.requestedName ?? "").trim();
+        if (requestedName && cards.length > 0) {
+          const noticeKey = `${requestedName.toLowerCase()}|${String(machineCtx.city ?? "").toLowerCase()}|${String(machineCtx.branch ?? "").toLowerCase()}|${String(machineCtx.specialty ?? "").toLowerCase()}`;
+          if (similarNameNoticeKey.current !== noticeKey) {
+            similarNameNoticeKey.current = noticeKey;
+            const noticeId = nextId();
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: noticeId,
+                sender: "bot",
+                text: `Did not find doctors with the name \"${requestedName}\". Showing available doctors with similar name:`,
+              },
+            ]);
+            anchorId = noticeId;
+          }
+        }
         if (cards.length > 0) {
           setDoctorCards(cards);
         } else {
@@ -1198,6 +1220,25 @@ export function useChatMachine() {
       if (AI_NAV_STATES.includes(currentState)) {
         const navigated = await tryAiIntent(text);
         if (navigated) return; // AI handled it — skip normal event mapping
+
+        // Deterministic fallback: if input looks like a person-name query,
+        // route into the doctor-name state-machine flow even when intent parser misses it.
+        const looksLikeNameOnlyQuery = /^[A-Za-z][A-Za-z\s.']{2,}$/.test(text)
+          && text.trim().split(/\s+/).length >= 2
+          && !/\b(book|appointment|doctor|specialty|symptom|pain|fever|city|branch|hospital)\b/i.test(text);
+        if (looksLikeNameOnlyQuery) {
+          const payload = JSON.stringify({ doctorName: text.trim() });
+          runner.sendEvent({ type: "AI_PREFILL", value: payload } as AppEvent);
+          const nextState = runner.currentState;
+          const nextCtx = runner.context as ChatContext;
+          if (nextState !== edocFiredForState.current) {
+            edocFiredForState.current = "";
+          }
+          setCurrentState(nextState);
+          setMachineCtx(nextCtx);
+          pushStaticBotMessage(nextState, nextCtx);
+          return;
+        }
       }
 
       const event = mapInputToEvent(text, currentState);
