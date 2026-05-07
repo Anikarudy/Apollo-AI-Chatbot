@@ -370,6 +370,7 @@ interface ChatRequest {
   context?: Record<string, string | undefined>;
   userMessage?: string;
   history?: Array<{ role: "user" | "assistant"; text: string }>;
+  summary?: string;
 }
 
 type AgentAction = "fetch_doctors" | "get_live_slots" | "book_appointment" | "unknown";
@@ -470,6 +471,7 @@ app.post("/api/chat", async (req: Request, res: Response): Promise<void> => {
   const currentState = String(payload.currentState ?? "MAIN_MENU");
   const context = payload.context ?? {};
   const userMessage = payload.userMessage;
+  const summary = (payload.summary ?? "").trim();
 
   if (!hasAnyLlm) {
     res.status(503).json({ error: NO_LLM_ERROR });
@@ -507,7 +509,10 @@ app.post("/api/chat", async (req: Request, res: Response): Promise<void> => {
 
   const systemPrompt = `You are Apollo Assist, a friendly and professional AI health assistant for Apollo Hospitals India.
 
-${kbContext}
+${summary ? `Conversation summary (what has happened so far):
+${summary}
+
+` : ""}${kbContext}
 
 Rules:
 - LANGUAGE: Detect the language the user wrote in and respond in THAT language.
@@ -541,7 +546,7 @@ Rules:
 // ── 1b. Intent parsing ────────────────────────────────────────────────────────
 interface IntentRequest { message: string; cities: string[]; specialties: string[]; history?: Array<{ role: "user" | "assistant"; text: string }>; currentState?: string; }
 export interface ParsedIntent {
-  intent: "book_appointment" | "find_doctor" | "health_checkup" | "have_symptoms" | "emergency" | "unknown";
+  intent: "book_appointment" | "find_doctor" | "health_checkup" | "have_symptoms" | "emergency" | "change_doctor" | "unknown";
   specialty?: string; city?: string; branch?: string; doctorName?: string; symptomText?: string;
 }
 
@@ -561,10 +566,9 @@ Extract booking intent from the user message and return ONLY a valid JSON object
 Known cities: ${(cities ?? []).join(", ")}
 Known specialties: ${(specialties ?? []).join(", ")}
 Current bot state: ${intentState ?? "unknown"}${historyBlock}
-
 JSON schema:
 {
-  "intent": "book_appointment" | "find_doctor" | "health_checkup" | "have_symptoms" | "emergency" | "unknown",
+  "intent": "book_appointment" | "find_doctor" | "health_checkup" | "have_symptoms" | "emergency" | "change_doctor" | "unknown",
   "specialty": string | null,
   "city": string | null,
   "branch": string | null,
@@ -573,9 +577,10 @@ JSON schema:
 }
 
 Rules:
+- CHANGE DOCTOR (highest priority when currentState is SHOW_DOCTORS): If the current bot state is "SHOW_DOCTORS" and the user is expressing a preference for a specific doctor by name — e.g. "no I want ramesh", "show me patel", "I prefer krishna", "ramsh", "no ramesh", or just a name like "priya sharma" — return { intent: "change_doctor", doctorName: "<name only>" }. Extract ONLY the name token; strip filler words like "no", "I want", "show me", "I prefer", "actually". Set doctorName to the name fragment as the user typed it (preserve misspellings). All other fields null.
 - Use "have_symptoms" when user describes a medical symptom or health complaint (e.g. "ear block", "chest pain", "my knee hurts"). Set symptomText to the exact symptom phrase. Also map to the closest specialty when possible.
 - Use "book_appointment" or "find_doctor" only if user explicitly mentions doctor/appointment/booking.
-- NAME-ONLY DOCTOR QUERY: If the message looks like a person name (for example 2+ alphabetic words like "shamila pendyala"), classify as "find_doctor" and set doctorName to that text.
+- NAME-ONLY DOCTOR QUERY: If the message looks like a person name (for example 2+ alphabetic words like "shamila pendyala") and currentState is NOT SHOW_DOCTORS, classify as "find_doctor" and set doctorName to that text.
 - CONTEXT RESOLUTION: If the user's message is just an affirmation ("yes", "sure", "ok", "yeah", "proceed", "please", "correct") — look at the conversation history to understand what they are confirming, and extract specialty/city/doctorName from prior context. E.g. if the bot said "I recommend ENT specialist", and user says "yes", return { intent: "find_doctor", specialty: "ENT" }. E.g. if bot said "Would you like to book in Hyderabad?", and user says "sure", return { intent: "book_appointment", city: "Hyderabad" }.
 - Set city if a known city is mentioned in the current message OR clearly referenced from history.
 - Return null for any field not mentioned or inferable. Never guess.
@@ -608,6 +613,29 @@ Return ONLY: { "specialty": "<exact name>" } or { "specialty": null }. No markdo
     res.json(JSON.parse(raw) as { specialty: string | null });
   } catch {
     res.json({ specialty: null });
+  }
+});
+
+// ── 1d. Conversation summarizer ───────────────────────────────────────────────
+app.post("/api/summarize", async (req: Request, res: Response): Promise<void> => {
+  if (!hasAnyLlm) { res.json({ summary: "" }); return; }
+
+  const { messages } = req.body as { messages?: Array<{ role: "user" | "assistant"; text: string }> };
+  const turns = (messages ?? []).filter((m) => m.text?.trim());
+  if (turns.length < 2) { res.json({ summary: "" }); return; }
+
+  const systemPrompt = `You are a session memory assistant for the Apollo Hospitals chatbot.
+Summarize the conversation below in 3–5 short bullet points.
+Focus ONLY on factual actions: what the user searched for (doctor name, specialty, city, branch), which doctors appeared, any slots or bookings made.
+Be concise — each bullet ≤ 15 words. No markdown headers. Start each line with "•".`;
+
+  const dialogue = turns.map((m) => `${m.role === "user" ? "User" : "Bot"}: ${m.text}`).join("\n");
+
+  try {
+    const raw = await callLlm(systemPrompt, dialogue);
+    res.json({ summary: raw.trim() });
+  } catch {
+    res.json({ summary: "" });
   }
 });
 

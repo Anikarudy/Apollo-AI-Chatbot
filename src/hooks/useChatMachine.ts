@@ -143,6 +143,56 @@ function getSafeLocationId(locationId?: string, fallback = "10551"): string {
   return isValidLocationId(locationId) ? String(locationId).trim() : fallback;
 }
 
+/**
+ * Builds a short rolling summary string for a given key event.
+ * The summary is injected into /api/chat so the LLM has factual "long-term memory"
+ * without needing the full message history. Max ~300 tokens.
+ */
+type SummaryEvent =
+  | { type: "doctors_shown"; specialty?: string; city?: string; branch?: string; doctorName?: string }
+  | { type: "doctor_selected"; doctorName: string; specialty?: string; city?: string; branch?: string; date?: string; time?: string }
+  | { type: "booking_done"; doctorName?: string; specialty?: string; city?: string; branch?: string; date?: string; time?: string; appointmentId?: string }
+  | { type: "booking_requested"; doctorName?: string; specialty?: string; city?: string; branch?: string };
+
+function buildSummary(prev: string, event: SummaryEvent): string {
+  const lines = prev ? prev.split("\n").filter(Boolean) : [];
+
+  switch (event.type) {
+    case "doctors_shown": {
+      const where = [event.branch, event.city].filter(Boolean).join(", ");
+      const subject = event.doctorName
+        ? `doctor "${event.doctorName}"`
+        : event.specialty ?? "doctors";
+      const line = `Searched for ${subject}${where ? ` in ${where}` : ""}.`;
+      // Replace any prior search line so we don't accumulate repeated searches
+      const filtered = lines.filter((l) => !l.startsWith("Searched "));
+      return [...filtered, line].slice(-6).join("\n");
+    }
+    case "doctor_selected": {
+      const where = [event.branch, event.city].filter(Boolean).join(", ");
+      const when = event.date ? ` on ${event.date}${event.time ? ` at ${event.time}` : ""}` : "";
+      const line = `• Selected ${event.doctorName}${event.specialty ? ` (${event.specialty})` : ""}${where ? ` at ${where}` : ""}${when}.`;
+      const filtered = lines.filter((l) => !l.startsWith("• Selected "));
+      return [...filtered, line].slice(-8).join("\n");
+    }
+    case "booking_done": {
+      const where = [event.branch, event.city].filter(Boolean).join(", ");
+      const when = event.date ? ` on ${event.date}${event.time ? ` at ${event.time}` : ""}` : "";
+      const appt = event.appointmentId && event.appointmentId !== "REQUEST" ? ` (Appt ID: ${event.appointmentId})` : "";
+      const line = `• Booking confirmed: ${event.doctorName ?? "doctor"}${event.specialty ? ` (${event.specialty})` : ""}${where ? ` at ${where}` : ""}${when}${appt}.`;
+      const filtered = lines.filter((l) => !l.startsWith("• Booking ") && !l.startsWith("• Appointment requested"));
+      return [...filtered, line].slice(-8).join("\n");
+    }
+    case "booking_requested": {
+      const where = [event.branch, event.city].filter(Boolean).join(", ");
+      const line = `• Appointment requested: ${event.doctorName ?? "a doctor"}${event.specialty ? ` (${event.specialty})` : ""}${where ? ` at ${where}` : ""}.`;
+      const filtered = lines.filter((l) => !l.startsWith("• Appointment requested") && !l.startsWith("• Booking "));
+      return [...filtered, line].slice(-8).join("\n");
+    }
+  }
+}
+
+
 export function useChatMachine() {
   const runnerRef = useRef<ApolloAssistRunner | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -153,7 +203,24 @@ export function useChatMachine() {
   const [isLlmLoading, setIsLlmLoading] = useState(false);
   const [doctorCards, setDoctorCards] = useState<DoctorCardData[]>([]);
   // ID of the bot message after which doctor cards should be rendered inline
-  const [cardsAnchorMsgId, setCardsAnchorMsgId] = useState<string | null>(null);
+  const [cardsAnchorMsgId, setCardsAnchorMsgId] = useState<number | null>(null);
+  // Rolling conversation summary — injected into /api/chat as "long-term memory"
+  const [conversationSummary, setConversationSummary] = useState<string>("");
+  const conversationSummaryRef = useRef<string>("");
+  useEffect(() => { conversationSummaryRef.current = conversationSummary; }, [conversationSummary]);
+
+  // Clear summary whenever the user returns to the main menu (Back to Menu, any reset)
+  const prevStateRef = useRef<string>("WELCOME");
+  useEffect(() => {
+    if (
+      currentState === "MAIN_MENU" &&
+      prevStateRef.current !== "MAIN_MENU" &&
+      prevStateRef.current !== "WELCOME"
+    ) {
+      setConversationSummary("");
+    }
+    prevStateRef.current = currentState;
+  }, [currentState]);
 
   // Mirror of messages for use inside callbacks without adding to deps arrays
   const messagesRef = useRef<ChatMessage[]>([]);
@@ -413,6 +480,28 @@ export function useChatMachine() {
     pushStaticBotMessage(nextState, nextCtx);
   }, [pushStaticBotMessage]);
 
+  // ── LLM-generated rolling summary ─────────────────────────────────────────
+  // Fire-and-forget: takes the last 16 messages and asks the LLM for a short
+  // bullet-point summary. Called after doctor cards load and after booking completes.
+  const updateSummaryWithLlm = useCallback(async () => {
+    const recent = messagesRef.current
+      .filter((m) => m.text.trim().length > 0)
+      .slice(-16)
+      .map((m) => ({ role: (m.sender === "user" ? "user" : "assistant") as "user" | "assistant", text: m.text }));
+    if (recent.length < 2) return;
+    try {
+      const res = await fetch("/api/summarize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: recent }),
+      });
+      if (res.ok) {
+        const data = await res.json() as { summary?: string };
+        if (data.summary) setConversationSummary(data.summary);
+      }
+    } catch { /* keep existing summary on failure */ }
+  }, []);
+
   // ── Load doctor cards when entering SHOW_DOCTORS ─────────────────────────
   useEffect(() => {
     if (currentState !== "SHOW_DOCTORS" && currentState !== "RESCHEDULE_APPOINTMENT") {
@@ -517,6 +606,8 @@ export function useChatMachine() {
           setDoctorCards([{ name: "No doctors found", specialty: machineCtx.specialty, hospital: "Try a different search or visit apollohospitals.com" }]);
         }
         setCardsAnchorMsgId(anchorId);
+        // Update rolling summary with LLM after cards are shown
+        void updateSummaryWithLlm();
       } catch {
         const anchorId = messagesRef.current[messagesRef.current.length - 1]?.id ?? null;
         setDoctorCards([{ name: fallbackName, specialty: machineCtx.specialty, hospital }]);
@@ -956,6 +1047,17 @@ export function useChatMachine() {
         };
         const d = await bookAppointment(payload);
         if (d.AppointmentID !== undefined && d.retcode === 0) {
+          setConversationSummary((prev) => buildSummary(prev, {
+            type: "booking_done",
+            doctorName: machineCtx.doctorName,
+            specialty: machineCtx.specialty,
+            city: machineCtx.city,
+            branch: machineCtx.branch,
+            date: machineCtx.selectedDate,
+            time: machineCtx.selectedSlotStart,
+            appointmentId: String(d.AppointmentID),
+          }));
+          void updateSummaryWithLlm();
           sendSilentEvent("BOOKING_DONE", String(d.AppointmentID));
         } else {
           logEdoc("BookAppointment.retcode_failure", { response: d });
@@ -1066,7 +1168,7 @@ export function useChatMachine() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ currentState: state, context: ctx, userMessage, history }),
+        body: JSON.stringify({ currentState: state, context: ctx, userMessage, history, summary: conversationSummaryRef.current || undefined }),
       });
       if (res.ok) {
         const data = (await res.json()) as { text: string | null };
@@ -1127,6 +1229,69 @@ export function useChatMachine() {
         doctorName?: string | null;
         symptomText?: string | null;
       };
+      // ── CHANGE DOCTOR: user wants a specific doctor while cards are shown ──────
+      if (parsed.intent === "change_doctor" && currentState === "SHOW_DOCTORS" && parsed.doctorName) {
+        const nameQuery = parsed.doctorName.trim();
+        const params = new URLSearchParams({ name: nameQuery });
+        if (machineCtx.specialty) params.set("specialty", machineCtx.specialty);
+        if (machineCtx.city)      params.set("city",      machineCtx.city);
+        if (machineCtx.branch)    params.set("branch",    machineCtx.branch);
+
+        let found: Array<{
+          name: string; specialty?: string; hospital?: string;
+          resourceId?: string; resourceIds?: string[];
+          locationId?: string; regionId?: string; serviceId?: string;
+        }> = [];
+        try {
+          const doctorRes = await fetch(`/api/doctors?${params.toString()}`);
+          if (doctorRes.ok) {
+            const doctorData = (await doctorRes.json()) as {
+              doctors?: typeof found;
+            };
+            found = doctorData.doctors ?? [];
+          }
+        } catch { /* fall through to not-found path */ }
+
+        if (found.length > 0) {
+          const doc = found[0];
+          const parts: string[] = [];
+          if (doc.specialty ?? machineCtx.specialty) parts.push((doc.specialty ?? machineCtx.specialty) as string);
+          if (machineCtx.branch) parts.push(machineCtx.branch);
+          if (machineCtx.city)   parts.push(machineCtx.city);
+          const detail = parts.filter(Boolean).join(", ");
+          const confirmMsg = detail
+            ? `Got it! Found ${doc.name} (${detail}).`
+            : `Got it! Found ${doc.name}.`;
+          const noticeId = nextId();
+          setMessages((prev) => [...prev, { id: noticeId, sender: "bot", text: confirmMsg }]);
+          const hospital = machineCtx.branch
+            ? `${machineCtx.branch}${machineCtx.city ? `, ${machineCtx.city}` : ""}`
+            : machineCtx.city ? `Apollo Hospitals, ${machineCtx.city}` : "Apollo Hospitals";
+          setDoctorCards(found.slice(0, 1).map((d) => ({
+            name:        d.name,
+            specialty:   d.specialty ?? machineCtx.specialty,
+            hospital:    d.hospital  ?? hospital,
+            resourceId:  d.resourceId,
+            resourceIds: d.resourceIds,
+            locationId:  d.locationId,
+            regionId:    d.regionId ?? "5",
+            serviceId:   d.serviceId,
+          })));
+          setCardsAnchorMsgId(noticeId);
+        } else {
+          const notFoundMsg = `I couldn't find a doctor matching "${nameQuery}" in this search. Would you like to look for a different doctor?`;
+          setMessages((prev) => [...prev, { id: nextId(), sender: "bot", text: notFoundMsg }]);
+          runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
+          const nextState = runner.currentState;
+          const nextCtx   = runner.context as ChatContext;
+          if (nextState !== edocFiredForState.current) edocFiredForState.current = "";
+          setCurrentState(nextState);
+          setMachineCtx(nextCtx);
+          pushStaticBotMessage(nextState, nextCtx);
+        }
+        return true;
+      }
+
       const isActionable = (parsed.intent === "book_appointment" || parsed.intent === "find_doctor")
         && (parsed.specialty || parsed.doctorName || parsed.city);
       const isSymptom = parsed.intent === "have_symptoms" && !!(parsed.symptomText || parsed.specialty);
@@ -1286,9 +1451,18 @@ export function useChatMachine() {
         ...prev,
         { id: nextId(), sender: "user", text: `Book ${doctor.name} · ${edocDate} at ${startTime}` },
       ]);
+      setConversationSummary((prev) => buildSummary(prev, {
+        type: "doctor_selected",
+        doctorName: doctor.name,
+        specialty: doctor.specialty,
+        city: machineCtx.city,
+        branch: machineCtx.branch,
+        date: edocDate,
+        time: startTime,
+      }));
       sendEvent("SELECT_SLOT", payload);
     },
-    [sendEvent]
+    [sendEvent, machineCtx.city, machineCtx.branch]
   );
 
   /**
@@ -1311,9 +1485,16 @@ export function useChatMachine() {
         ...prev,
         { id: nextId(), sender: "user", text: `Request appointment with ${doctor.name}` },
       ]);
+      setConversationSummary((prev) => buildSummary(prev, {
+        type: "booking_requested",
+        doctorName: doctor.name,
+        specialty: doctor.specialty,
+        city: machineCtx.city,
+        branch: machineCtx.branch,
+      }));
       sendEvent("SELECT_SLOT", payload);
     },
-    [sendEvent]
+    [sendEvent, machineCtx.city, machineCtx.branch]
   );
 
   const resetMachine = useCallback(() => {
@@ -1328,6 +1509,7 @@ export function useChatMachine() {
     setIsLlmLoading(false);
     setDoctorCards([]);
     setCardsAnchorMsgId(null);
+    setConversationSummary("");
     setLiveDates({});
     setLiveSlots({});
     setSlotServiceByKey({});
@@ -1342,6 +1524,7 @@ export function useChatMachine() {
     isLlmLoading,
     doctorCards,
     cardsAnchorMsgId,
+    conversationSummary,
     liveDates,
     liveSlots,
     slotsLoading,
