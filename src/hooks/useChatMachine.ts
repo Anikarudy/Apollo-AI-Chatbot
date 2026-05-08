@@ -27,6 +27,24 @@ export interface DoctorCardData {
   serviceId?: string;     // EDOC ServiceID
 }
 
+/**
+ * Structured decision returned by POST /api/agent/decide.
+ * The LLM proposes; XState + tools execute.
+ */
+export interface AgentDecision {
+  action: "CONTINUE_WORKFLOW" | "SWITCH_WORKFLOW" | "CALL_TOOL" | "ASK_CLARIFICATION" | "RESET_FLOW";
+  targetWorkflow: string | null;
+  reason: string;
+  confidence: number;
+  entities: {
+    doctorName: string | null;
+    specialty: string | null;
+    city: string | null;
+    branch: string | null;
+    symptomText: string | null;
+  };
+}
+
 /** One live date entry returned by /api/edoc/calendar-dates */
 export interface LiveDate {
   display: string;   // "1/7/2025"
@@ -109,12 +127,37 @@ const NO_LLM_STATES = new Set([
   "BOOKING_CONFIRMED",       // Dynamic message handled by stateResponses
 ]);
 
-// States where free-text should first be sent to the AI intent parser.
+// States where free-text should first be sent to the AI intent parser (legacy fallback).
 const AI_NAV_STATES = [
   "WELCOME", "MAIN_MENU", "FALLBACK",
   "BOOK_APPT_OPTIONS", "BOOK_APPT_OPTIONS_LOCATION",
   "FIND_DOCTOR_OPTIONS",
 ];
+
+// XState states that accept the AI_PREFILL event directly.
+// Used by executeAgentDecision to know whether a BACK_TO_MENU hop is needed first.
+const AI_PREFILL_STATES = new Set([
+  "WELCOME", "MAIN_MENU", "BOOK_APPT_OPTIONS", "BOOK_APPT_OPTIONS_LOCATION",
+  "FIND_DOCTOR_OPTIONS", "FALLBACK",
+]);
+
+// States where the agent-decide pipeline runs on every free-text turn.
+// Wider than AI_NAV_STATES — covers mid-workflow redirects (e.g. from ENTER_DOCTOR_NAME).
+const AGENT_DECIDE_STATES = new Set([
+  // Navigation / menu
+  "WELCOME", "MAIN_MENU", "FALLBACK",
+  // Booking entry
+  "BOOK_APPT_OPTIONS", "BOOK_APPT_OPTIONS_LOCATION", "FIND_DOCTOR_OPTIONS",
+  // Mid-workflow — user might redirect here
+  "ENTER_DOCTOR_NAME", "SELECT_SPECIALTY", "ASK_BASIC_DETAILS",
+  "ASK_CITY", "ASK_CITY_FOR_LOCATION", "ASK_BRANCH", "ASK_BRANCH_FOR_LOCATION",
+  "DOCTOR_NAME_SUGGESTIONS", "DOCTOR_NOT_FOUND_ASK_CITY",
+  "HEALTH_CHECKUP_ENTRY",
+  // Results / post-booking
+  "SHOW_DOCTORS", "BOOKING_CONFIRMED",
+  // Error / not-found recovery
+  "DOCTOR_NOT_FOUND", "SPECIALTY_NOT_FOUND", "BOOKING_FAILED_STATE",
+]);
 
 function parseLiveDate(dateStr: string): LiveDate {
   const [d, m, y] = dateStr.split("/");
@@ -1351,6 +1394,309 @@ export function useChatMachine() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentState, pushStaticBotMessage]);
 
+  // ── Agent-decision pipeline ────────────────────────────────────────────────
+  //
+  // callAgentDecide   → fetches /api/agent/decide, returns AgentDecision | null
+  // executeAgentDecision → maps action+targetWorkflow to machine events / tool calls
+  // tryAgentDecide    → combines both; falls back to tryAiIntent on network failure
+
+  /**
+   * Calls POST /api/agent/decide with current session context.
+   * Returns null on any network/parse error — never throws.
+   */
+  const callAgentDecide = useCallback(async (text: string): Promise<AgentDecision | null> => {
+    try {
+      const history = messagesRef.current.slice(-8).map((m) => ({
+        role: (m.sender === "user" ? "user" : "assistant") as "user" | "assistant",
+        text: m.text,
+      }));
+      const res = await fetch("/api/agent/decide", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          currentState,
+          machineContext: machineCtx,
+          userMessage: text,
+          history,
+          summary: conversationSummaryRef.current || undefined,
+        }),
+      });
+      if (!res.ok) return null;
+      const decision = await res.json() as AgentDecision;
+      console.log(
+        `[AGENT] state="${currentState}" message="${text}" → ` +
+        `action="${decision.action}" workflow="${decision.targetWorkflow ?? "-"}" ` +
+        `confidence=${decision.confidence}`
+      );
+      return decision;
+    } catch (err) {
+      console.warn("[AGENT] callAgentDecide failed:", err);
+      return null;
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentState, machineCtx]);
+
+  /**
+   * Given an AgentDecision, maps it to XState events / tool calls.
+   * Returns true if the agent handled the turn; false to fall through to
+   * the deterministic (tryAiIntent → mapInputToEvent) pipeline.
+   *
+   * SAFETY CONTRACT:
+   *   - Never calls EDOC APIs directly.
+   *   - Never mutates patient DB.
+   *   - All transactional work stays in the XState machine + dedicated API routes.
+   */
+  const executeAgentDecision = useCallback(async (
+    decision: AgentDecision,
+  ): Promise<boolean> => {
+    const runner = runnerRef.current;
+    if (!runner) return false;
+
+    const { action, targetWorkflow, confidence, entities } = decision;
+
+    // Below-threshold or explicit continue — let the deterministic fallback handle it
+    if (
+      action === "CONTINUE_WORKFLOW" ||
+      (confidence < 0.6 && action !== "ASK_CLARIFICATION" && action !== "RESET_FLOW")
+    ) {
+      return false;
+    }
+
+    // ── Helper: navigate to a state that accepts AI_PREFILL ─────────────────
+    const ensureAiPrefillReady = () => {
+      if (AI_PREFILL_STATES.has(runner.currentState)) return;
+      runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
+      // Some states (e.g. ENTER_PHONE_FOR_BOOKING) go to SHOW_DOCTORS, not MAIN_MENU
+      if (!AI_PREFILL_STATES.has(runner.currentState)) {
+        runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
+      }
+    };
+
+    // ── Helper: commit state after machine transition ────────────────────────
+    const commitState = () => {
+      const nextState = runner.currentState;
+      const nextCtx = runner.context as ChatContext;
+      if (nextState !== edocFiredForState.current) edocFiredForState.current = "";
+      setCurrentState(nextState);
+      setMachineCtx(nextCtx);
+      console.log(`[AGENT] Transitioned → state="${nextState}"`);
+      pushStaticBotMessage(nextState, nextCtx);
+    };
+
+    // ── ASK_CLARIFICATION ────────────────────────────────────────────────────
+    if (action === "ASK_CLARIFICATION") {
+      const question = decision.reason || "Could you clarify what you're looking for?";
+      setMessages((prev) => [...prev, { id: nextId(), sender: "bot", text: question }]);
+      console.log(`[AGENT] ASK_CLARIFICATION: "${question}"`);
+      return true;
+    }
+
+    // ── RESET_FLOW ───────────────────────────────────────────────────────────
+    if (action === "RESET_FLOW") {
+      runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
+      if (runner.currentState !== "MAIN_MENU") {
+        runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
+      }
+      console.log("[AGENT] RESET_FLOW → MAIN_MENU");
+      commitState();
+      return true;
+    }
+
+    // ── CALL_TOOL: CHANGE_DOCTOR (inline doctor card swap) ───────────────────
+    if (action === "CALL_TOOL" && targetWorkflow === "CHANGE_DOCTOR") {
+      const nameQuery = (entities.doctorName ?? "").trim();
+      if (!nameQuery) return false;
+
+      // Fresh entities overwrite; null fields use machineCtx so context search filters still work
+      const useSpecialty = entities.specialty ?? machineCtx.specialty;
+      const useCity      = entities.city      ?? machineCtx.city;
+      const useBranch    = entities.branch    ?? machineCtx.branch;
+
+      const params = new URLSearchParams({ name: nameQuery });
+      if (useSpecialty) params.set("specialty", useSpecialty);
+      if (useCity)      params.set("city",      useCity);
+      if (useBranch)    params.set("branch",    useBranch);
+
+      console.log(`[AGENT] CALL_TOOL CHANGE_DOCTOR name="${nameQuery}" city="${useCity ?? "-"}" specialty="${useSpecialty ?? "-"}"`);
+
+      let found: DoctorCardData[] = [];
+      try {
+        const r = await fetch(`/api/doctors?${params.toString()}`);
+        if (r.ok) {
+          const data = await r.json() as { doctors?: DoctorCardData[] };
+          found = (data.doctors ?? []).slice(0, 1);
+        }
+      } catch { /* fall through to not-found path */ }
+
+      const noticeId = nextId();
+      if (found.length > 0) {
+        const doc = found[0];
+        const detailParts = [doc.specialty ?? useSpecialty, useBranch, useCity].filter(Boolean);
+        const detail = detailParts.join(", ");
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: noticeId,
+            sender: "bot",
+            text: detail ? `Got it! Found ${doc.name} (${detail}).` : `Got it! Found ${doc.name}.`,
+          },
+        ]);
+        const hospital = useBranch
+          ? `${useBranch}${useCity ? `, ${useCity}` : ""}`
+          : useCity ? `Apollo Hospitals, ${useCity}` : "Apollo Hospitals";
+        setDoctorCards([{
+          name:        doc.name,
+          specialty:   doc.specialty ?? useSpecialty,
+          hospital:    doc.hospital  ?? hospital,
+          resourceId:  doc.resourceId,
+          resourceIds: doc.resourceIds,
+          locationId:  doc.locationId,
+          regionId:    doc.regionId ?? "5",
+          serviceId:   doc.serviceId,
+        }]);
+        setCardsAnchorMsgId(noticeId);
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          { id: noticeId, sender: "bot", text: `I couldn't find "${nameQuery}". Try a different name or use Change search?` },
+        ]);
+        // Reset to menu so the user can try a new search
+        runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
+        if (runner.currentState !== "MAIN_MENU") runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
+        commitState();
+      }
+      return true;
+    }
+
+    // ── SWITCH_WORKFLOW / CALL_TOOL (all other workflows) ───────────────────
+    if (action === "SWITCH_WORKFLOW" || action === "CALL_TOOL") {
+      // Build AI_PREFILL payload from ONLY the entities the user mentioned right now.
+      // Null fields are intentionally excluded — no stale context bleed.
+      const freshPrefill: Record<string, string> = {};
+      if (entities.doctorName)  freshPrefill.doctorName = entities.doctorName;
+      if (entities.specialty)   freshPrefill.specialty  = entities.specialty;
+      if (entities.city)        freshPrefill.city       = entities.city;
+      if (entities.branch)      freshPrefill.branch     = entities.branch;
+
+      console.log(`[AGENT] ${action} → workflow="${targetWorkflow ?? "-"}" freshEntities:`, freshPrefill);
+
+      // ── Workflows that don't go through AI_PREFILL ─────────────────────────
+
+      if (targetWorkflow === "EMERGENCY") {
+        runner.sendEvent({ type: "EMERGENCY" } as AppEvent);
+        commitState();
+        return true;
+      }
+
+      if (targetWorkflow === "MAIN_MENU") {
+        runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
+        if (runner.currentState !== "MAIN_MENU") runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
+        commitState();
+        return true;
+      }
+
+      if (targetWorkflow === "HEALTH_CHECKUP") {
+        const before = runner.currentState;
+        runner.sendEvent({ type: "HEALTH_CHECKUP" } as AppEvent);
+        if (runner.currentState === before) {
+          // State didn't accept HEALTH_CHECKUP — navigate to menu first
+          runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
+          if (runner.currentState !== "MAIN_MENU") runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
+          runner.sendEvent({ type: "HEALTH_CHECKUP" } as AppEvent);
+        }
+        if (entities.city && runner.currentState === "HEALTH_CHECKUP_ENTRY") {
+          runner.sendEvent({ type: "ENTER_CITY", value: entities.city } as AppEvent);
+        }
+        commitState();
+        return true;
+      }
+
+      if (targetWorkflow === "BOOK_BY_LOCATION") {
+        const before = runner.currentState;
+        runner.sendEvent({ type: "BOOK_BY_LOCATION" } as AppEvent);
+        if (runner.currentState === before) {
+          runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
+          if (runner.currentState !== "MAIN_MENU") runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
+          runner.sendEvent({ type: "BOOK_BY_LOCATION" } as AppEvent);
+        }
+        if (entities.city && runner.currentState === "ASK_CITY_FOR_LOCATION") {
+          runner.sendEvent({ type: "ENTER_CITY", value: entities.city } as AppEvent);
+        }
+        // Capture the state after potential ENTER_CITY (annotate as string to break TS narrowing)
+        const stateAfterLocationSend: string = runner.currentState;
+        if (entities.branch && stateAfterLocationSend === "ASK_BRANCH_FOR_LOCATION") {
+          runner.sendEvent({ type: "SELECT_BRANCH", value: entities.branch } as AppEvent);
+        }
+        commitState();
+        return true;
+      }
+
+      // ── SYMPTOM_TRIAGE ───────────────────────────────────────────────────
+      if (targetWorkflow === "SYMPTOM_TRIAGE") {
+        if (entities.specialty) {
+          // Specialty already known — route directly through AI_PREFILL
+          ensureAiPrefillReady();
+          runner.sendEvent({
+            type: "AI_PREFILL",
+            value: JSON.stringify({
+              specialty: entities.specialty,
+              ...(entities.city   ? { city:   entities.city }   : {}),
+              ...(entities.branch ? { branch: entities.branch } : {}),
+            }),
+          } as AppEvent);
+        } else {
+          // No specialty — navigate to symptom entry flow
+          const before = runner.currentState;
+          runner.sendEvent({ type: "HAVE_SYMPTOMS" } as AppEvent);
+          if (runner.currentState === before) runner.sendEvent({ type: "BY_SYMPTOMS" } as AppEvent);
+          if (runner.currentState === before) {
+            // Event not accepted in this state — go via menu → BOOK_APPT_OPTIONS
+            runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
+            if (runner.currentState !== "MAIN_MENU") runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
+            runner.sendEvent({ type: "BOOK_APPOINTMENT" } as AppEvent);
+            runner.sendEvent({ type: "HAVE_SYMPTOMS" } as AppEvent);
+          }
+          if (runner.currentState === "ASK_BASIC_DETAILS" && entities.symptomText) {
+            runner.sendEvent({ type: "ENTER_SYMPTOM", value: entities.symptomText } as AppEvent);
+          }
+        }
+        commitState();
+        return true;
+      }
+
+      // ── All remaining workflows: BOOK_BY_NAME, BOOK_BY_SPECIALTY, FIND_DOCTOR ──
+      // AI_PREFILL_ROUTE in the machine handles the rest based on which entities are present.
+      if (Object.keys(freshPrefill).length > 0) {
+        ensureAiPrefillReady();
+        runner.sendEvent({ type: "AI_PREFILL", value: JSON.stringify(freshPrefill) } as AppEvent);
+        commitState();
+        return true;
+      }
+
+      // No usable entities extracted — fall through to deterministic pipeline
+      return false;
+    }
+
+    return false;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentState, machineCtx, pushStaticBotMessage, setDoctorCards, setCardsAnchorMsgId]);
+
+  /**
+   * Primary entry point for agent-orchestrated turns.
+   * 1. Calls callAgentDecide (Gemini)
+   * 2. On success: executes the decision
+   * 3. On network failure: falls back to tryAiIntent (legacy intent parser)
+   */
+  const tryAgentDecide = useCallback(async (text: string): Promise<boolean> => {
+    const decision = await callAgentDecide(text);
+    if (!decision) {
+      // Agent unavailable — fall back to the legacy intent parser
+      console.warn("[AGENT] callAgentDecide returned null, falling back to tryAiIntent");
+      return tryAiIntent(text);
+    }
+    return executeAgentDecision(decision);
+  }, [callAgentDecide, executeAgentDecision, tryAiIntent]);
+
   // ── Free-text input ────────────────────────────────────────────────────────
   const sendUserText = useCallback(
     async (text: string) => {
@@ -1358,7 +1704,7 @@ export function useChatMachine() {
       if (!runner) return;
       setMessages((prev) => [...prev, { id: nextId(), sender: "user", text }]);
 
-      // In SHOW_DOCTORS, handle text without leaving the cards view.
+      // ── SHOW_DOCTORS: keep cards visible; explicit keywords take priority ──
       if (currentState === "SHOW_DOCTORS") {
         const event = mapInputToEvent(text, currentState);
         if (event.type !== "UNKNOWN") {
@@ -1366,13 +1712,22 @@ export function useChatMachine() {
           runner.sendEvent(event);
           const nextState = runner.currentState;
           const nextCtx = runner.context as ChatContext;
-          if (nextState !== edocFiredForState.current) edocFiredForState.current = "";
-          setCurrentState(nextState);
-          setMachineCtx(nextCtx);
-          await pushLlmBotMessage(nextState, nextCtx as Record<string, unknown>, text);
+          if (nextState !== "SHOW_DOCTORS") {
+            // State actually changed — commit and show new state message
+            if (nextState !== edocFiredForState.current) edocFiredForState.current = "";
+            setCurrentState(nextState);
+            setMachineCtx(nextCtx);
+            await pushLlmBotMessage(nextState, nextCtx as Record<string, unknown>, text);
+          } else {
+            // Machine didn't accept the event (state unchanged) — treat as conversational
+            const navigated = await tryAgentDecide(text);
+            if (!navigated) {
+              await pushLlmDirect(currentState, runner.context as Record<string, unknown>, text);
+            }
+          }
         } else {
-          // Try AI intent navigation first (catches "wrong specialty", "different city", etc.)
-          const navigated = await tryAiIntent(text);
+          // Agent-decide pipeline handles intent (doctor swap, specialty change, etc.)
+          const navigated = await tryAgentDecide(text);
           if (!navigated) {
             // Purely conversational — respond in-place without leaving SHOW_DOCTORS
             await pushLlmDirect(currentState, runner.context as Record<string, unknown>, text);
@@ -1381,45 +1736,55 @@ export function useChatMachine() {
         return;
       }
 
-      // For navigation states, first try AI intent parsing
-      if (AI_NAV_STATES.includes(currentState)) {
-        const navigated = await tryAiIntent(text);
-        if (navigated) return; // AI handled it — skip normal event mapping
+      // ── AGENT_DECIDE_STATES: agent runs first on every free-text turn ─────
+      if (AGENT_DECIDE_STATES.has(currentState)) {
+        const navigated = await tryAgentDecide(text);
+        if (navigated) return;
 
-        // Deterministic fallback: if input looks like a person-name query,
-        // route into the doctor-name state-machine flow even when intent parser misses it.
-        const looksLikeNameOnlyQuery = /^[A-Za-z][A-Za-z\s.']{2,}$/.test(text)
-          && text.trim().split(/\s+/).length >= 2
-          && !/\b(book|appointment|doctor|specialty|symptom|pain|fever|city|branch|hospital)\b/i.test(text);
-        if (looksLikeNameOnlyQuery) {
-          const payload = JSON.stringify({ doctorName: text.trim() });
-          runner.sendEvent({ type: "AI_PREFILL", value: payload } as AppEvent);
-          const nextState = runner.currentState;
-          const nextCtx = runner.context as ChatContext;
-          if (nextState !== edocFiredForState.current) {
-            edocFiredForState.current = "";
+        // ── Deterministic fallback 1: legacy AI intent parser (for AI_NAV_STATES) ──
+        if (AI_NAV_STATES.includes(currentState)) {
+          const legacyNavigated = await tryAiIntent(text);
+          if (legacyNavigated) return;
+
+          // Deterministic fallback 2: name-only heuristic
+          const looksLikeNameOnlyQuery = /^[A-Za-z][A-Za-z\s.']{2,}$/.test(text)
+            && text.trim().split(/\s+/).length >= 2
+            && !/\b(book|appointment|doctor|specialty|symptom|pain|fever|city|branch|hospital)\b/i.test(text);
+          if (looksLikeNameOnlyQuery) {
+            const payload = JSON.stringify({ doctorName: text.trim() });
+            runner.sendEvent({ type: "AI_PREFILL", value: payload } as AppEvent);
+            const nextState = runner.currentState;
+            const nextCtx = runner.context as ChatContext;
+            if (nextState !== edocFiredForState.current) edocFiredForState.current = "";
+            setCurrentState(nextState);
+            setMachineCtx(nextCtx);
+            pushStaticBotMessage(nextState, nextCtx);
+            return;
           }
-          setCurrentState(nextState);
-          setMachineCtx(nextCtx);
-          pushStaticBotMessage(nextState, nextCtx);
-          return;
         }
       }
 
+      // ── Deterministic fallback: mapInputToEvent (all states) ─────────────
       const event = mapInputToEvent(text, currentState);
       runner.sendEvent(event);
       const nextState = runner.currentState;
       const nextCtx = runner.context as ChatContext;
-      // Reset EDOC fire guard when state changes (same as sendEvent / sendSilentEvent)
       if (nextState !== edocFiredForState.current) {
         edocFiredForState.current = "";
       }
-      setCurrentState(nextState);
-      setMachineCtx(nextCtx);
-      await pushLlmBotMessage(nextState, runner.context as Record<string, unknown>, text);
+      if (nextState !== currentState) {
+        // State changed — commit and show the new state's message
+        setCurrentState(nextState);
+        setMachineCtx(nextCtx);
+        await pushLlmBotMessage(nextState, runner.context as Record<string, unknown>, text);
+      } else {
+        // Machine didn't accept the event (state unchanged) — respond in-place with LLM
+        // rather than blindly re-pushing the same state message.
+        await pushLlmDirect(currentState, runner.context as Record<string, unknown>, text);
+      }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [currentState, pushLlmBotMessage, pushLlmDirect, tryAiIntent]
+    [currentState, pushLlmBotMessage, pushLlmDirect, tryAgentDecide, tryAiIntent]
   );
 
   const sendQuickReply = useCallback(

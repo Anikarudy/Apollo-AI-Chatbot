@@ -1628,6 +1628,216 @@ app.post("/api/patient/details", (req: Request, res: Response): void => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ── Agent Orchestration Decision  (POST /api/agent/decide) ───────────────────
+// The LLM proposes a structured action; XState + tools execute it safely.
+// The LLM NEVER touches EDOC APIs, patient DB, or auth keys.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type AgentDecisionAction =
+  | "CONTINUE_WORKFLOW"
+  | "SWITCH_WORKFLOW"
+  | "CALL_TOOL"
+  | "ASK_CLARIFICATION"
+  | "RESET_FLOW";
+
+export interface AgentDecision {
+  action: AgentDecisionAction;
+  /** One of the valid workflow names, or null for CONTINUE_WORKFLOW/ASK_CLARIFICATION */
+  targetWorkflow: string | null;
+  /** Human-readable reason; also used as the clarification question for ASK_CLARIFICATION */
+  reason: string;
+  /** 0–1 confidence; values below 0.6 cause the frontend to fall back to deterministic handling */
+  confidence: number;
+  /** Entities extracted ONLY from the CURRENT user message — never copied from session context */
+  entities: {
+    doctorName: string | null;
+    specialty: string | null;
+    city: string | null;
+    branch: string | null;
+    symptomText: string | null;
+  };
+}
+
+interface AgentDecideRequest {
+  currentState?: string;
+  machineContext?: Record<string, string | undefined>;
+  userMessage: string;
+  history?: Array<{ role: "user" | "assistant"; text: string }>;
+  summary?: string;
+}
+
+/** Normalise an entity value: empty strings / undefined → null */
+function sanitizeEntity(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const s = String(value).trim();
+  return s.length > 0 ? s : null;
+}
+
+const AGENT_DECIDE_FALLBACK: AgentDecision = {
+  action: "CONTINUE_WORKFLOW",
+  targetWorkflow: null,
+  reason: "Fallback — continuing current workflow",
+  confidence: 1,
+  entities: { doctorName: null, specialty: null, city: null, branch: null, symptomText: null },
+};
+
+const VALID_AGENT_ACTIONS: AgentDecisionAction[] = [
+  "CONTINUE_WORKFLOW", "SWITCH_WORKFLOW", "CALL_TOOL", "ASK_CLARIFICATION", "RESET_FLOW",
+];
+
+/**
+ * POST /api/agent/decide
+ *
+ * Analyses the user's message in session context and returns a structured AgentDecision.
+ * The frontend uses this to decide whether to continue the current XState workflow,
+ * switch to a different one, trigger a tool call, ask for clarification, or reset.
+ *
+ * Security contract:
+ *   - This endpoint ONLY reasons about intent and entities.
+ *   - It NEVER calls EDOC APIs, reads/writes patient DB, or returns auth credentials.
+ *   - All transactional execution happens in the XState machine + dedicated API routes.
+ */
+app.post("/api/agent/decide", async (req: Request, res: Response): Promise<void> => {
+  if (!hasAnyLlm) {
+    res.json(AGENT_DECIDE_FALLBACK);
+    return;
+  }
+
+  const payload = (req.body ?? {}) as AgentDecideRequest;
+  const {
+    currentState: botState = "MAIN_MENU",
+    machineContext = {},
+    userMessage,
+    history = [],
+    summary = "",
+  } = payload;
+
+  if (!userMessage?.trim()) {
+    res.status(400).json({ error: "userMessage required" });
+    return;
+  }
+
+  const ctx = machineContext as Record<string, string | undefined>;
+
+  // Build a concise description of current session state for the LLM
+  const contextLines = [
+    `Bot state: ${botState}`,
+    ctx.doctorName  ? `Doctor in context: ${ctx.doctorName}`  : null,
+    ctx.specialty   ? `Specialty in context: ${ctx.specialty}` : null,
+    ctx.city        ? `City in context: ${ctx.city}`           : null,
+    ctx.branch      ? `Branch in context: ${ctx.branch}`       : null,
+    ctx.symptomText ? `Symptom in context: ${ctx.symptomText}` : null,
+  ].filter(Boolean).join("\n");
+
+  const summaryBlock = summary.trim()
+    ? `\nConversation so far:\n${summary}\n`
+    : "";
+
+  const systemPrompt = `You are the conversational orchestrator for Apollo Assist, a healthcare chatbot for Apollo Hospitals India.
+
+Your job: analyse the user's latest message in context and return the single best next action as a JSON object.
+
+=== CURRENT SESSION ===
+${contextLines}${summaryBlock}
+
+=== VALID TARGET WORKFLOWS ===
+BOOK_BY_NAME       — user wants a specific doctor by name
+BOOK_BY_SPECIALTY  — user wants doctors of a given specialty (e.g. Cardiology, ENT)
+SYMPTOM_TRIAGE     — user describes a symptom; needs a specialty/doctor recommendation
+BOOK_BY_LOCATION   — user wants to search by hospital/city first
+FIND_DOCTOR        — general doctor discovery
+CHANGE_DOCTOR      — user is viewing doctor cards and wants a DIFFERENT specific doctor (use with CALL_TOOL)
+HEALTH_CHECKUP     — user wants a health or wellness package
+EMERGENCY          — medical emergency
+MAIN_MENU          — user wants to reset or return to the main menu
+
+=== ACTION RULES ===
+CONTINUE_WORKFLOW  — user is supplying the expected input for the current bot state (e.g. providing their city when asked for city, entering a name when prompted). Use when message fits the current state naturally. Confidence ≥ 0.7.
+SWITCH_WORKFLOW    — user changes direction mid-conversation (e.g. in ENTER_DOCTOR_NAME they say "show cardiologists"). Confidence must be ≥ 0.6 to switch.
+CALL_TOOL          — user wants live data or a card swap within the current flow (e.g. viewing cards and asking for a different doctor). Confidence ≥ 0.6.
+ASK_CLARIFICATION  — intent is too ambiguous. Set reason = the clarifying question to display to the user.
+RESET_FLOW         — user explicitly wants to start over, go back, or visit the main menu.
+
+=== ENTITY EXTRACTION RULES (CRITICAL) ===
+• Extract ONLY entities explicitly stated in the CURRENT user message.
+• Do NOT copy entities from the session context above into your output.
+• null means the user did not say it right now — the frontend will NOT inherit the old stale value.
+• Exception: CONTINUE_WORKFLOW may have all-null entities (the value flows through the deterministic state machine).
+• Specialty: use Apollo specialty names (e.g. "Cardiology", "ENT", "Orthopaedics", "Dermatology", "Neurology", "Gynaecology", "Paediatrics", "Gastroenterology", "Urology", "Oncology").
+• City: use the city name as the user typed it.
+• If the user says "switch to Chennai" — set city:"Chennai", leave specialty/branch null.
+• If the user says "actually I want Cardiology" — set specialty:"Cardiology", leave city/branch null.
+
+=== CONFIDENCE SCALE ===
+0.9  Very clear ("show cardiologists in Hyderabad")
+0.7  Likely but minor ambiguity
+0.5  Ambiguous → use CONTINUE_WORKFLOW or ASK_CLARIFICATION
+< 0.5  Never use SWITCH_WORKFLOW or CALL_TOOL
+
+Return ONLY a valid JSON object — no markdown, no extra text:
+{
+  "action": "CONTINUE_WORKFLOW" | "SWITCH_WORKFLOW" | "CALL_TOOL" | "ASK_CLARIFICATION" | "RESET_FLOW",
+  "targetWorkflow": string | null,
+  "reason": string,
+  "confidence": number,
+  "entities": {
+    "doctorName": string | null,
+    "specialty": string | null,
+    "city": string | null,
+    "branch": string | null,
+    "symptomText": string | null
+  }
+}`;
+
+  console.log(`[AGENT/decide] state="${botState}" message="${userMessage}"`);
+
+  try {
+    const recentHistory = history.slice(-8);
+    const raw = stripMarkdownJson(
+      await callLlm(systemPrompt, `User message: "${userMessage}"`, recentHistory)
+    );
+    const parsed = JSON.parse(raw) as AgentDecision;
+
+    if (!parsed || !VALID_AGENT_ACTIONS.includes(parsed.action)) {
+      console.warn("[AGENT/decide] Invalid action in LLM response, falling back:", JSON.stringify(parsed));
+      res.json(AGENT_DECIDE_FALLBACK);
+      return;
+    }
+
+    const rawEntities = (parsed.entities ?? {}) as Record<string, unknown>;
+    const decision: AgentDecision = {
+      action: parsed.action,
+      targetWorkflow:
+        typeof parsed.targetWorkflow === "string" && parsed.targetWorkflow.trim()
+          ? parsed.targetWorkflow.trim()
+          : null,
+      reason: String(parsed.reason ?? ""),
+      confidence:
+        typeof parsed.confidence === "number"
+          ? Math.max(0, Math.min(1, parsed.confidence))
+          : 0.5,
+      entities: {
+        doctorName:  sanitizeEntity(rawEntities.doctorName),
+        specialty:   sanitizeEntity(rawEntities.specialty),
+        city:        sanitizeEntity(rawEntities.city),
+        branch:      sanitizeEntity(rawEntities.branch),
+        symptomText: sanitizeEntity(rawEntities.symptomText),
+      },
+    };
+
+    console.log(
+      `[AGENT/decide] → action="${decision.action}" workflow="${decision.targetWorkflow ?? "-"}" ` +
+      `confidence=${decision.confidence} reason="${decision.reason}"`
+    );
+    res.json(decision);
+  } catch (err: unknown) {
+    const e = err as { message?: string };
+    console.warn("[AGENT/decide] LLM parse/call error, falling back:", e.message ?? err);
+    res.json(AGENT_DECIDE_FALLBACK);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log(`Apollo Assist backend running on http://localhost:${PORT}`);

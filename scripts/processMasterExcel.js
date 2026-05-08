@@ -63,7 +63,6 @@ const locations = locationSheet
 // ==========================
 const existing = JSON.parse(fs.readFileSync("data/clean.json", "utf-8"));
 const existingDoctors = Array.isArray(existing) ? existing : (existing.doctors ?? []);
-
 // ==========================
 // MERGE LOGIC
 // ==========================
