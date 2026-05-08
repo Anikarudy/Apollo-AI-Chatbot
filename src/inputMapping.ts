@@ -187,7 +187,9 @@ export function mapInputToEvent(message: string, currentState?: string): AppEven
   if (state === "SHOW_DOCTORS") {
     if (/(change|search|different|another|new search|more doctor|wrong|not right|other doctor|different specialty|change specialty)/i.test(text)) return { type: "CHANGE_SEARCH" };
     if (/(back|menu|home|start over)/i.test(text)) return { type: "BACK_TO_MENU" };
-    // Everything else falls through to UNKNOWN — handled by tryAiIntent then in-place LLM
+    // Everything else must stay UNKNOWN so it routes to tryAiIntent / pushLlmDirect
+    // and never falls through to generic handlers (greetings → START would re-trigger static SHOW_DOCTORS message)
+    return { type: "UNKNOWN" };
   }
 
   // ── Greetings / Start ──────────────────────────────────────
