@@ -371,6 +371,8 @@ interface ChatRequest {
   userMessage?: string;
   history?: Array<{ role: "user" | "assistant"; text: string }>;
   summary?: string;
+  /** ISO 639-1 language code detected from the user's messages (e.g. "te", "hi"). */
+  userLanguage?: string;
 }
 
 type AgentAction = "fetch_doctors" | "get_live_slots" | "book_appointment" | "unknown";
@@ -472,6 +474,7 @@ app.post("/api/chat", async (req: Request, res: Response): Promise<void> => {
   const context = payload.context ?? {};
   const userMessage = payload.userMessage;
   const summary = (payload.summary ?? "").trim();
+  const userLanguage = String(payload.userLanguage ?? "").trim();
 
   if (!hasAnyLlm) {
     res.status(503).json({ error: NO_LLM_ERROR });
@@ -507,15 +510,32 @@ app.post("/api/chat", async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  const systemPrompt = `You are Apollo Assist, a friendly and professional AI health assistant for Apollo Hospitals India.
+  const CHAT_LANG_NAMES: Record<string, string> = {
+    te: "Telugu", hi: "Hindi", ta: "Tamil", kn: "Kannada", ml: "Malayalam",
+    gu: "Gujarati", bn: "Bengali", pa: "Punjabi", ur: "Urdu", mr: "Marathi",
+    or: "Odia", si: "Sinhala",
+  };
+  const detectedLangName = CHAT_LANG_NAMES[userLanguage ?? ""] ?? "";
 
-${summary ? `Conversation summary (what has happened so far):
-${summary}
+  // Language block prepended at the very top of the system prompt so the LLM
+  // sees it before any other instruction.  Kept separate from the Rules list so
+  // it cannot be softened by later bullets.
+  const langHeader = detectedLangName
+    ? `=== RESPONSE LANGUAGE: ${detectedLangName.toUpperCase()} ===
+You MUST write your entire response in ${detectedLangName}. This is the highest-priority instruction.
+- The conversation history may contain English messages — that is irrelevant. Reply in ${detectedLangName} now.
+- Do NOT use English words except for: doctor names, hospital names, city/branch names, phone numbers, and medical specialty names (e.g. Cardiology, ENT). Everything else must be in ${detectedLangName}.
+- Do NOT add a translation, explanation, or language label.
+- Do NOT apologise for language switching. Just respond naturally in ${detectedLangName}.
+===\n`
+    : "";
 
-` : ""}${kbContext}
+  const systemPrompt = `${langHeader}You are Apollo Assist, a friendly and professional AI health assistant for Apollo Hospitals India.
+
+${summary ? `Conversation summary (what has happened so far):\n${summary}\n\n` : ""}${kbContext}
 
 Rules:
-- LANGUAGE: Detect the language the user wrote in and respond in THAT language.
+- LANGUAGE: ${detectedLangName ? `Respond in ${detectedLangName}. Keep doctor names, city names, hospitals, phone numbers, and medical specialty names in English; write everything else in ${detectedLangName}.` : "Detect the language the user wrote in (including romanized scripts) and respond in that exact language."}
 - Respond warmly and concisely (2-3 sentences max).
 - Guide the user to their next logical action based on the current bot state.
 - Use real hospital names, phone numbers, and package names from the knowledge base above.
@@ -636,6 +656,85 @@ Be concise — each bullet ≤ 15 words. No markdown headers. Start each line wi
     res.json({ summary: raw.trim() });
   } catch {
     res.json({ summary: "" });
+  }
+});
+
+// ── Language detection ────────────────────────────────────────────────────────
+// Detects the language of a user message (supports romanized scripts).
+app.post("/api/detect-language", async (req: Request, res: Response): Promise<void> => {
+  if (!hasAnyLlm) { res.json({ code: "en" }); return; }
+
+  const { text } = req.body as { text?: string };
+  if (!text?.trim()) { res.json({ code: "en" }); return; }
+
+  const systemPrompt = `Detect the language of the user's message. Return ONLY: { "code": "<ISO 639-1 code>" }
+For romanized text (Latin script used to write a non-Latin language), detect the UNDERLYING language.
+Examples: "naku doctor kavali" → Telugu romanized → {"code":"te"}; "mujhe doctor chahiye" → Hindi → {"code":"hi"}; "I need a doctor" → {"code":"en"}; "నాకు డాక్టర్ కావాలి" → {"code":"te"}
+Supported codes: en, te, hi, ta, kn, ml, gu, bn, pa, ur, mr, or, si.
+Return {"code":"en"} if uncertain. Return ONLY raw JSON, no markdown.`;
+
+  try {
+    const raw = stripMarkdownJson(await callLlm(systemPrompt, `Detect language of: "${String(text).slice(0, 200)}"`));
+    const parsed = JSON.parse(raw) as { code?: string };
+    const code = String(parsed.code ?? "en").toLowerCase().trim().slice(0, 5);
+    res.json({ code: /^[a-z]{2,5}$/.test(code) ? code : "en" });
+  } catch {
+    res.json({ code: "en" });
+  }
+});
+
+// ── UI translation (batch strings) ───────────────────────────────────────────
+// Translates an array of UI strings (button labels, bot messages) to a target language.
+// Keeps doctor names, city names, hospital names, and medical specialties in English.
+app.post("/api/translate-ui", async (req: Request, res: Response): Promise<void> => {
+  const { strings, targetLanguage } = req.body as { strings?: string[]; targetLanguage?: string };
+  if (!strings || !Array.isArray(strings) || strings.length === 0) {
+    res.json({ translations: strings ?? [] });
+    return;
+  }
+  if (!targetLanguage || targetLanguage === "en" || !hasAnyLlm) {
+    res.json({ translations: strings });
+    return;
+  }
+
+  const LANGUAGE_NAMES: Record<string, string> = {
+    te: "Telugu", hi: "Hindi", ta: "Tamil", kn: "Kannada", ml: "Malayalam",
+    gu: "Gujarati", bn: "Bengali", pa: "Punjabi", ur: "Urdu", mr: "Marathi",
+    or: "Odia", si: "Sinhala",
+  };
+  const langName = LANGUAGE_NAMES[targetLanguage] ?? targetLanguage;
+
+  const systemPrompt = `You are a JSON-only UI string translator for Apollo Hospitals India chatbot.
+Target language: ${langName}.
+
+INPUT: a JSON array of short UI strings (button labels and bot messages).
+OUTPUT: a JSON array of the same strings translated to ${langName}. Output ONLY the JSON array — no markdown, no explanation, no extra keys.
+
+STRICT RULES:
+1. The output array MUST have exactly the same number of elements as the input array, in the same order.
+2. These tokens MUST stay in English exactly as written: doctor names, hospital names, branch names, city names (e.g. Hyderabad, Chennai, Bangalore), phone numbers, and medical specialty names (Cardiology, Neurology, Orthopaedics, Gynaecology, Paediatrics, Oncology, Gastroenterology, ENT, Dermatology, Urology, etc.).
+3. Preserve emoji characters exactly — do not remove, add, or replace them.
+4. Button labels must be SHORT (≤ 6 words in ${langName}). Do not expand them into full sentences.
+5. Do NOT add parenthetical English translations, footnotes, or explanations.
+6. If a string is already in ${langName} or is a proper noun, return it unchanged.
+7. Output raw JSON only. Do not wrap in markdown code fences.`;
+
+  try {
+    const raw = stripMarkdownJson(
+      await callLlm(systemPrompt, `Translate to ${langName}: ${JSON.stringify(strings)}`)
+    );
+    const parsed = JSON.parse(raw) as unknown[];
+    if (Array.isArray(parsed) && parsed.length === strings.length) {
+      res.json({
+        translations: parsed.map((t, i) =>
+          typeof t === "string" && t.trim() ? t : strings[i]
+        ),
+      });
+    } else {
+      res.json({ translations: strings });
+    }
+  } catch {
+    res.json({ translations: strings });
   }
 });
 
@@ -1664,6 +1763,8 @@ interface AgentDecideRequest {
   userMessage: string;
   history?: Array<{ role: "user" | "assistant"; text: string }>;
   summary?: string;
+  /** ISO 639-1 language code detected from the user's messages (e.g. "te", "hi"). */
+  userLanguage?: string;
 }
 
 /** Normalise an entity value: empty strings / undefined → null */
@@ -1710,6 +1811,7 @@ app.post("/api/agent/decide", async (req: Request, res: Response): Promise<void>
     userMessage,
     history = [],
     summary = "",
+    userLanguage = "",
   } = payload;
 
   if (!userMessage?.trim()) {
@@ -1787,7 +1889,10 @@ Return ONLY a valid JSON object — no markdown, no extra text:
     "branch": string | null,
     "symptomText": string | null
   }
-}`;
+}${userLanguage && userLanguage !== "en" ? `
+
+=== LANGUAGE ===
+The user's interface language is "${userLanguage}". When action is ASK_CLARIFICATION, write the "reason" field in the user's language (not English).` : ""}`;
 
   console.log(`[AGENT/decide] state="${botState}" message="${userMessage}"`);
 

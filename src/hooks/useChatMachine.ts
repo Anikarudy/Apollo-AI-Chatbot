@@ -7,7 +7,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { ApolloAssistRunner } from "../../apolloAssistMachine";
 import { mapInputToEvent, AppEvent } from "../inputMapping.js";
-import { getStateResponse, ChatContext } from "../stateResponses";
+import { getStateResponse, ChatContext, QuickReply } from "../stateResponses";
 
 export interface ChatMessage {
   id: number;
@@ -107,6 +107,23 @@ const nextId = () => ++msgId;
 
 const MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
 const DAYS   = ["SUN","MON","TUE","WED","THU","FRI","SAT"];
+
+/**
+ * Heuristic: detect language from Unicode script ranges (instant, no API call).
+ * Returns an ISO 639-1 code when a non-Latin script is detected, otherwise null.
+ */
+function detectScriptLanguage(text: string): string | null {
+  if (/[\u0C00-\u0C7F]/.test(text)) return "te"; // Telugu
+  if (/[\u0900-\u097F]/.test(text)) return "hi"; // Devanagari (Hindi/Marathi)
+  if (/[\u0B80-\u0BFF]/.test(text)) return "ta"; // Tamil
+  if (/[\u0C80-\u0CFF]/.test(text)) return "kn"; // Kannada
+  if (/[\u0D00-\u0D7F]/.test(text)) return "ml"; // Malayalam
+  if (/[\u0A80-\u0AFF]/.test(text)) return "gu"; // Gujarati
+  if (/[\u0980-\u09FF]/.test(text)) return "bn"; // Bengali
+  if (/[\u0A00-\u0A7F]/.test(text)) return "pa"; // Gurmukhi (Punjabi)
+  if (/[\u0600-\u06FF]/.test(text)) return "ur"; // Arabic/Urdu
+  return null;
+}
 
 // States where Gemini adds no value — use static responses directly.
 // Includes: transient auto-transitions, loading spinners, error dead-ends, and
@@ -252,6 +269,20 @@ export function useChatMachine() {
   const conversationSummaryRef = useRef<string>("");
   useEffect(() => { conversationSummaryRef.current = conversationSummary; }, [conversationSummary]);
 
+  // ── Multilingual support ────────────────────────────────────────────────
+  /** ISO 639-1 code of the user's detected language (e.g. "te", "hi"). Default "en". */
+  const [userLanguage, setUserLanguage] = useState<string>("en");
+  /** Ref keeps the current language accessible inside synchronous callbacks without deps. */
+  const userLanguageRef = useRef<string>("en");
+  /** Translated quick-reply chips for the current state (null = show English originals). */
+  const [translatedQuickReplies, setTranslatedQuickReplies] = useState<QuickReply[] | null>(null);
+  /** Cache: `"<lang>:<labels joined>"` → translated labels array. Persists across renders. */
+  const quickReplyLabelCache = useRef<Map<string, string[]>>(new Map());
+  /** Cache: `"<lang>:<original message>"` → translated message. Avoids re-calling API. */
+  const uiTranslationCache = useRef<Map<string, string>>(new Map());
+  /** Tracks in-flight translate-ui requests so we don't fire duplicates simultaneously. */
+  const translationInFlight = useRef<Set<string>>(new Set());
+
   // Clear summary whenever the user returns to the main menu (Back to Menu, any reset)
   const prevStateRef = useRef<string>("WELCOME");
   useEffect(() => {
@@ -264,6 +295,54 @@ export function useChatMachine() {
     }
     prevStateRef.current = currentState;
   }, [currentState]);
+
+  // ── Translate quick reply chips when state or language changes ──────────
+  useEffect(() => {
+    if (!userLanguage || userLanguage === "en") {
+      setTranslatedQuickReplies(null);
+      return;
+    }
+    const resp = getStateResponse(currentState, machineCtx);
+    const labels = resp.quickReplies.map((q) => q.label);
+    if (labels.length === 0) {
+      setTranslatedQuickReplies(null);
+      return;
+    }
+    const cacheKey = `${userLanguage}:${labels.join("\x00")}`;
+    const cached = quickReplyLabelCache.current.get(cacheKey);
+    if (cached) {
+      setTranslatedQuickReplies(resp.quickReplies.map((q, i) => ({ ...q, label: cached[i] ?? q.label })));
+      return;
+    }
+    // Prevent concurrent identical requests
+    if (translationInFlight.current.has(cacheKey)) return;
+    translationInFlight.current.add(cacheKey);
+
+    void (async () => {
+      try {
+        const res = await fetch("/api/translate-ui", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ strings: labels, targetLanguage: userLanguage }),
+        });
+        if (!res.ok) return;
+        const data = await res.json() as { translations?: string[] };
+        const translations = data.translations ?? labels;
+        quickReplyLabelCache.current.set(cacheKey, translations);
+        // Only update if state/language haven't changed while we were fetching
+        setTranslatedQuickReplies((prev) => {
+          // If machine moved on, the effect will re-run and will pick the right cache entry
+          void prev;
+          return resp.quickReplies.map((q, i) => ({ ...q, label: translations[i] ?? q.label }));
+        });
+      } catch {
+        // Keep English on failure — don't set translatedQuickReplies
+      } finally {
+        translationInFlight.current.delete(cacheKey);
+      }
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentState, userLanguage, machineCtx.city, machineCtx.branch, machineCtx.specialty, machineCtx.doctorName, machineCtx.doctorSuggestions]);
 
   // Mirror of messages for use inside callbacks without adding to deps arrays
   const messagesRef = useRef<ChatMessage[]>([]);
@@ -295,7 +374,72 @@ export function useChatMachine() {
   // Static response
   const pushStaticBotMessage = useCallback((state: string, ctx: ChatContext) => {
     const resp = getStateResponse(state, ctx);
-    setMessages((prev) => [...prev, { id: nextId(), sender: "bot", text: resp.message }]);
+    const msgId = nextId();
+    setMessages((prev) => [...prev, { id: msgId, sender: "bot", text: resp.message }]);
+
+    // Background-translate the static message when the UI language is non-English.
+    // The English text is shown immediately; we replace it once the translation arrives.
+    const lang = userLanguageRef.current;
+    if (!lang || lang === "en") return;
+
+    void (async () => {
+      const cacheKey = `${lang}:${resp.message}`;
+      try {
+        let translated: string | undefined = uiTranslationCache.current.get(cacheKey);
+        if (!translated) {
+          const res = await fetch("/api/translate-ui", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ strings: [resp.message], targetLanguage: lang }),
+          });
+          if (!res.ok) return;
+          const data = await res.json() as { translations?: string[] };
+          translated = data.translations?.[0];
+          if (translated) uiTranslationCache.current.set(cacheKey, translated);
+        }
+        if (translated && translated !== resp.message) {
+          setMessages((prev) =>
+            prev.map((m) => m.id === msgId ? { ...m, text: translated! } : m)
+          );
+        }
+      } catch { /* keep English on failure */ }
+    })();
+  }, []); // userLanguageRef and uiTranslationCache are refs — no deps needed
+
+  /**
+   * Detects the user's language from their message and updates userLanguageRef + userLanguage.
+   * Uses instant Unicode-script heuristic first; falls back to LLM for romanized scripts.
+   * Fire-and-forget — never throws.
+   */
+  const detectAndSetLanguage = useCallback(async (text: string): Promise<void> => {
+    // 1. Instant script detection (no API call)
+    const scriptLang = detectScriptLanguage(text);
+    if (scriptLang) {
+      if (scriptLang !== userLanguageRef.current) {
+        userLanguageRef.current = scriptLang;
+        setUserLanguage(scriptLang);
+      }
+      return;
+    }
+    // 2. Skip very short / purely numeric input — not enough signal
+    const trimmed = text.trim();
+    if (trimmed.length < 4 || /^\d+$/.test(trimmed)) return;
+
+    // 3. LLM-based detection for romanized text (async, fire-and-forget)
+    try {
+      const res = await fetch("/api/detect-language", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: trimmed.slice(0, 200) }),
+      });
+      if (!res.ok) return;
+      const data = await res.json() as { code?: string };
+      const code = String(data.code ?? "en").toLowerCase().trim();
+      if (code && code !== userLanguageRef.current) {
+        userLanguageRef.current = code;
+        setUserLanguage(code);
+      }
+    } catch { /* keep current language */ }
   }, []);
 
   const logEdoc = useCallback((step: string, payload: Record<string, unknown>) => {
@@ -1211,7 +1355,14 @@ export function useChatMachine() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ currentState: state, context: ctx, userMessage, history, summary: conversationSummaryRef.current || undefined }),
+        body: JSON.stringify({
+          currentState: state,
+          context: ctx,
+          userMessage,
+          history,
+          summary: conversationSummaryRef.current || undefined,
+          userLanguage: userLanguageRef.current !== "en" ? userLanguageRef.current : undefined,
+        }),
       });
       if (res.ok) {
         const data = (await res.json()) as { text: string | null };
@@ -1419,6 +1570,7 @@ export function useChatMachine() {
           userMessage: text,
           history,
           summary: conversationSummaryRef.current || undefined,
+          userLanguage: userLanguageRef.current !== "en" ? userLanguageRef.current : undefined,
         }),
       });
       if (!res.ok) return null;
@@ -1704,6 +1856,19 @@ export function useChatMachine() {
       if (!runner) return;
       setMessages((prev) => [...prev, { id: nextId(), sender: "user", text }]);
 
+      // ── Language detection ─────────────────────────────────────────────────
+      // Sync heuristic first (instant) so the current turn's LLM call benefits;
+      // async LLM detection runs in background for romanized scripts.
+      const scriptLang = detectScriptLanguage(text);
+      if (scriptLang && scriptLang !== userLanguageRef.current) {
+        userLanguageRef.current = scriptLang;
+        setUserLanguage(scriptLang);
+      } else if (!scriptLang && text.trim().length >= 4) {
+        // Await detection before proceeding — guarantees the correct language code
+        // is in userLanguageRef before the LLM call is made this turn.
+        await detectAndSetLanguage(text);
+      }
+
       // ── SHOW_DOCTORS: keep cards visible; explicit keywords take priority ──
       if (currentState === "SHOW_DOCTORS") {
         const event = mapInputToEvent(text, currentState);
@@ -1784,7 +1949,7 @@ export function useChatMachine() {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [currentState, pushLlmBotMessage, pushLlmDirect, tryAgentDecide, tryAiIntent]
+    [currentState, pushLlmBotMessage, pushLlmDirect, tryAgentDecide, tryAiIntent, detectAndSetLanguage]
   );
 
   const sendQuickReply = useCallback(
@@ -1879,6 +2044,10 @@ export function useChatMachine() {
     setLiveSlots({});
     setSlotServiceByKey({});
     setSlotsLoading({});
+    // Reset language tracking for the new conversation
+    userLanguageRef.current = "en";
+    setUserLanguage("en");
+    setTranslatedQuickReplies(null);
     setMessages([{ id: nextId(), sender: "bot", text: getStateResponse(initial).message }]);
   }, []);
 
@@ -1893,6 +2062,8 @@ export function useChatMachine() {
     liveDates,
     liveSlots,
     slotsLoading,
+    userLanguage,
+    translatedQuickReplies,
     getServiceIdForSlot,
     fetchSlotsForDate,
     selectDoctorForBooking,

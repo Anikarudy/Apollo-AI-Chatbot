@@ -20,6 +20,7 @@ const ChatWidget: React.FC = () => {
     getServiceIdForSlot, fetchSlotsForDate, selectDoctorForBooking,
     requestAppointmentForDoctor,
     sendUserText, sendQuickReply, resetMachine,
+    translatedQuickReplies,
   } = useChatMachine();
 
   const [inputText, setInputText] = useState("");
@@ -301,9 +302,9 @@ const ChatWidget: React.FC = () => {
           && currentState !== "SHOW_DOCTORS"
           && currentState !== "RESCHEDULE_APPOINTMENT" && (
           <div key={`quick-${currentState}`} className="quick-replies" role="group" aria-label="Quick reply options">
-            {stateResp.quickReplies.map((qr, idx) => (
+            {(translatedQuickReplies ?? stateResp.quickReplies).map((qr, idx) => (
               <button
-                key={`${currentState}-${qr.eventType}-${qr.value ?? qr.label}-${idx}`}
+                key={`${currentState}-${qr.eventType}-${qr.value ?? stateResp.quickReplies[idx]?.label ?? qr.label}-${idx}`}
                 className="quick-reply-btn"
                 onClick={() => void sendQuickReply(qr.label, qr.eventType, qr.value)}
               >
