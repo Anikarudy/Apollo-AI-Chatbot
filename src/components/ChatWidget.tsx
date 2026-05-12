@@ -27,6 +27,8 @@ const ChatWidget: React.FC = () => {
   const [selectedDateIdxByDoctor, setSelectedDateIdxByDoctor] = useState<Record<string, number>>({});
   const [selectedSlotByDoctor, setSelectedSlotByDoctor]       = useState<Record<string, string | null>>({});
   const [slotsOpenByDoctor, setSlotsOpenByDoctor]             = useState<Record<string, boolean>>({});
+  const [dateStartByDoctor, setDateStartByDoctor]             = useState<Record<string, number>>({});
+  const [msgQuickReplies, setMsgQuickReplies]                 = useState<Record<number, { label: string; eventType: string; value?: string }[]>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll to bottom
@@ -39,13 +41,26 @@ const ChatWidget: React.FC = () => {
     setSelectedDateIdxByDoctor({});
     setSelectedSlotByDoctor({});
     setSlotsOpenByDoctor({});
+    setDateStartByDoctor({});
   }, [currentState, doctorCards.length]);
 
   const stateResp = getStateResponse(currentState, machineCtx);
 
+  const snapshotQuickReplies = () => {
+    const qrs = translatedQuickReplies ?? stateResp.quickReplies;
+    if (qrs.length === 0) return;
+    const lastBotMsg = [...messages].reverse().find(m => m.sender === "bot");
+    if (!lastBotMsg) return;
+    setMsgQuickReplies(prev => {
+      if (prev[lastBotMsg.id]) return prev;
+      return { ...prev, [lastBotMsg.id]: [...qrs] };
+    });
+  };
+
   const handleSend = async () => {
     const text = inputText.trim();
     if (!text) return;
+    snapshotQuickReplies();
     setInputText("");
     await sendUserText(text);
   };
@@ -81,6 +96,8 @@ const ChatWidget: React.FC = () => {
               setInputText("");
               setSelectedDateIdxByDoctor({});
               setSelectedSlotByDoctor({});
+              setDateStartByDoctor({});
+              setMsgQuickReplies({});
               resetMachine();
             }}
           >＋</button>
@@ -116,6 +133,20 @@ const ChatWidget: React.FC = () => {
                 )}
               </div>
             </div>
+
+            {/* Historical quick replies for past bot messages */}
+            {msg.sender === "bot" && msgQuickReplies[msg.id] && msgQuickReplies[msg.id].length > 0 && (
+              <div className="historical-quick-replies">
+                <div className="qr-label-row">Option selected:</div>
+                <div className="quick-replies">
+                  {msgQuickReplies[msg.id].map((qr, i) => (
+                    <button key={i} className="quick-reply-btn past" disabled>
+                      {qr.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Doctor cards anchored inline — only rendered once at their original position */}
             {msg.id === cardsAnchorMsgId && doctorCards.length > 0 && (
@@ -200,30 +231,49 @@ const ChatWidget: React.FC = () => {
                             return (
                               <>
                                 {dates.length > 0 ? (
-                                  <div className="appt-day-tabs" role="tablist" aria-label={`Choose a day for ${doctor.name}`}>
-                                    {dates.map((day, dayIdx) => (
-                                      <button
-                                        key={`${doctorKey}-${day.edoc}`}
-                                        type="button"
-                                        role="tab"
-                                        aria-selected={selectedIdx === dayIdx}
-                                        className={`appt-day-btn ${selectedIdx === dayIdx ? "active" : ""}`}
-                                        onClick={() => {
-                                          setSelectedDateIdxByDoctor((prev) => ({ ...prev, [doctorKey]: dayIdx }));
-                                          setSelectedSlotByDoctor((prev) => ({ ...prev, [doctorKey]: null }));
-                                          if (doctor.resourceId && doctor.locationId) {
-                                            void fetchSlotsForDate(doctorKey, doctor.resourceId, doctor.locationId, doctor.regionId ?? "5", day.edoc);
-                                          }
-                                        }}
-                                      >
-                                        <span>{day.label}</span>
-                                        <strong>{day.date}</strong>
-                                        <small>{day.month}</small>
-                                      </button>
-                                    ))}
+                                  <div className="appt-day-tabs-wrap">
+                                    <button
+                                      type="button"
+                                      className="appt-day-nav-btn"
+                                      disabled={(dateStartByDoctor[doctorKey] ?? 0) === 0}
+                                      onClick={() => setDateStartByDoctor(prev => ({ ...prev, [doctorKey]: Math.max(0, (prev[doctorKey] ?? 0) - 1) }))}
+                                      aria-label="Previous dates"
+                                    >‹</button>
+                                    <div className="appt-day-tabs" role="tablist" aria-label={`Choose a day for ${doctor.name}`}>
+                                      {dates.slice(dateStartByDoctor[doctorKey] ?? 0, (dateStartByDoctor[doctorKey] ?? 0) + 3).map((day, relIdx) => {
+                                        const dayIdx = (dateStartByDoctor[doctorKey] ?? 0) + relIdx;
+                                        return (
+                                          <button
+                                            key={`${doctorKey}-${day.edoc}`}
+                                            type="button"
+                                            role="tab"
+                                            aria-selected={selectedIdx === dayIdx}
+                                            className={`appt-day-btn ${selectedIdx === dayIdx ? "active" : ""}`}
+                                            onClick={() => {
+                                              setSelectedDateIdxByDoctor((prev) => ({ ...prev, [doctorKey]: dayIdx }));
+                                              setSelectedSlotByDoctor((prev) => ({ ...prev, [doctorKey]: null }));
+                                              if (doctor.resourceId && doctor.locationId) {
+                                                void fetchSlotsForDate(doctorKey, doctor.resourceId, doctor.locationId, doctor.regionId ?? "5", day.edoc);
+                                              }
+                                            }}
+                                          >
+                                            <span>{day.label}</span>
+                                            <strong>{day.date}</strong>
+                                            <small>{day.month}</small>
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+                                    <button
+                                      type="button"
+                                      className="appt-day-nav-btn"
+                                      disabled={(dateStartByDoctor[doctorKey] ?? 0) + 3 >= dates.length}
+                                      onClick={() => setDateStartByDoctor(prev => ({ ...prev, [doctorKey]: Math.min(dates.length - 1, (prev[doctorKey] ?? 0) + 1) }))}
+                                      aria-label="Next dates"
+                                    >›</button>
                                   </div>
                                 ) : (
-                                  <p className="appt-no-slots" style={{ padding: "10px 18px 0" }}>Loading available dates…</p>
+                                  <p className="appt-no-slots" style={{ padding: "10px 14px 0" }}>Loading available dates…</p>
                                 )}
                                 <div className="appt-slots" role="group" aria-label={`Available slots for ${doctor.name}`}>
                                   {isLoadingSlots ? (
@@ -238,6 +288,14 @@ const ChatWidget: React.FC = () => {
                                         className={`appt-slot-btn ${selectedSlot === slot ? "selected" : ""}`}
                                         onClick={() => setSelectedSlotByDoctor((prev) => ({ ...prev, [doctorKey]: slot }))}
                                       >
+                                        <span className="slot-cal-icon" aria-hidden="true">
+                          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <rect x="0.75" y="1.75" width="10.5" height="9.5" rx="1.25" stroke="currentColor" strokeWidth="1.3"/>
+                            <line x1="0.75" y1="4.25" x2="11.25" y2="4.25" stroke="currentColor" strokeWidth="1.3"/>
+                            <line x1="3.5" y1="0.75" x2="3.5" y2="3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+                            <line x1="8.5" y1="0.75" x2="8.5" y2="3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+                          </svg>
+                        </span>
                                         {slot}
                                       </button>
                                     ))
@@ -260,7 +318,7 @@ const ChatWidget: React.FC = () => {
                                     selectDoctorForBooking(doctor, selectedDate.edoc, selectedSlot, serviceId);
                                   }}
                                 >
-                                  Book appointment
+                                  Book appointment →
                                 </button>
                               </>
                             );
@@ -299,19 +357,30 @@ const ChatWidget: React.FC = () => {
 
         {/* Quick replies */}
         {stateResp.quickReplies.length > 0 && !isLlmLoading
+          && messages[messages.length - 1]?.sender !== "user"
           && currentState !== "SHOW_DOCTORS"
           && currentState !== "RESCHEDULE_APPOINTMENT" && (
-          <div key={`quick-${currentState}`} className="quick-replies" role="group" aria-label="Quick reply options">
-            {(translatedQuickReplies ?? stateResp.quickReplies).map((qr, idx) => (
-              <button
-                key={`${currentState}-${qr.eventType}-${qr.value ?? stateResp.quickReplies[idx]?.label ?? qr.label}-${idx}`}
-                className="quick-reply-btn"
-                onClick={() => void sendQuickReply(qr.label, qr.eventType, qr.value)}
-              >
-                {qr.label}
-              </button>
-            ))}
-          </div>
+          <>
+            <div className="qr-label-row active">Select an option:</div>
+            <div key={`quick-${currentState}`} className="quick-replies" role="group" aria-label="Quick reply options">
+              {(translatedQuickReplies ?? stateResp.quickReplies).map((qr, idx) => (
+                <button
+                  key={`${currentState}-${qr.eventType}-${qr.value ?? stateResp.quickReplies[idx]?.label ?? qr.label}-${idx}`}
+                  className="quick-reply-btn"
+                  onClick={() => {
+                    snapshotQuickReplies();
+                    void sendQuickReply(qr.label, qr.eventType, qr.value);
+                  }}
+                >
+                  {qr.label}
+                </button>
+              ))}
+            </div>
+            <div className="chat-reactions">
+              <button className="reaction-btn" title="Helpful" aria-label="Mark as helpful">👍</button>
+              <button className="reaction-btn" title="Not helpful" aria-label="Mark as not helpful">👎</button>
+            </div>
+          </>
         )}
 
         <div ref={messagesEndRef} />
@@ -319,22 +388,40 @@ const ChatWidget: React.FC = () => {
 
       {/* Input bar */}
       <div className="chat-input-bar">
-        <button className="chat-input-attach" aria-label="Attach file">＋</button>
-        <input
-          className="chat-input-field"
-          type="text"
-          placeholder={stateResp.inputPlaceholder ?? "Message Apollo Assist…"}
-          value={inputText}
-          onChange={(e) => setInputText(e.target.value)}
-          onKeyDown={handleKeyDown}
-          aria-label="Type a message"
-        />
-        <button className="chat-input-mic" aria-label="Voice input">🎤</button>
+        {(currentState === "ENTER_PHONE_FOR_BOOKING" || currentState === "ENTER_PHONE") ? (
+          <>
+            <div className="chat-phone-prefix">🇮🇳 +91</div>
+            <input
+              className="chat-input-field"
+              type="tel"
+              placeholder="Mobile Number"
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              onKeyDown={handleKeyDown}
+              aria-label="Enter mobile number"
+            />
+            <button className="chat-input-send" onClick={() => void handleSend()} aria-label="Send">›</button>
+          </>
+        ) : (
+          <>
+            <button className="chat-input-attach" aria-label="Attach file">＋</button>
+            <input
+              className="chat-input-field"
+              type="text"
+              placeholder={stateResp.inputPlaceholder ?? "Message Apollo Assist…"}
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              onKeyDown={handleKeyDown}
+              aria-label="Type a message"
+            />
+            <button className="chat-input-mic" aria-label="Voice input">🎤</button>
+          </>
+        )}
       </div>
 
       {/* Footer */}
       <div className="chat-footer">
-        Powered by <span>Apollo Health Axis</span>
+        Powered by <span>Apollo HealthAxis</span>
       </div>
     </div>
   );

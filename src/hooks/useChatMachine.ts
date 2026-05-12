@@ -170,6 +170,8 @@ const AGENT_DECIDE_STATES = new Set([
   "ASK_CITY", "ASK_CITY_FOR_LOCATION", "ASK_BRANCH", "ASK_BRANCH_FOR_LOCATION",
   "DOCTOR_NAME_SUGGESTIONS", "DOCTOR_NOT_FOUND_ASK_CITY",
   "HEALTH_CHECKUP_ENTRY",
+  // Symptom flow — user may type a symptom instead of pressing a button
+  "SELECT_SYMPTOM_CATEGORY",
   // Results / post-booking
   "SHOW_DOCTORS", "BOOKING_CONFIRMED",
   // Error / not-found recovery
@@ -788,11 +790,57 @@ export function useChatMachine() {
         }
         if (cards.length > 0) {
           setDoctorCards(cards);
+          setCardsAnchorMsgId(anchorId);
+        } else if (
+          (machineCtx.specialty ?? "").toLowerCase() === "general physician" &&
+          !machineCtx.doctorName
+        ) {
+          // Fallback: try "General Medicine" when "General Physician" returns no results
+          const fallbackParams = new URLSearchParams();
+          fallbackParams.set("specialty", "General Medicine");
+          if (machineCtx.city)   fallbackParams.set("city",   machineCtx.city);
+          if (machineCtx.branch) fallbackParams.set("branch", machineCtx.branch);
+          const fallbackRes = await fetch(`/api/doctors?${fallbackParams.toString()}`, { signal: controller.signal });
+          const fallbackData = fallbackRes.ok
+            ? (await fallbackRes.json()) as { doctors?: typeof data.doctors }
+            : { doctors: [] };
+          const fallbackCards = (fallbackData.doctors ?? []).slice(0, 6).map((d) => ({
+            name:        d.name,
+            specialty:   d.specialty ?? "General Medicine",
+            hospital:    d.hospital  ?? hospital,
+            profileUrl:  d.profileUrl,
+            resourceId:  d.resourceId,
+            resourceIds: d.resourceIds,
+            locationId:  d.locationId,
+            regionId:    d.regionId ?? "5",
+            serviceId:   d.serviceId,
+          }));
+          if (fallbackCards.length > 0) {
+            setDoctorCards(fallbackCards);
+            setCardsAnchorMsgId(anchorId);
+          } else {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === anchorId
+                  ? { ...m, text: "No doctors were found matching your search criteria. Please try a different specialty, branch, or city." }
+                  : m
+              )
+            );
+            setDoctorCards([]);
+            setCardsAnchorMsgId(null);
+          }
         } else {
-          // No doctors found — show a single "no results" placeholder
-          setDoctorCards([{ name: "No doctors found", specialty: machineCtx.specialty, hospital: "Try a different search or visit apollohospitals.com" }]);
+          // No doctors found — replace the "Showing available doctors..." message with the no-doctors message, show no cards
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === anchorId
+                ? { ...m, text: "No doctors were found matching your search criteria. Please try a different specialty, branch, or city." }
+                : m
+            )
+          );
+          setDoctorCards([]);
+          setCardsAnchorMsgId(null);
         }
-        setCardsAnchorMsgId(anchorId);
         // Update rolling summary with LLM after cards are shown
         void updateSummaryWithLlm();
       } catch {
@@ -1785,31 +1833,58 @@ export function useChatMachine() {
 
       // ── SYMPTOM_TRIAGE ───────────────────────────────────────────────────
       if (targetWorkflow === "SYMPTOM_TRIAGE") {
-        if (entities.specialty) {
-          // Specialty already known — route directly through AI_PREFILL
+        const symptomText = entities.symptomText ?? "";
+        let resolvedSpecialty: string | null = entities.specialty ?? null;
+
+        // If the agent didn't extract a specialty, try the static map first
+        if (!resolvedSpecialty && symptomText) {
+          const { mapSymptomToSpecialty } = await import("../knowledgeBase.js");
+          resolvedSpecialty = mapSymptomToSpecialty(symptomText);
+        }
+
+        // If still no specialty, ask the LLM symptom-specialty endpoint
+        if (!resolvedSpecialty && symptomText) {
+          try {
+            const { specialities } = await import("../knowledgeBase.js");
+            const res = await fetch("/api/symptom-specialty", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ symptom: symptomText, specialties: specialities }),
+            });
+            if (res.ok) {
+              const data = await res.json() as { specialty?: string | null };
+              resolvedSpecialty = data.specialty ?? null;
+            }
+          } catch { /* fall through to navigation path */ }
+        }
+
+        if (resolvedSpecialty) {
+          // Specialty resolved — route directly with AI_PREFILL (fastest path to doctors)
           ensureAiPrefillReady();
           runner.sendEvent({
             type: "AI_PREFILL",
             value: JSON.stringify({
-              specialty: entities.specialty,
+              specialty: resolvedSpecialty,
               ...(entities.city   ? { city:   entities.city }   : {}),
               ...(entities.branch ? { branch: entities.branch } : {}),
             }),
           } as AppEvent);
+        } else if (runner.currentState === "SELECT_SYMPTOM_CATEGORY" && symptomText) {
+          // Already in symptom flow — fire ENTER_SYMPTOM_TEXT so the machine handles it
+          runner.sendEvent({ type: "ENTER_SYMPTOM_TEXT", value: symptomText } as AppEvent);
         } else {
-          // No specialty — navigate to symptom entry flow
+          // No specialty and not at symptom screen — navigate to symptom entry flow
           const before = runner.currentState;
           runner.sendEvent({ type: "HAVE_SYMPTOMS" } as AppEvent);
           if (runner.currentState === before) runner.sendEvent({ type: "BY_SYMPTOMS" } as AppEvent);
           if (runner.currentState === before) {
-            // Event not accepted in this state — go via menu → BOOK_APPT_OPTIONS
             runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
             if (runner.currentState !== "MAIN_MENU") runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
             runner.sendEvent({ type: "BOOK_APPOINTMENT" } as AppEvent);
             runner.sendEvent({ type: "HAVE_SYMPTOMS" } as AppEvent);
           }
-          if (runner.currentState === "ASK_BASIC_DETAILS" && entities.symptomText) {
-            runner.sendEvent({ type: "ENTER_SYMPTOM", value: entities.symptomText } as AppEvent);
+          if (runner.currentState === "ASK_BASIC_DETAILS" && symptomText) {
+            runner.sendEvent({ type: "ENTER_SYMPTOM", value: symptomText } as AppEvent);
           }
         }
         commitState();
@@ -1910,22 +1985,8 @@ export function useChatMachine() {
         if (AI_NAV_STATES.includes(currentState)) {
           const legacyNavigated = await tryAiIntent(text);
           if (legacyNavigated) return;
-
-          // Deterministic fallback 2: name-only heuristic
-          const looksLikeNameOnlyQuery = /^[A-Za-z][A-Za-z\s.']{2,}$/.test(text)
-            && text.trim().split(/\s+/).length >= 2
-            && !/\b(book|appointment|doctor|specialty|symptom|pain|fever|city|branch|hospital)\b/i.test(text);
-          if (looksLikeNameOnlyQuery) {
-            const payload = JSON.stringify({ doctorName: text.trim() });
-            runner.sendEvent({ type: "AI_PREFILL", value: payload } as AppEvent);
-            const nextState = runner.currentState;
-            const nextCtx = runner.context as ChatContext;
-            if (nextState !== edocFiredForState.current) edocFiredForState.current = "";
-            setCurrentState(nextState);
-            setMachineCtx(nextCtx);
-            pushStaticBotMessage(nextState, nextCtx);
-            return;
-          }
+          // No name heuristic here — let it fall through to mapInputToEvent/pushLlmDirect
+          // so conversational messages get a warm LLM response rather than a bad doctor search
         }
       }
 

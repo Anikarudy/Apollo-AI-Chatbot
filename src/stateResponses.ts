@@ -881,15 +881,15 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
       const foundLocation = found.branch
         ? `${found.branch}, ${found.location}`
         : found.location;
-      msg = `Found doctor ${found.name} in ${foundLocation}.\n\nSelect a time slot below to book, or refine your search.\n\nBook online: ${searchUrl}`;
+      msg = `Showing results for ${found.name} at ${foundLocation}.\n\nSelect a time slot below to book, or refine your search.`;
     } else if (location || specialty || doctorName) {
-      const filterParts: string[] = [];
-      if (location) filterParts.push(`📍 ${location}`);
-      if (specialty) filterParts.push(`🩺 ${specialty}`);
-      if (doctorName) filterParts.push(`👨‍⚕️ ${doctorName}`);
-      msg = `Showing available doctors${filterParts.length ? ` for ${filterParts.join(" · ")}` : ""}.\n\nSelect a time slot below to book, or refine your search.\n\nBook online: ${searchUrl}`;
+      const parts: string[] = [];
+      if (location) parts.push(location);
+      if (specialty) parts.push(specialty);
+      if (doctorName) parts.push(doctorName);
+      msg = `Showing available doctors${parts.length ? ` for ${parts.join(" - ")}` : ""}.\n\nSelect a time slot below to book, or refine your search.`;
     } else {
-      msg = `Here are the available Apollo doctors. Select a time slot to book your appointment.\n\nBook online: ${searchUrl}`;
+      msg = `Here are the available Apollo doctors.\n\nSelect a time slot below to book your appointment.`;
     }
 
     return {
