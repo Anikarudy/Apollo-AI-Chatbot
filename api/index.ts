@@ -1,6 +1,9 @@
 import express, { Request, Response } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import pino from "pino";
 import { GoogleGenerativeAI, FunctionCallingMode } from "@google/generative-ai";
 import Groq from "groq-sdk";
 import axios from "axios";
@@ -14,18 +17,51 @@ import {
 } from "./agentHandlers";
 import { searchDoctors, SEARCH_DOCTORS_TOOL, fuzzySearchAllDoctors } from "./searchDoctors";
 import {
-  findPatient,
-  registerPatient,
-  saveAppointment,
-  getLatestPatientAppointment,
-} from "./db";
+  getPatientService,
+  getAppointmentService,
+  getChatService,
+  getAuditService,
+} from "./services/providers";
 
 dotenv.config();
 
+// ── Structured logger ─────────────────────────────────────────────────────────
+const log = pino({
+  level: process.env.LOG_LEVEL ?? "info",
+  ...(process.env.NODE_ENV !== "production" && {
+    transport: { target: "pino-pretty", options: { colorize: true, ignore: "pid,hostname" } },
+  }),
+});
+
 const app = express();
 const frontendOrigin = process.env.FRONTEND_ORIGIN ?? "http://localhost:5173";
+
+// ── Security headers ──────────────────────────────────────────────────────────
+app.use(helmet());
+
 app.use(cors({ origin: frontendOrigin }));
-app.use(express.json());
+app.use(express.json({ limit: "64kb" }));
+
+// ── Rate limiting ─────────────────────────────────────────────────────────────
+/** General API limit: 120 req/min per IP */
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Please slow down." },
+});
+
+/** AI/LLM endpoints: 20 req/min per IP — more expensive operations */
+const llmLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many AI requests. Please wait a moment." },
+});
+
+app.use(generalLimiter);
 
 // ── Request/response logging middleware ──────────────────────────────────────
 app.use((req, res, next) => {
@@ -33,12 +69,24 @@ app.use((req, res, next) => {
   res.on("finish", () => {
     const ms = Date.now() - start;
     const status = res.statusCode;
-    if (status < 400) {
-      console.log(`[API] ${req.method} ${req.path} → ${status} (${ms}ms)`);
-    } else {
-      console.warn(`[API] ${req.method} ${req.path} → ${status} (${ms}ms)`);
-    }
+    const logFn = status >= 500 ? log.error.bind(log) : status >= 400 ? log.warn.bind(log) : log.info.bind(log);
+    logFn({ method: req.method, path: req.path, status, ms }, `${req.method} ${req.path} ${status}`);
   });
+  next();
+});
+
+// ── Session-ID middleware ─────────────────────────────────────────────────────
+// Reads X-Session-Id header from frontend and makes it available on req.
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace Express {
+    interface Request {
+      sessionId: string;
+    }
+  }
+}
+app.use((req, _res, next) => {
+  req.sessionId = String(req.headers["x-session-id"] ?? "anonymous");
   next();
 });
 const PORT = Number(process.env.PORT ?? 3001);
@@ -468,7 +516,7 @@ async function localPost(path: string, body: Record<string, unknown>, timeoutMs 
 }
 
 // ── 1. LLM chat ───────────────────────────────────────────────────────────────
-app.post("/api/chat", async (req: Request, res: Response): Promise<void> => {
+app.post("/api/chat", llmLimiter, async (req: Request, res: Response): Promise<void> => {
   const payload = (req.body ?? {}) as ChatRequest;
   const currentState = String(payload.currentState ?? "MAIN_MENU");
   const context = payload.context ?? {};
@@ -563,12 +611,20 @@ GENERAL:
   const history = (payload.history ?? []).slice(-8);
 
   try {
-    console.log(`[LLM] /api/chat invoked — state: ${currentState}, message: ${userMessage ? `"${userMessage}"` : "(none)"}`);
+    log.info({ sessionId: req.sessionId, state: currentState }, "/api/chat invoked");
+    // Log user message (fire-and-forget)
+    if (userMessage) {
+      void getChatService().logMessage({ sessionId: req.sessionId, role: "user", message: userMessage, machineState: currentState });
+    }
     const text = await callLlm(systemPrompt, userContent, history);
+    // Log bot response (fire-and-forget)
+    if (text) {
+      void getChatService().logMessage({ sessionId: req.sessionId, role: "bot", message: text, machineState: currentState, agentAction: "chat_response" });
+    }
     res.json({ text });
   } catch (err: unknown) {
     const error = err as { message?: string };
-    console.error("[LLM /api/chat error]", error.message ?? err);
+    log.error({ err, sessionId: req.sessionId }, "/api/chat error");
     res.json({ text: null, error: error.message ?? "LLM unavailable" });
   }
 });
@@ -1623,7 +1679,7 @@ interface SaveAppointmentRequest {
  * Check if a patient exists by mobile, UHID, or name+DOB.
  * Returns { found: true, patient } or { found: false }.
  */
-app.post("/api/patient/lookup", (req: Request, res: Response): void => {
+app.post("/api/patient/lookup", async (req: Request, res: Response): Promise<void> => {
   const { mobile, uhid, name, dob } = (req.body ?? {}) as PatientLookupRequest;
 
   if (!mobile && !uhid && !(name && dob)) {
@@ -1631,9 +1687,9 @@ app.post("/api/patient/lookup", (req: Request, res: Response): void => {
     return;
   }
 
-  console.log(`[patient/lookup] mobile=${mobile ?? "-"} uhid=${uhid ?? "-"} name=${name ?? "-"}`);
+  log.info({ sessionId: req.sessionId, mobile: mobile ?? "-", uhid: uhid ?? "-" }, "patient/lookup");
 
-  const patient = findPatient(mobile, uhid, name, dob);
+  const patient = await getPatientService().findPatient({ mobile, uhid, name, dob });
   if (patient) {
     res.json({ found: true, patient });
   } else {
@@ -1646,7 +1702,7 @@ app.post("/api/patient/lookup", (req: Request, res: Response): void => {
  * Create a new patient record. Returns the created patient with generated UHID.
  * If mobile already registered, returns the existing record (idempotent).
  */
-app.post("/api/patient/register", (req: Request, res: Response): void => {
+app.post("/api/patient/register", async (req: Request, res: Response): Promise<void> => {
   const { name, mobile, dob } = (req.body ?? {}) as PatientRegisterRequest;
 
   if (!name || !mobile || !dob) {
@@ -1660,14 +1716,16 @@ app.post("/api/patient/register", (req: Request, res: Response): void => {
     return;
   }
 
-  console.log(`[patient/register] name=${name} mobile=${mobile} dob=${dob}`);
+  log.info({ sessionId: req.sessionId, name, mobile }, "patient/register");
 
   try {
-    const patient = registerPatient(name, mobile, dob);
+    const patient = await getPatientService().registerPatient(name, mobile, dob);
+    // Fire-and-forget audit
+    void getAuditService().logEvent({ sessionId: req.sessionId, eventType: "patient_registered", payload: { uhid: patient.uhid, mobile } });
     res.json({ patient });
   } catch (err: unknown) {
     const e = err as { message?: string };
-    console.error("[patient/register] Error:", e.message ?? err);
+    log.error({ err }, "patient/register failed");
     res.status(500).json({ error: e.message ?? "Failed to register patient" });
   }
 });
@@ -1676,7 +1734,7 @@ app.post("/api/patient/register", (req: Request, res: Response): void => {
  * POST /api/patient/appointment
  * Save a confirmed appointment for an existing patient (looked up by mobile).
  */
-app.post("/api/patient/appointment", (req: Request, res: Response): void => {
+app.post("/api/patient/appointment", async (req: Request, res: Response): Promise<void> => {
   const { mobile, appointmentId, doctorName, date, slot, status } = (req.body ?? {}) as SaveAppointmentRequest;
 
   if (!mobile) {
@@ -1684,27 +1742,29 @@ app.post("/api/patient/appointment", (req: Request, res: Response): void => {
     return;
   }
 
-  const patient = findPatient(mobile);
+  const patient = await getPatientService().findPatient({ mobile });
   if (!patient) {
     res.status(404).json({ error: "Patient not found. Register the patient first." });
     return;
   }
 
-  console.log(`[patient/appointment] patientId=${patient.id} doctor=${doctorName ?? "-"} date=${date ?? "-"}`);
+  log.info({ sessionId: req.sessionId, patientId: patient.id, doctorName: doctorName ?? "-", date: date ?? "-" }, "patient/appointment");
 
   try {
-    const appt = saveAppointment(
-      patient.id,
-      appointmentId ?? null,
-      doctorName ?? null,
-      date ?? null,
-      slot ?? null,
-      status ?? "confirmed"
-    );
+    const appt = await getAppointmentService().saveAppointment({
+      patientId: patient.id,
+      appointmentId: appointmentId ?? null,
+      doctorName: doctorName ?? null,
+      date: date ?? null,
+      slot: slot ?? null,
+      status: status ?? "confirmed",
+    });
+    // Fire-and-forget audit
+    void getAuditService().logEvent({ sessionId: req.sessionId, eventType: "appointment_saved", payload: { appointmentId: appointmentId ?? null, doctorName: doctorName ?? null, date: date ?? null } });
     res.json({ appointment: appt });
   } catch (err: unknown) {
     const e = err as { message?: string };
-    console.error("[patient/appointment] Error:", e.message ?? err);
+    log.error({ err }, "patient/appointment failed");
     res.status(500).json({ error: e.message ?? "Failed to save appointment" });
   }
 });
@@ -1717,7 +1777,7 @@ app.post("/api/patient/appointment", (req: Request, res: Response): void => {
  * ONLY retrieves data when user explicitly asks.
  * NEVER returns all records.
  */
-app.post("/api/patient/details", (req: Request, res: Response): void => {
+app.post("/api/patient/details", async (req: Request, res: Response): Promise<void> => {
   const { mobile, uhid, name, dob } = (req.body ?? {}) as PatientLookupRequest;
 
   if (!mobile && !uhid && !(name && dob)) {
@@ -1725,9 +1785,9 @@ app.post("/api/patient/details", (req: Request, res: Response): void => {
     return;
   }
 
-  console.log(`[patient/details] mobile=${mobile ?? "-"} uhid=${uhid ?? "-"} name=${name ?? "-"}`);
+  log.info({ sessionId: req.sessionId, mobile: mobile ?? "-", uhid: uhid ?? "-" }, "patient/details");
 
-  const record = getLatestPatientAppointment(mobile, uhid, name, dob);
+  const record = await getAppointmentService().getLatestAppointment({ mobile, uhid, name, dob });
 
   if (record) {
     res.json({ found: true, record });
@@ -1808,7 +1868,7 @@ const VALID_AGENT_ACTIONS: AgentDecisionAction[] = [
  *   - It NEVER calls EDOC APIs, reads/writes patient DB, or returns auth credentials.
  *   - All transactional execution happens in the XState machine + dedicated API routes.
  */
-app.post("/api/agent/decide", async (req: Request, res: Response): Promise<void> => {
+app.post("/api/agent/decide", llmLimiter, async (req: Request, res: Response): Promise<void> => {
   if (!hasAnyLlm) {
     res.json(AGENT_DECIDE_FALLBACK);
     return;
@@ -1948,13 +2008,35 @@ The user's interface language is "${userLanguage}". When action is ASK_CLARIFICA
     res.json(decision);
   } catch (err: unknown) {
     const e = err as { message?: string };
-    console.warn("[AGENT/decide] LLM parse/call error, falling back:", e.message ?? err);
+    log.warn({ err: e.message, sessionId: req.sessionId }, "AGENT/decide LLM parse/call error, falling back");
     res.json(AGENT_DECIDE_FALLBACK);
   }
 });
 
+// ── Health check ──────────────────────────────────────────────────────────────
+app.get("/health", (_req: Request, res: Response) => {
+  res.json({ status: "ok", ts: new Date().toISOString(), provider: process.env.DATA_PROVIDER ?? "sqlite" });
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
-  console.log(`Apollo Assist backend running on http://localhost:${PORT}`);
+const server = app.listen(PORT, () => {
+  log.info({ port: PORT, provider: process.env.DATA_PROVIDER ?? "sqlite" }, "Apollo Assist backend started");
 });
+
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+function shutdown(signal: string) {
+  log.info({ signal }, "Received shutdown signal, closing server...");
+  server.close(() => {
+    log.info("HTTP server closed");
+    process.exit(0);
+  });
+  // Force-kill after 10 s if connections are stuck
+  setTimeout(() => {
+    log.error("Graceful shutdown timed out, forcing exit");
+    process.exit(1);
+  }, 10000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT",  () => shutdown("SIGINT"));

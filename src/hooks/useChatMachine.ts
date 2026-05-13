@@ -255,7 +255,20 @@ function buildSummary(prev: string, event: SummaryEvent): string {
 }
 
 
+/** Retrieve or create a persistent session ID stored in localStorage. */
+function getOrCreateSessionId(): string {
+  const KEY = "apollo_session_id";
+  const existing = localStorage.getItem(KEY);
+  if (existing) return existing;
+  const id = crypto.randomUUID();
+  localStorage.setItem(KEY, id);
+  return id;
+}
+
 export function useChatMachine() {
+  // Stable session identifier — created once per browser and sent as X-Session-Id header
+  const sessionIdRef = useRef<string>(getOrCreateSessionId());
+
   const runnerRef = useRef<ApolloAssistRunner | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   // Keep ref in sync with state so callbacks can read current messages without dep issues
@@ -1402,7 +1415,7 @@ export function useChatMachine() {
       setIsLlmLoading(true);
       const res = await fetch("/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "X-Session-Id": sessionIdRef.current },
         body: JSON.stringify({
           currentState: state,
           context: ctx,
@@ -1611,7 +1624,7 @@ export function useChatMachine() {
       }));
       const res = await fetch("/api/agent/decide", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "X-Session-Id": sessionIdRef.current },
         body: JSON.stringify({
           currentState,
           machineContext: machineCtx,
