@@ -9,15 +9,18 @@
     "esModuleInterop": true,
     "resolveJsonModule": true,
     "skipLibCheck": true,
-    "outDir": "dist-server",
-    "rootDir": "."
+    "outDir": "../dist-server",
+    "rootDir": ".."
   },
   "include": [
-    "api",
-    "apolloAssistMachine.ts",
-    "src/inputMapping.ts",
-    "src/stateResponses.ts",
-    "src/knowledgeBase.ts",
-    "data/**/*.json"
+    ".",
+    "../frontend/apolloAssistMachine.ts",
+    "../frontend/src/inputMapping.ts",
+    "../frontend/src/stateResponses.ts",
+    "../frontend/src/knowledgeBase.ts",
+    "../data/**/*.json"
+  ],
+  "exclude": [
+    "prisma.config.ts"
   ]
 }

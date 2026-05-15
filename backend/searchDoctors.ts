@@ -10,8 +10,8 @@
 
 import Fuse from "fuse.js";
 import { SchemaType, FunctionDeclaration, Schema } from "@google/generative-ai";
-import { doctors, fuzzyDoctorsByName } from "../src/knowledgeBase";
-export { fuzzyDoctorsByName as fuzzySearchAllDoctors } from "../src/knowledgeBase";
+import { doctors, fuzzyDoctorsByName } from "../frontend/src/knowledgeBase";
+export { fuzzyDoctorsByName as fuzzySearchAllDoctors } from "../frontend/src/knowledgeBase";
 
 export interface ToolDoctor {
   name: string;

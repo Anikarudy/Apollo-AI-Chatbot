@@ -13,6 +13,6 @@
     "resolveJsonModule": true,
     "allowSyntheticDefaultImports": true
   },
-  "include": ["src", "apolloAssistMachine.ts"],
-  "exclude": ["node_modules", "dist", "server"]
+  "include": ["frontend/src", "frontend/apolloAssistMachine.ts"],
+  "exclude": ["node_modules", "dist", "backend"]
 }

@@ -376,14 +376,63 @@ export function useChatMachine() {
   const noLiveDatesNoticeKey = useRef<string>("");
   const similarNameNoticeKey = useRef<string>("");
 
-  // Initialize runner once
+  // Initialize runner once; attempt session hydration before showing welcome
   useEffect(() => {
     const runner = new ApolloAssistRunner();
     runnerRef.current = runner;
     const initial = runner.currentState;
     setCurrentState(initial);
-    const welcome = getStateResponse(initial);
-    setMessages([{ id: nextId(), sender: "bot", text: welcome.message }]);
+
+    const sid = sessionIdRef.current;
+
+    // Retry helper: backend may not be up yet when the frontend starts in dev.
+    // Tries up to maxAttempts times with a linear backoff (1s, 2s …).
+    // On every failure we just wait and retry silently; final failure shows welcome.
+    const fetchWithRetry = async (
+      url: string,
+      opts: RequestInit,
+      maxAttempts = 4,
+      delayMs = 1000,
+    ): Promise<Response> => {
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          const r = await fetch(url, opts);
+          return r;
+        } catch {
+          if (attempt === maxAttempts) throw new Error("backend unavailable");
+          await new Promise((resolve) => setTimeout(resolve, delayMs * attempt));
+        }
+      }
+      throw new Error("backend unavailable");
+    };
+
+    void fetchWithRetry(
+      `/api/session/${encodeURIComponent(sid)}`,
+      { headers: { "X-Session-Id": sid } },
+    )
+      .then((r) => (r.ok ? (r.json() as Promise<{ messages?: Array<{ role: string; message: string }> }>) : Promise.resolve(null)))
+      .then((data) => {
+        const msgs = data?.messages ?? [];
+        if (msgs.length > 0) {
+          // Restore prior conversation — no welcome injection
+          setMessages(
+            msgs.map((m) => ({
+              id:     nextId(),
+              sender: (m.role === "user" ? "user" : "bot") as "user" | "bot",
+              text:   m.message,
+            }))
+          );
+        } else {
+          // No history: show greeting as normal
+          const welcome = getStateResponse(initial);
+          setMessages([{ id: nextId(), sender: "bot", text: welcome.message }]);
+        }
+      })
+      .catch(() => {
+        const welcome = getStateResponse(initial);
+        setMessages([{ id: nextId(), sender: "bot", text: welcome.message }]);
+      });
+
     return () => runner.stop();
   }, []);
 
@@ -392,6 +441,14 @@ export function useChatMachine() {
     const resp = getStateResponse(state, ctx);
     const msgId = nextId();
     setMessages((prev) => [...prev, { id: msgId, sender: "bot", text: resp.message }]);
+
+    // Persist bot message so session restore shows it on page refresh.
+    // Inline fetch (not logInteraction) to avoid a circular useCallback dependency.
+    void fetch("/api/log-interaction", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Session-Id": sessionIdRef.current },
+      body: JSON.stringify({ message: resp.message, messageType: "system_event", machineState: state, role: "bot" }),
+    }).catch(() => {});
 
     // Background-translate the static message when the UI language is non-English.
     // The English text is shown immediately; we replace it once the translation arrives.
@@ -2038,12 +2095,28 @@ export function useChatMachine() {
     [currentState, pushLlmBotMessage, pushLlmDirect, tryAgentDecide, tryAiIntent, detectAndSetLanguage]
   );
 
+  /**
+   * Fire-and-forget: logs a structured button interaction to the audit DB.
+   * Never throws — DB failures must not affect chatbot UX.
+   */
+  const logInteraction = useCallback(
+    (message: string, messageType: string, buttonLabel?: string, buttonValue?: string) => {
+      void fetch("/api/log-interaction", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Session-Id": sessionIdRef.current },
+        body: JSON.stringify({ message, messageType, buttonLabel, buttonValue, machineState: currentState }),
+      }).catch(() => {});
+    },
+    [currentState]
+  );
+
   const sendQuickReply = useCallback(
     (label: string, eventType: string, value?: string) => {
       setMessages((prev) => [...prev, { id: nextId(), sender: "user", text: label }]);
+      logInteraction(label, "quick_reply", label, eventType);
       sendEvent(eventType, value);
     },
-    [sendEvent]
+    [sendEvent, logInteraction]
   );
 
   /**
@@ -2076,9 +2149,15 @@ export function useChatMachine() {
         date: edocDate,
         time: startTime,
       }));
+      logInteraction(
+        `Book ${doctor.name} · ${edocDate} at ${startTime}`,
+        "slot_selection",
+        `${doctor.name} · ${edocDate} at ${startTime}`,
+        "SELECT_SLOT"
+      );
       sendEvent("SELECT_SLOT", payload);
     },
-    [sendEvent, machineCtx.city, machineCtx.branch]
+    [sendEvent, logInteraction, machineCtx.city, machineCtx.branch]
   );
 
   /**
@@ -2108,9 +2187,15 @@ export function useChatMachine() {
         city: machineCtx.city,
         branch: machineCtx.branch,
       }));
+      logInteraction(
+        `Request appointment with ${doctor.name}`,
+        "doctor_selection",
+        doctor.name,
+        "SELECT_SLOT"
+      );
       sendEvent("SELECT_SLOT", payload);
     },
-    [sendEvent, machineCtx.city, machineCtx.branch]
+    [sendEvent, logInteraction, machineCtx.city, machineCtx.branch]
   );
 
   const resetMachine = useCallback(() => {
@@ -2134,6 +2219,10 @@ export function useChatMachine() {
     userLanguageRef.current = "en";
     setUserLanguage("en");
     setTranslatedQuickReplies(null);
+    // Generate a fresh session ID so the new conversation is stored separately
+    const newSessionId = crypto.randomUUID();
+    localStorage.setItem("apollo_session_id", newSessionId);
+    sessionIdRef.current = newSessionId;
     setMessages([{ id: nextId(), sender: "bot", text: getStateResponse(initial).message }]);
   }, []);
 

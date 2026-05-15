@@ -1,0 +1,46 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model ChatSession {
+  id        String   @id @default(uuid())
+  sessionId String   @unique
+  language  String   @default("en")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages ChatMessage[]
+}
+
+model ChatMessage {
+  id           String   @id @default(uuid())
+  sessionId    String
+  role         String   // "user" | "bot"
+  message      String
+  messageType  String?  // "text" | "quick_reply" | "card" etc.
+  buttonLabel String?
+  buttonValue String?
+  machineState String?  // XState state name at time of message
+  agentAction  String?  // agent/decide action taken
+  metadata     Json?    // arbitrary key-value for debugging
+  createdAt    DateTime @default(now())
+
+  session ChatSession @relation(fields: [sessionId], references: [sessionId])
+
+  @@index([sessionId])
+}
+
+model AuditEvent {
+  id        String   @id @default(uuid())
+  sessionId String
+  eventType String   // e.g. "workflow_switch" | "booking_success" | "booking_failure" | "api_failure" | "button_click"
+  payload   Json?    // arbitrary structured data for this event
+  createdAt DateTime @default(now())
+
+  @@index([sessionId])
+}

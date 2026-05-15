@@ -7,7 +7,7 @@ import pino from "pino";
 import { GoogleGenerativeAI, FunctionCallingMode } from "@google/generative-ai";
 import Groq from "groq-sdk";
 import axios from "axios";
-import { buildDoctorSearchUrl, contacts, getDoctorsByName, getDoctorsForLocation, getLocationFallbacksForCity, doctors, hospitalsByCity } from "../src/knowledgeBase";
+import { buildDoctorSearchUrl, contacts, getDoctorsByName, getDoctorsForLocation, getLocationFallbacksForCity, doctors, hospitalsByCity } from "../frontend/src/knowledgeBase";
 import { getLocationFromBranch } from "../data/locationMap";
 import {
   mapBookAppointmentForAgent,
@@ -16,12 +16,9 @@ import {
   mapSlotsForAgent,
 } from "./agentHandlers";
 import { searchDoctors, SEARCH_DOCTORS_TOOL, fuzzySearchAllDoctors } from "./searchDoctors";
-import {
-  getPatientService,
-  getAppointmentService,
-  getChatService,
-  getAuditService,
-} from "./services/providers";
+import { upsertSession, getSession } from "./services/chatSessionService";
+import { logMessage } from "./services/chatMessageService";
+import { logEvent } from "./services/auditService";
 
 dotenv.config();
 
@@ -457,6 +454,12 @@ interface ChatRequest {
   summary?: string;
   /** ISO 639-1 language code detected from the user's messages (e.g. "te", "hi"). */
   userLanguage?: string;
+  /** Interaction type for structured logging: "text" | "quick_reply" | "doctor_selection" | "slot_selection" | "system_event" */
+  messageType?: string;
+  /** Display label of the button the user clicked (quick reply / doctor card / slot). */
+  buttonLabel?: string;
+  /** Machine value / event type of the button clicked. */
+  buttonValue?: string;
 }
 
 type AgentAction = "fetch_doctors" | "get_live_slots" | "book_appointment" | "unknown";
@@ -559,6 +562,9 @@ app.post("/api/chat", chatLimiter, async (req: Request, res: Response): Promise<
   const userMessage = payload.userMessage;
   const summary = (payload.summary ?? "").trim();
   const userLanguage = String(payload.userLanguage ?? "").trim();
+  const messageType = payload.messageType;
+  const buttonLabel = payload.buttonLabel;
+  const buttonValue = payload.buttonValue;
 
   if (!hasAnyLlm) {
     res.status(503).json({ error: NO_LLM_ERROR });
@@ -648,15 +654,36 @@ GENERAL:
 
   try {
     log.info({ sessionId: req.sessionId, state: currentState }, "/api/chat invoked");
-    // Log user message (fire-and-forget — never crashes the request)
+
+    // Upsert session row (fire-and-forget — never blocks the LLM call)
+    void upsertSession(req.sessionId, userLanguage || "en").catch(() => {});
+
+    // Log inbound user message
     if (userMessage) {
-      void getChatService().logMessage({ sessionId: req.sessionId, role: "user", message: userMessage, machineState: currentState }).catch(() => {});
+      void logMessage({
+        sessionId:    req.sessionId,
+        role:         "user",
+        message:      userMessage,
+        messageType:  messageType ?? "text",
+        buttonLabel:  buttonLabel,
+        buttonValue:  buttonValue,
+        machineState: currentState,
+      }).catch(() => {});
     }
+
     const text = await callLlm(systemPrompt, userContent, history);
-    // Log bot response (fire-and-forget)
+
+    // Log outbound bot reply
     if (text) {
-      void getChatService().logMessage({ sessionId: req.sessionId, role: "bot", message: text, machineState: currentState, agentAction: "chat_response" }).catch(() => {});
+      void logMessage({
+        sessionId:    req.sessionId,
+        role:         "bot",
+        message:      text,
+        machineState: currentState,
+        agentAction:  "chat_response",
+      }).catch(() => {});
     }
+
     res.json({ text });
   } catch (err: unknown) {
     const error = err as { message?: string };
@@ -665,7 +692,39 @@ GENERAL:
   }
 });
 
-// ── 1b. Intent parsing ────────────────────────────────────────────────────────
+// ── 1b. Structured interaction logging ────────────────────────────────────────
+// Called by the frontend for button clicks (quick replies, doctor selections, slot picks)
+// that do NOT go through /api/chat (they trigger static state transitions instead).
+interface LogInteractionRequest {
+  message: string;
+  messageType: string;   // "quick_reply" | "doctor_selection" | "slot_selection" | "system_event"
+  buttonLabel?: string;
+  buttonValue?: string;
+  machineState?: string;
+  role?: "user" | "bot";  // defaults to "user" if omitted
+}
+
+app.post("/api/log-interaction", generalLimiter, async (req: Request, res: Response): Promise<void> => {
+  const body = (req.body ?? {}) as LogInteractionRequest;
+  if (!body.message || !body.messageType) {
+    res.status(400).json({ error: "message and messageType required" });
+    return;
+  }
+  // Ensure session row exists before inserting child message
+  void upsertSession(req.sessionId).catch(() => {});
+  void logMessage({
+    sessionId:    req.sessionId,
+    role:         body.role ?? "user",
+    message:      body.message,
+    messageType:  body.messageType,
+    buttonLabel:  body.buttonLabel,
+    buttonValue:  body.buttonValue,
+    machineState: body.machineState,
+  }).catch(() => {});
+  res.json({ ok: true });
+});
+
+// ── 1c. Intent parsing ────────────────────────────────────────────────────────
 interface IntentRequest { message: string; cities: string[]; specialties: string[]; history?: Array<{ role: "user" | "assistant"; text: string }>; currentState?: string; }
 export interface ParsedIntent {
   intent: "book_appointment" | "find_doctor" | "health_checkup" | "have_symptoms" | "emergency" | "change_doctor" | "unknown";
@@ -878,10 +937,10 @@ app.get("/api/doctors", async (req: Request, res: Response): Promise<void> => {
     const strictMatched = getDoctorsByName(name, 200);
     let matched = strictMatched.length > 0 ? strictMatched : fuzzySearchAllDoctors(name, 200);
 
-    if (city)    matched = matched.filter(d => d.location.toLowerCase() === city.toUpperCase().toLowerCase());
-    if (branch)  matched = matched.filter(d => d.branch.toLowerCase() === branch.toUpperCase().toLowerCase());
+    if (city)    matched = matched.filter((d: {location: string}) => d.location.toLowerCase() === city.toUpperCase().toLowerCase());
+    if (branch)  matched = matched.filter((d: {branch: string}) => d.branch.toLowerCase() === branch.toUpperCase().toLowerCase());
     // Also filter by specialty if provided (e.g. user searched by name AND changed to specialty)
-    if (specialty) matched = matched.filter(d => {
+    if (specialty) matched = matched.filter((d: {speciality: string}) => {
       const ds = normaliseSpecialty(d.speciality);
       return ds === specNorm || ds === specialty.toLowerCase();
     });
@@ -1138,10 +1197,25 @@ app.post("/api/edoc/book-appointment", bookingLimiter, async (req: Request, res:
     const r = await axios.post(`${EDOC_BASE}/api/EDOC/BookAppointment`, b, { headers: edocHeaders(), timeout: 15000 });
     logEdoc("BookAppointment.response", r.data);
     console.log("[EDOC] BookAppointment succeeded (200 OK)");
+    // Audit: booking success
+    void logEvent(req.sessionId, "booking_success", {
+      appointmentId: (r.data as Record<string, unknown>).AppointmentID,
+      resourceId:    b.ResourceID,
+      locationId:    b.LocationID,
+      uhid:          b.UHIDNumber,
+      startDateTime: b.StartDateTime,
+    }).catch(() => {});
     res.json(r.data);
   } catch (err: unknown) {
     const e = err as { message?: string; response?: { data: unknown } };
     logEdoc("BookAppointment.error", { message: e.message, response: e.response?.data });
+    // Audit: booking failure
+    void logEvent(req.sessionId, "booking_failure", {
+      error:         String(e.message ?? "unknown"),
+      resourceId:    b.ResourceID,
+      locationId:    b.LocationID,
+      startDateTime: b.StartDateTime,
+    }).catch(() => {});
     res.status(500).json({ error: e.response?.data ?? e.message ?? "BookAppointment failed" });
   }
 });
@@ -1685,154 +1759,6 @@ Examples of when to call the tool:
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ── Patient Memory Endpoints (SQLite-backed) ──────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
-
-interface PatientLookupRequest {
-  mobile?: string;
-  uhid?: string;
-  name?: string;
-  dob?: string;
-}
-
-interface PatientRegisterRequest {
-  name: string;
-  mobile: string;
-  dob: string;
-}
-
-interface SaveAppointmentRequest {
-  mobile: string;
-  appointmentId?: string;
-  doctorName?: string;
-  date?: string;
-  slot?: string;
-  status?: string;
-}
-
-/**
- * POST /api/patient/lookup
- * Check if a patient exists by mobile, UHID, or name+DOB.
- * Returns { found: true, patient } or { found: false }.
- */
-app.post("/api/patient/lookup", async (req: Request, res: Response): Promise<void> => {
-  const { mobile, uhid, name, dob } = (req.body ?? {}) as PatientLookupRequest;
-
-  if (!mobile && !uhid && !(name && dob)) {
-    res.status(400).json({ error: "Provide mobile, uhid, or both name and dob" });
-    return;
-  }
-
-  log.info({ sessionId: req.sessionId, mobile: mobile ?? "-", uhid: uhid ?? "-" }, "patient/lookup");
-
-  const patient = await getPatientService().findPatient({ mobile, uhid, name, dob });
-  if (patient) {
-    res.json({ found: true, patient });
-  } else {
-    res.json({ found: false });
-  }
-});
-
-/**
- * POST /api/patient/register
- * Create a new patient record. Returns the created patient with generated UHID.
- * If mobile already registered, returns the existing record (idempotent).
- */
-app.post("/api/patient/register", async (req: Request, res: Response): Promise<void> => {
-  const { name, mobile, dob } = (req.body ?? {}) as PatientRegisterRequest;
-
-  if (!name || !mobile || !dob) {
-    res.status(400).json({ error: "name, mobile, and dob are required" });
-    return;
-  }
-
-  // Basic format validation for dob (YYYY-MM-DD)
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(dob.trim())) {
-    res.status(400).json({ error: "dob must be in YYYY-MM-DD format" });
-    return;
-  }
-
-  log.info({ sessionId: req.sessionId, name, mobile }, "patient/register");
-
-  try {
-    const patient = await getPatientService().registerPatient(name, mobile, dob);
-    // Fire-and-forget audit
-    void getAuditService().logEvent({ sessionId: req.sessionId, eventType: "patient_registered", payload: { uhid: patient.uhid, mobile } });
-    res.json({ patient });
-  } catch (err: unknown) {
-    const e = err as { message?: string };
-    log.error({ err }, "patient/register failed");
-    res.status(500).json({ error: e.message ?? "Failed to register patient" });
-  }
-});
-
-/**
- * POST /api/patient/appointment
- * Save a confirmed appointment for an existing patient (looked up by mobile).
- */
-app.post("/api/patient/appointment", async (req: Request, res: Response): Promise<void> => {
-  const { mobile, appointmentId, doctorName, date, slot, status } = (req.body ?? {}) as SaveAppointmentRequest;
-
-  if (!mobile) {
-    res.status(400).json({ error: "mobile is required" });
-    return;
-  }
-
-  const patient = await getPatientService().findPatient({ mobile });
-  if (!patient) {
-    res.status(404).json({ error: "Patient not found. Register the patient first." });
-    return;
-  }
-
-  log.info({ sessionId: req.sessionId, patientId: patient.id, doctorName: doctorName ?? "-", date: date ?? "-" }, "patient/appointment");
-
-  try {
-    const appt = await getAppointmentService().saveAppointment({
-      patientId: patient.id,
-      appointmentId: appointmentId ?? null,
-      doctorName: doctorName ?? null,
-      date: date ?? null,
-      slot: slot ?? null,
-      status: status ?? "confirmed",
-    });
-    // Fire-and-forget audit
-    void getAuditService().logEvent({ sessionId: req.sessionId, eventType: "appointment_saved", payload: { appointmentId: appointmentId ?? null, doctorName: doctorName ?? null, date: date ?? null } });
-    res.json({ appointment: appt });
-  } catch (err: unknown) {
-    const e = err as { message?: string };
-    log.error({ err }, "patient/appointment failed");
-    res.status(500).json({ error: e.message ?? "Failed to save appointment" });
-  }
-});
-
-/**
- * POST /api/patient/details
- * Retrieve the most recent appointment + patient info.
- * Returns { found: true, record } or { found: false }.
- *
- * ONLY retrieves data when user explicitly asks.
- * NEVER returns all records.
- */
-app.post("/api/patient/details", async (req: Request, res: Response): Promise<void> => {
-  const { mobile, uhid, name, dob } = (req.body ?? {}) as PatientLookupRequest;
-
-  if (!mobile && !uhid && !(name && dob)) {
-    res.status(400).json({ error: "Provide mobile, uhid, or both name and dob" });
-    return;
-  }
-
-  log.info({ sessionId: req.sessionId, mobile: mobile ?? "-", uhid: uhid ?? "-" }, "patient/details");
-
-  const record = await getAppointmentService().getLatestAppointment({ mobile, uhid, name, dob });
-
-  if (record) {
-    res.json({ found: true, record });
-  } else {
-    res.json({ found: false, message: "No appointment found. Would you like to book one?" });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
 // ── Agent Orchestration Decision  (POST /api/agent/decide) ───────────────────
 // The LLM proposes a structured action; XState + tools execute it safely.
 // The LLM NEVER touches EDOC APIs, patient DB, or auth keys.
@@ -2041,11 +1967,54 @@ The user's interface language is "${userLanguage}". When action is ASK_CLARIFICA
       `[AGENT/decide] → action="${decision.action}" workflow="${decision.targetWorkflow ?? "-"}" ` +
       `confidence=${decision.confidence} reason="${decision.reason}"`
     );
+    // Audit: workflow switch events
+    if (decision.action === "SWITCH_WORKFLOW" && decision.targetWorkflow) {
+      void logEvent(req.sessionId, "workflow_switch", {
+        targetWorkflow: decision.targetWorkflow,
+        fromState:      botState,
+        userMessage,
+        confidence:     decision.confidence,
+        entities:       decision.entities,
+      }).catch(() => {});
+    }
     res.json(decision);
   } catch (err: unknown) {
     const e = err as { message?: string };
     log.warn({ err: e.message, sessionId: req.sessionId }, "AGENT/decide LLM parse/call error, falling back");
     res.json(AGENT_DECIDE_FALLBACK);
+  }
+});
+
+// ── Session history (used by frontend for page-refresh restoration) ────────────
+app.get("/api/session/:sessionId", generalLimiter, async (req: Request, res: Response): Promise<void> => {
+  const { sessionId } = req.params;
+  if (!sessionId || typeof sessionId !== "string") {
+    res.status(400).json({ error: "sessionId required", messages: [] });
+    return;
+  }
+  try {
+    const session = await getSession(sessionId, 100);
+    if (!session) {
+      // Not a hard error — brand-new session just has no history yet
+      res.status(404).json({ sessionId, messages: [] });
+      return;
+    }
+    res.json({
+      sessionId: session.sessionId,
+      language:  session.language,
+      messages:  session.messages.map((m) => ({
+        role:         m.role,
+        message:      m.message,
+        messageType:  m.messageType,
+        buttonLabel:  m.buttonLabel,
+        buttonValue:  m.buttonValue,
+        machineState: m.machineState,
+        createdAt:    m.createdAt,
+      })),
+    });
+  } catch (err) {
+    log.error({ err }, "GET /api/session/:sessionId error");
+    res.status(500).json({ error: "Failed to load session", messages: [] });
   }
 });
 
@@ -2058,6 +2027,11 @@ app.get("/health", (_req: Request, res: Response) => {
 
 const server = app.listen(PORT, () => {
   log.info({ port: PORT, provider: process.env.DATA_PROVIDER ?? "sqlite" }, "Apollo Assist backend started");
+});
+
+server.on("error", (err: NodeJS.ErrnoException) => {
+  log.error({ err: err.message, code: err.code }, "Server failed to start");
+  process.exit(1);
 });
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────

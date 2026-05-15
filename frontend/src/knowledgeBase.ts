@@ -1,6 +1,6 @@
 import Fuse from "fuse.js";
-import finalDoctorsRaw from "../data/finalDoctors.json";
-import { getLocationFromBranch } from "../data/locationMap";
+import finalDoctorsRaw from "../../data/finalDoctors.json";
+import { getLocationFromBranch } from "../../data/locationMap";
 
 export interface HealthPackage {
   name: string;
