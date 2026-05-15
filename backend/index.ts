@@ -710,8 +710,8 @@ app.post("/api/log-interaction", generalLimiter, async (req: Request, res: Respo
     res.status(400).json({ error: "message and messageType required" });
     return;
   }
-  // Ensure session row exists before inserting child message
-  void upsertSession(req.sessionId).catch(() => {});
+  // Ensure session row exists BEFORE inserting child message (FK constraint)
+  await upsertSession(req.sessionId).catch(() => {});
   void logMessage({
     sessionId:    req.sessionId,
     role:         body.role ?? "user",
