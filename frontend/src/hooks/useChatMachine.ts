@@ -383,55 +383,50 @@ export function useChatMachine() {
     const initial = runner.currentState;
     setCurrentState(initial);
 
-    const sid = sessionIdRef.current;
-
-    // Retry helper: backend may not be up yet when the frontend starts in dev.
-    // Tries up to maxAttempts times with a linear backoff (1s, 2s …).
-    // On every failure we just wait and retry silently; final failure shows welcome.
-    const fetchWithRetry = async (
-      url: string,
-      opts: RequestInit,
-      maxAttempts = 4,
-      delayMs = 1000,
-    ): Promise<Response> => {
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
-          const r = await fetch(url, opts);
-          return r;
-        } catch {
-          if (attempt === maxAttempts) throw new Error("backend unavailable");
-          await new Promise((resolve) => setTimeout(resolve, delayMs * attempt));
-        }
-      }
-      throw new Error("backend unavailable");
+    const showWelcome = () => {
+      const welcome = getStateResponse(initial);
+      setMessages([{ id: nextId(), sender: "bot", text: welcome.message }]);
     };
 
-    void fetchWithRetry(
-      `/api/session/${encodeURIComponent(sid)}`,
-      { headers: { "X-Session-Id": sid } },
-    )
-      .then((r) => (r.ok ? (r.json() as Promise<{ messages?: Array<{ role: string; message: string }> }>) : Promise.resolve(null)))
-      .then((data) => {
-        const msgs = data?.messages ?? [];
-        if (msgs.length > 0) {
-          // Restore prior conversation — no welcome injection
-          setMessages(
-            msgs.map((m) => ({
-              id:     nextId(),
-              sender: (m.role === "user" ? "user" : "bot") as "user" | "bot",
-              text:   m.message,
-            }))
-          );
-        } else {
-          // No history: show greeting as normal
-          const welcome = getStateResponse(initial);
-          setMessages([{ id: nextId(), sender: "bot", text: welcome.message }]);
+    const fetchSession = async (retries = 3, delayMs = 1500): Promise<void> => {
+      const sid = sessionIdRef.current;
+      for (let attempt = 0; attempt < retries; attempt++) {
+        try {
+          const r = await fetch(`/api/session/${encodeURIComponent(sid)}`, {
+            headers: { "X-Session-Id": sid },
+          });
+          if (r.ok) {
+            const data = await r.json() as { messages?: Array<{ role: string; message: string }> };
+            const msgs = data?.messages ?? [];
+            if (msgs.length > 0) {
+              setMessages(
+                msgs.map((m) => ({
+                  id:     nextId(),
+                  sender: (m.role === "user" ? "user" : "bot") as "user" | "bot",
+                  text:   m.message,
+                }))
+              );
+            } else {
+              showWelcome();
+            }
+            return;
+          }
+          if (r.status === 404) {
+            // Brand-new session — no retry needed
+            showWelcome();
+            return;
+          }
+        } catch {
+          // Network error (ECONNREFUSED during startup race) — retry after delay
         }
-      })
-      .catch(() => {
-        const welcome = getStateResponse(initial);
-        setMessages([{ id: nextId(), sender: "bot", text: welcome.message }]);
-      });
+        if (attempt < retries - 1) {
+          await new Promise<void>((res) => setTimeout(res, delayMs));
+        }
+      }
+      showWelcome();
+    };
+
+    void fetchSession();
 
     return () => runner.stop();
   }, []);
