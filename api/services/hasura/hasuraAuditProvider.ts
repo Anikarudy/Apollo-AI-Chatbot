@@ -5,8 +5,8 @@
  * Logs to the audit_events table.
  */
 
-import { IAuditService } from "../interfaces.js";
-import { hasuraQuery } from "./hasuraClient.js";
+import { IAuditService } from "../interfaces";
+import { hasuraQuery } from "./hasuraClient";
 
 const LOG_EVENT = `
   mutation LogAuditEvent($sessionId: String!, $eventType: String!, $payload: jsonb!) {

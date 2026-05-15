@@ -4,8 +4,8 @@
  * Hasura (Postgres) implementation of IAppointmentService.
  */
 
-import { IAppointmentService, Appointment } from "../interfaces.js";
-import { hasuraQuery } from "./hasuraClient.js";
+import { IAppointmentService, Appointment } from "../interfaces";
+import { hasuraQuery } from "./hasuraClient";
 
 const INSERT_APPOINTMENT = `
   mutation InsertAppointment(

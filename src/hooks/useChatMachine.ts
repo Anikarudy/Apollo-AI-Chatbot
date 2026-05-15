@@ -276,6 +276,7 @@ export function useChatMachine() {
   const [currentState, setCurrentState] = useState<string>("WELCOME");
   const [machineCtx, setMachineCtx] = useState<ChatContext>({});
   const [isLlmLoading, setIsLlmLoading] = useState(false);
+  const [rateLimitSeconds, setRateLimitSeconds] = useState<number>(0);
   const [doctorCards, setDoctorCards] = useState<DoctorCardData[]>([]);
   // ID of the bot message after which doctor cards should be rendered inline
   const [cardsAnchorMsgId, setCardsAnchorMsgId] = useState<number | null>(null);
@@ -1425,6 +1426,12 @@ export function useChatMachine() {
           userLanguage: userLanguageRef.current !== "en" ? userLanguageRef.current : undefined,
         }),
       });
+      if (res.status === 429) {
+        const data = await res.json() as { retryAfter?: number };
+        setRateLimitSeconds(data.retryAfter ?? 15);
+        setIsLlmLoading(false);
+        return;
+      }
       if (res.ok) {
         const data = (await res.json()) as { text: string | null };
         if (data.text) {
@@ -1634,6 +1641,11 @@ export function useChatMachine() {
           userLanguage: userLanguageRef.current !== "en" ? userLanguageRef.current : undefined,
         }),
       });
+      if (res.status === 429) {
+        const data = await res.json() as { retryAfter?: number };
+        setRateLimitSeconds(data.retryAfter ?? 15);
+        return null;
+      }
       if (!res.ok) return null;
       const decision = await res.json() as AgentDecision;
       console.log(
@@ -2130,6 +2142,7 @@ export function useChatMachine() {
     currentState,
     machineCtx,
     isLlmLoading,
+    rateLimitSeconds,
     doctorCards,
     cardsAnchorMsgId,
     conversationSummary,

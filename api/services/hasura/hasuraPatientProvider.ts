@@ -4,8 +4,9 @@
  * Hasura (Postgres) implementation of IPatientService.
  */
 
-import { IPatientService, Patient } from "../interfaces.js";
-import { hasuraQuery } from "./hasuraClient.js";
+import { IPatientService, Patient } from "../interfaces";
+import { hasuraQuery } from "./hasuraClient";
+import { randomBytes } from "crypto";
 
 const FIND_PATIENT = `
   query FindPatient($mobile: String, $uhid: String, $name: String, $dob: String) {
@@ -33,8 +34,7 @@ const INSERT_PATIENT = `
 `;
 
 function generateUhid(): string {
-  const { randomBytes } = require("crypto");
-  return (randomBytes(3) as Buffer).toString("hex").toUpperCase();
+  return randomBytes(3).toString("hex").toUpperCase();
 }
 
 export class HasuraPatientProvider implements IPatientService {

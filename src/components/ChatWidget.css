@@ -263,6 +263,20 @@
   color: #2582A1;
 }
 
+/* ── Rate limit banner ─────────────────────────────────── */
+.rate-limit-banner {
+  background: #fff3cd;
+  color: #7a5200;
+  font-size: 12px;
+  text-align: center;
+  padding: 7px 14px;
+  border-top: 1px solid #ffe08a;
+  animation: fadeIn 0.2s ease;
+}
+.rate-limit-banner strong {
+  font-weight: 700;
+}
+
 /* ── Input bar ─────────────────────────────────────────── */
 .chat-input-bar {
   display: flex;
@@ -298,6 +312,11 @@
 .chat-input-field:focus {
   border-color: #2582A1;
   background: #fff;
+}
+.chat-input-field:disabled {
+  background: #f5f5f5;
+  color: #aaa;
+  cursor: not-allowed;
 }
 
 .chat-phone-prefix {

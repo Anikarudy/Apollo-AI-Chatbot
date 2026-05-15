@@ -43,22 +43,58 @@ app.use(cors({ origin: frontendOrigin }));
 app.use(express.json({ limit: "64kb" }));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
-/** General API limit: 120 req/min per IP */
+/** Returns a JSON 429 with a retryAfter field the frontend can read */
+function rateLimitResponse(retryAfterSecs: number) {
+  return {
+    error: "Too many requests",
+    retryAfter: retryAfterSecs,
+    message: `You're sending messages too quickly. Please wait ${retryAfterSecs} seconds and try again.`,
+  };
+}
+
+/** General fallback: 120 req/min */
 const generalLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 120,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: "Too many requests. Please slow down." },
+  message: rateLimitResponse(30),
 });
 
-/** AI/LLM endpoints: 20 req/min per IP — more expensive operations */
-const llmLimiter = rateLimit({
+/** /api/chat and /api/agent/decide: 50 req/min — generous during development */
+const chatLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 20,
+  max: 50,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: "Too many AI requests. Please wait a moment." },
+  message: rateLimitResponse(15),
+});
+
+/** Intent / language helpers: 80 req/min */
+const intentLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 80,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: rateLimitResponse(10),
+});
+
+/** EDOC booking mutations: 5 req/min — strict to prevent double-bookings */
+const bookingLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: rateLimitResponse(60),
+});
+
+/** EDOC calendar/slot reads: 30 req/min */
+const calendarLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: rateLimitResponse(15),
 });
 
 app.use(generalLimiter);
@@ -516,7 +552,7 @@ async function localPost(path: string, body: Record<string, unknown>, timeoutMs 
 }
 
 // ── 1. LLM chat ───────────────────────────────────────────────────────────────
-app.post("/api/chat", llmLimiter, async (req: Request, res: Response): Promise<void> => {
+app.post("/api/chat", chatLimiter, async (req: Request, res: Response): Promise<void> => {
   const payload = (req.body ?? {}) as ChatRequest;
   const currentState = String(payload.currentState ?? "MAIN_MENU");
   const context = payload.context ?? {};
@@ -612,14 +648,14 @@ GENERAL:
 
   try {
     log.info({ sessionId: req.sessionId, state: currentState }, "/api/chat invoked");
-    // Log user message (fire-and-forget)
+    // Log user message (fire-and-forget — never crashes the request)
     if (userMessage) {
-      void getChatService().logMessage({ sessionId: req.sessionId, role: "user", message: userMessage, machineState: currentState });
+      void getChatService().logMessage({ sessionId: req.sessionId, role: "user", message: userMessage, machineState: currentState }).catch(() => {});
     }
     const text = await callLlm(systemPrompt, userContent, history);
     // Log bot response (fire-and-forget)
     if (text) {
-      void getChatService().logMessage({ sessionId: req.sessionId, role: "bot", message: text, machineState: currentState, agentAction: "chat_response" });
+      void getChatService().logMessage({ sessionId: req.sessionId, role: "bot", message: text, machineState: currentState, agentAction: "chat_response" }).catch(() => {});
     }
     res.json({ text });
   } catch (err: unknown) {
@@ -636,7 +672,7 @@ export interface ParsedIntent {
   specialty?: string; city?: string; branch?: string; doctorName?: string; symptomText?: string;
 }
 
-app.post("/api/intent", async (req: Request, res: Response): Promise<void> => {
+app.post("/api/intent", intentLimiter, async (req: Request, res: Response): Promise<void> => {
   if (!hasAnyLlm) { res.json({ intent: "unknown" }); return; }
 
   const { message, cities, specialties, history, currentState: intentState } = req.body as IntentRequest;
@@ -1086,7 +1122,7 @@ app.post("/api/agent/book-appointment", async (req: Request, res: Response): Pro
 // ─────────────────────────────────────────────────────────────────────────────
 
 // 2. Book Appointment
-app.post("/api/edoc/book-appointment", async (req: Request, res: Response): Promise<void> => {
+app.post("/api/edoc/book-appointment", bookingLimiter, async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const b = req.body as Record<string, unknown>;
   if (!b.ResourceID || !b.StartDateTime || !b.LocationID || !b.UHIDNumber) {
@@ -1111,7 +1147,7 @@ app.post("/api/edoc/book-appointment", async (req: Request, res: Response): Prom
 });
 
 // 3. Reschedule Appointment
-app.post("/api/edoc/reschedule-appointment", async (req: Request, res: Response): Promise<void> => {
+app.post("/api/edoc/reschedule-appointment", bookingLimiter, async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const b = req.body as Record<string, unknown>;
   if (!b.AppointmentID || !b.StartDateTime) {
@@ -1133,7 +1169,7 @@ app.post("/api/edoc/reschedule-appointment", async (req: Request, res: Response)
 });
 
 // 4. Cancel Appointment
-app.post("/api/edoc/cancel-appointment", async (req: Request, res: Response): Promise<void> => {
+app.post("/api/edoc/cancel-appointment", bookingLimiter, async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const b = req.body as Record<string, unknown>;
   if (!b.AppointmentID || !b.LocationID) {
@@ -1155,7 +1191,7 @@ app.post("/api/edoc/cancel-appointment", async (req: Request, res: Response): Pr
 });
 
 // 5. Fetch Real-time Slots (DoctorCalenderRules)
-app.post("/api/edoc/slots", async (req: Request, res: Response): Promise<void> => {
+app.post("/api/edoc/slots", calendarLimiter, async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const { resourceId, locationId, regionId, date, city, branch } = req.body as Record<string, string>;
   if (!resourceId || !date) {
@@ -1205,7 +1241,7 @@ app.post("/api/edoc/slots", async (req: Request, res: Response): Promise<void> =
 });
 
 // 6. Fetch Real-time Slots V2 (DoctorCalenderRules_V2)
-app.post("/api/edoc/slots-v2", async (req: Request, res: Response): Promise<void> => {
+app.post("/api/edoc/slots-v2", calendarLimiter, async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const { resourceId, locationId, regionId, date, city, branch } = req.body as Record<string, string>;
   if (!resourceId || !date) {
@@ -1341,7 +1377,7 @@ app.post("/api/edoc/slots-v2", async (req: Request, res: Response): Promise<void
 });
 
 // 7. Get Calendar Details for Online (Medmantra sync)
-app.post("/api/edoc/calendar-details", async (req: Request, res: Response): Promise<void> => {
+app.post("/api/edoc/calendar-details", calendarLimiter, async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const { resourceId, locationId, regionId, date, city, branch } = req.body as Record<string, string>;
   if (!resourceId) {
@@ -1424,7 +1460,7 @@ app.post("/api/edoc/uhid-search", async (req: Request, res: Response): Promise<v
 });
 
 // 9. Doctor Calendar Live Dates
-app.post("/api/edoc/calendar-dates", async (req: Request, res: Response): Promise<void> => {
+app.post("/api/edoc/calendar-dates", calendarLimiter, async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const { resourceId, locationId, regionId, city, branch } = req.body as Record<string, string>;
   if (!resourceId) {
@@ -1868,7 +1904,7 @@ const VALID_AGENT_ACTIONS: AgentDecisionAction[] = [
  *   - It NEVER calls EDOC APIs, reads/writes patient DB, or returns auth credentials.
  *   - All transactional execution happens in the XState machine + dedicated API routes.
  */
-app.post("/api/agent/decide", llmLimiter, async (req: Request, res: Response): Promise<void> => {
+app.post("/api/agent/decide", chatLimiter, async (req: Request, res: Response): Promise<void> => {
   if (!hasAnyLlm) {
     res.json(AGENT_DECIDE_FALLBACK);
     return;

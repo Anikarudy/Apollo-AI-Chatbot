@@ -5,8 +5,8 @@
  * Handles chat_sessions and chat_messages tables.
  */
 
-import { IChatService, ChatSession } from "../interfaces.js";
-import { hasuraQuery } from "./hasuraClient.js";
+import { IChatService, ChatSession } from "../interfaces";
+import { hasuraQuery } from "./hasuraClient";
 
 const UPSERT_SESSION = `
   mutation UpsertSession($sessionId: String!, $language: String) {
@@ -30,7 +30,7 @@ const UPDATE_SESSION_STATE = `
 
 const LOG_MESSAGE = `
   mutation LogMessage(
-    $sessionId: String!
+    $sessionUuid: uuid!
     $role: String!
     $message: String!
     $machineState: String
@@ -38,13 +38,19 @@ const LOG_MESSAGE = `
     $metadata: jsonb
   ) {
     insert_chat_messages_one(object: {
-      session_id: $sessionId
+      session_id: $sessionUuid
       role: $role
       message: $message
       machine_state: $machineState
       agent_action: $agentAction
       metadata: $metadata
     }) { id }
+  }
+`;
+
+const GET_SESSION_UUID = `
+  query GetSessionUuid($sessionId: String!) {
+    chat_sessions(where: { session_id: { _eq: $sessionId } }, limit: 1) { id }
   }
 `;
 
@@ -69,12 +75,27 @@ type HasuraSessionRow = {
 };
 
 export class HasuraChatProvider implements IChatService {
+  /** Cache: session_id (TEXT) → UUID id — avoids an extra query on every message */
+  private readonly uuidCache = new Map<string, string>();
+
+  private async resolveUuid(sessionId: string): Promise<string | null> {
+    if (this.uuidCache.has(sessionId)) return this.uuidCache.get(sessionId)!;
+    const data = await hasuraQuery<{ chat_sessions: { id: string }[] }>(
+      GET_SESSION_UUID, { sessionId }
+    );
+    const uuid = data.chat_sessions[0]?.id ?? null;
+    if (uuid) this.uuidCache.set(sessionId, uuid);
+    return uuid;
+  }
+
   async upsertSession(sessionId: string, language = "en"): Promise<ChatSession> {
     const data = await hasuraQuery<{ insert_chat_sessions_one: HasuraSessionRow }>(
       UPSERT_SESSION,
       { sessionId, language }
     );
     const r = data.insert_chat_sessions_one;
+    // Cache UUID immediately so logMessage never needs an extra round-trip
+    this.uuidCache.set(r.session_id, r.id);
     return {
       id: r.id,
       sessionId: r.session_id,
@@ -99,8 +120,15 @@ export class HasuraChatProvider implements IChatService {
     agentAction?: string;
     metadata?: Record<string, unknown>;
   }): Promise<void> {
+    // Ensure session exists and get its UUID
+    let sessionUuid = await this.resolveUuid(opts.sessionId);
+    if (!sessionUuid) {
+      await this.upsertSession(opts.sessionId);
+      sessionUuid = await this.resolveUuid(opts.sessionId);
+    }
+    if (!sessionUuid) return; // still not found — skip silently
     await hasuraQuery(LOG_MESSAGE, {
-      sessionId: opts.sessionId,
+      sessionUuid,
       role: opts.role,
       message: opts.message,
       machineState: opts.machineState ?? null,

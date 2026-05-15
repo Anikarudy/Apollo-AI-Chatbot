@@ -15,7 +15,8 @@ function edocToDate(edoc: string): Date {
 
 const ChatWidget: React.FC = () => {
   const {
-    messages, currentState, machineCtx, isLlmLoading, doctorCards, cardsAnchorMsgId,
+    messages, currentState, machineCtx, isLlmLoading, rateLimitSeconds,
+    doctorCards, cardsAnchorMsgId,
     liveDates, liveSlots, slotsLoading,
     getServiceIdForSlot, fetchSlotsForDate, selectDoctorForBooking,
     requestAppointmentForDoctor,
@@ -24,6 +25,8 @@ const ChatWidget: React.FC = () => {
   } = useChatMachine();
 
   const [inputText, setInputText] = useState("");
+  const [rateLimitUntil, setRateLimitUntil] = useState<number | null>(null); // epoch ms when throttle expires
+  const rateLimitTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [selectedDateIdxByDoctor, setSelectedDateIdxByDoctor] = useState<Record<string, number>>({});
   const [selectedSlotByDoctor, setSelectedSlotByDoctor]       = useState<Record<string, string | null>>({});
   const [slotsOpenByDoctor, setSlotsOpenByDoctor]             = useState<Record<string, boolean>>({});
@@ -44,6 +47,25 @@ const ChatWidget: React.FC = () => {
     setDateStartByDoctor({});
   }, [currentState, doctorCards.length]);
 
+  // Set/clear rate limit countdown whenever hook signals a 429
+  useEffect(() => {
+    if (!rateLimitSeconds || rateLimitSeconds <= 0) return;
+    setRateLimitUntil(Date.now() + rateLimitSeconds * 1000);
+  }, [rateLimitSeconds]);
+
+  // Clear countdown timer when throttle expires
+  useEffect(() => {
+    if (!rateLimitUntil) return;
+    const tick = setInterval(() => {
+      if (Date.now() >= rateLimitUntil) {
+        setRateLimitUntil(null);
+        clearInterval(tick);
+      }
+    }, 500);
+    rateLimitTimerRef.current = tick;
+    return () => clearInterval(tick);
+  }, [rateLimitUntil]);
+
   const stateResp = getStateResponse(currentState, machineCtx);
 
   const snapshotQuickReplies = () => {
@@ -59,7 +81,7 @@ const ChatWidget: React.FC = () => {
 
   const handleSend = async () => {
     const text = inputText.trim();
-    if (!text) return;
+    if (!text || isLlmLoading || rateLimitUntil) return;
     snapshotQuickReplies();
     setInputText("");
     await sendUserText(text);
@@ -386,6 +408,14 @@ const ChatWidget: React.FC = () => {
         <div ref={messagesEndRef} />
       </div>
 
+      {/* Rate limit banner */}
+      {rateLimitUntil && (
+        <div className="rate-limit-banner" role="alert" aria-live="assertive">
+          ⏳ You're sending messages too quickly. Please wait{" "}
+          <strong>{Math.ceil((rateLimitUntil - Date.now()) / 1000)}s</strong> and try again.
+        </div>
+      )}
+
       {/* Input bar */}
       <div className="chat-input-bar">
         {(currentState === "ENTER_PHONE_FOR_BOOKING" || currentState === "ENTER_PHONE") ? (
@@ -396,11 +426,12 @@ const ChatWidget: React.FC = () => {
               type="tel"
               placeholder="Mobile Number"
               value={inputText}
+              disabled={!!rateLimitUntil || isLlmLoading}
               onChange={(e) => setInputText(e.target.value)}
               onKeyDown={handleKeyDown}
               aria-label="Enter mobile number"
             />
-            <button className="chat-input-send" onClick={() => void handleSend()} aria-label="Send">›</button>
+            <button className="chat-input-send" disabled={!!rateLimitUntil || isLlmLoading} onClick={() => void handleSend()} aria-label="Send">›</button>
           </>
         ) : (
           <>
@@ -408,8 +439,9 @@ const ChatWidget: React.FC = () => {
             <input
               className="chat-input-field"
               type="text"
-              placeholder={stateResp.inputPlaceholder ?? "Message Apollo Assist…"}
+              placeholder={rateLimitUntil ? "Please wait…" : (stateResp.inputPlaceholder ?? "Message Apollo Assist…")}
               value={inputText}
+              disabled={!!rateLimitUntil || isLlmLoading}
               onChange={(e) => setInputText(e.target.value)}
               onKeyDown={handleKeyDown}
               aria-label="Type a message"
