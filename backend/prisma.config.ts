@@ -2,12 +2,11 @@
 // npm install --save-dev prisma dotenv
 import * as dotenv from "dotenv";
 import path from "path";
-import { defineConfig } from "prisma/config";
 
 // Load from project root .env regardless of which directory the CLI is run from
 dotenv.config({ path: path.resolve(__dirname, "../.env") });
 
-export default defineConfig({
+export default {
   schema: "prisma/schema.prisma",
   migrations: {
     path: "prisma/migrations",
@@ -15,4 +14,4 @@ export default defineConfig({
   datasource: {
     url: process.env["DATABASE_URL"],
   },
-});
+};
