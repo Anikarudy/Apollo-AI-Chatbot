@@ -30,7 +30,10 @@ interface ApolloContext {
   regionId?: string;         // EDOC RegionID (default "5")
   serviceId?: string;        // EDOC ServiceID
   uhid?: string;             // Patient UHID
-  appointmentId?: string;    // Booked appointment ID
+  appointmentId?: string;    // Booked appointment ID (current booking)
+  existingApptId?: string;   // Prior appointment ID found during duplicate check
+  existingApptDate?: string; // Date of prior appointment
+  existingApptTime?: string; // Time of prior appointment
   selectedDate?: string;     // "01-JUL-2025"
   selectedSlotStart?: string; // "21:00"
   selectedSlotEnd?: string;   // "21:15"
@@ -840,7 +843,7 @@ export const apolloMachine = createMachine(
       PROCESS_UHID: {
         on: {
           UHID_FOUND: {
-            target: "CONFIRM_APPOINTMENT",
+            target: "CHECK_EXISTING_APPOINTMENT",
             actions: assign({ uhid: ({ event }) => event.value }),
           },
           UHID_NOT_FOUND: "COLLECT_PATIENT_DETAILS",
@@ -882,7 +885,7 @@ export const apolloMachine = createMachine(
       GENERATE_UHID_STATE: {
         on: {
           UHID_GENERATED: {
-            target: "CONFIRM_APPOINTMENT",
+            target: "CHECK_EXISTING_APPOINTMENT",
             actions: assign({ uhid: ({ event }) => event.value }),
           },
           UHID_FAILED: "UHID_GENERATE_FAILED",
@@ -894,10 +897,45 @@ export const apolloMachine = createMachine(
         on: {
           // Skip UHID — proceed with phone as patient reference
           SKIP_UHID: {
-            target: "CONFIRM_APPOINTMENT",
+            target: "CHECK_EXISTING_APPOINTMENT",
             actions: assign({ uhid: ({ context }) => `TEMP-${context.phoneNumber ?? "unknown"}` }),
           },
           RETRY_PATIENT_DETAILS: "COLLECT_PATIENT_DETAILS",
+          BACK_TO_MENU: "MAIN_MENU",
+        },
+      },
+
+      CHECK_EXISTING_APPOINTMENT: {
+        on: {
+          // No prior appointment found — proceed normally
+          NO_EXISTING_APPT: "CONFIRM_APPOINTMENT",
+          // Prior appointment found — show warning; user chooses
+          HAS_EXISTING_APPT: {
+            target: "EXISTING_APPT_WARNING",
+            actions: assign({
+              existingApptId:   ({ event }) => (JSON.parse(event.value ?? "{}") as Record<string,string>).apptId,
+              existingApptDate: ({ event }) => (JSON.parse(event.value ?? "{}") as Record<string,string>).date,
+              existingApptTime: ({ event }) => (JSON.parse(event.value ?? "{}") as Record<string,string>).time,
+            }),
+          },
+          BACK_TO_MENU: "MAIN_MENU",
+        },
+      },
+
+      EXISTING_APPT_WARNING: {
+        on: {
+          // User wants to book anyway (follow-up appointment)
+          BOOK_ANYWAY: "CONFIRM_APPOINTMENT",
+          // User wants to reschedule the existing appointment
+          RESCHEDULE: {
+            target: "RESCHEDULE_APPOINTMENT",
+            actions: assign({ appointmentId: ({ context }) => context.existingApptId }),
+          },
+          // User wants to cancel the existing appointment
+          CANCEL_BOOKING: {
+            target: "CANCEL_APPOINTMENT_STATE",
+            actions: assign({ appointmentId: ({ context }) => context.existingApptId }),
+          },
           BACK_TO_MENU: "MAIN_MENU",
         },
       },

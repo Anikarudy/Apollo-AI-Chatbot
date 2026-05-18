@@ -91,6 +91,10 @@ export type AppEvent =
   | { type: "SKIP_UHID" }
   | { type: "RETRY_PATIENT_DETAILS" }
   | { type: "ENTER_PATIENT_DETAILS"; value: string }
+  // ── Duplicate booking check events ───────────────────────────────────────
+  | { type: "NO_EXISTING_APPT" }
+  | { type: "HAS_EXISTING_APPT"; value: string }  // JSON: {apptId, date, time}
+  | { type: "BOOK_ANYWAY" }
   // ── AI intent navigation ──────────────────────────────────────────────────
   | { type: "AI_PREFILL"; value: string }   // JSON: {specialty?,city?,branch?,doctorName?}
   | { type: "AI_SYMPTOM_MAPPED"; value: string } // specialty string from AI

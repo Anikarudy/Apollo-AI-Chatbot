@@ -142,6 +142,8 @@ const NO_LLM_STATES = new Set([
   "SHOW_DOCTORS",            // UI is card-driven; LLM message shown before cards load
   "CONFIRM_APPOINTMENT",     // Dynamic context-aware message handled by stateResponses
   "BOOKING_CONFIRMED",       // Dynamic message handled by stateResponses
+  "CHECK_EXISTING_APPOINTMENT", // Transient: fires API check then auto-transitions
+  "EXISTING_APPT_WARNING",   // Static warning message + buttons
 ]);
 
 // States where free-text should first be sent to the AI intent parser (legacy fallback).
@@ -275,6 +277,13 @@ export function useChatMachine() {
   useEffect(() => { messagesRef.current = messages; }, [messages]);
   const [currentState, setCurrentState] = useState<string>("WELCOME");
   const [machineCtx, setMachineCtx] = useState<ChatContext>({});
+
+  // Persist machine state so doctor cards and context survive page refresh
+  useEffect(() => {
+    if (currentState !== "WELCOME") {
+      localStorage.setItem("apollo_machine_snapshot", JSON.stringify({ state: currentState, ctx: machineCtx }));
+    }
+  }, [currentState, machineCtx]);
   const [isLlmLoading, setIsLlmLoading] = useState(false);
   const [rateLimitSeconds, setRateLimitSeconds] = useState<number>(0);
   const [doctorCards, setDoctorCards] = useState<DoctorCardData[]>([]);
@@ -406,6 +415,17 @@ export function useChatMachine() {
                   text:   m.message,
                 }))
               );
+              // Restore machine state (currentState + machineCtx) so doctor cards re-render
+              const snapshotRaw = localStorage.getItem("apollo_machine_snapshot");
+              if (snapshotRaw) {
+                try {
+                  const snap = JSON.parse(snapshotRaw) as { state: string; ctx: ChatContext };
+                  if (snap.state && snap.ctx) {
+                    setCurrentState(snap.state);
+                    setMachineCtx(snap.ctx);
+                  }
+                } catch { /* ignore corrupt snapshot */ }
+              }
             } else {
               showWelcome();
             }
@@ -1212,6 +1232,40 @@ export function useChatMachine() {
 
   // Prevent EDOC async effects from double-firing on re-renders
   const edocFiredForState = useRef<string>("");
+
+  // CHECK_EXISTING_APPOINTMENT: check if patient already has an appt with this doctor
+  useEffect(() => {
+    if (currentState !== "CHECK_EXISTING_APPOINTMENT") return;
+    if (edocFiredForState.current === currentState) return;
+    edocFiredForState.current = currentState;
+    const phone      = machineCtx.phoneNumber;
+    const doctorName = machineCtx.doctorName;
+    if (!phone || !doctorName) { sendSilentEvent("NO_EXISTING_APPT"); return; }
+
+    fetch("/api/appointments/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ phone, doctorName }),
+    })
+      .then((r) => r.json())
+      .then((data: unknown) => {
+        const d = data as { existing?: { apptId?: string; date?: string; time?: string } | null };
+        if (d.existing?.apptId) {
+          sendSilentEvent(
+            "HAS_EXISTING_APPT",
+            JSON.stringify({
+              apptId: d.existing.apptId,
+              date:   d.existing.date ?? "",
+              time:   d.existing.time ?? "",
+            })
+          );
+        } else {
+          sendSilentEvent("NO_EXISTING_APPT");
+        }
+      })
+      .catch(() => sendSilentEvent("NO_EXISTING_APPT")); // fail-safe: never block booking
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentState, machineCtx.phoneNumber, machineCtx.doctorName]);
 
   // PROCESS_UHID: look up UHID by phone
   useEffect(() => {
@@ -2217,6 +2271,7 @@ export function useChatMachine() {
     // Generate a fresh session ID so the new conversation is stored separately
     const newSessionId = crypto.randomUUID();
     localStorage.setItem("apollo_session_id", newSessionId);
+    localStorage.removeItem("apollo_machine_snapshot");
     sessionIdRef.current = newSessionId;
     setMessages([{ id: nextId(), sender: "bot", text: getStateResponse(initial).message }]);
   }, []);

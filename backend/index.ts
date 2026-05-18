@@ -19,6 +19,8 @@ import { searchDoctors, SEARCH_DOCTORS_TOOL, fuzzySearchAllDoctors } from "./sea
 import { upsertSession, getSession } from "./services/chatSessionService";
 import { logMessage } from "./services/chatMessageService";
 import { logEvent } from "./services/auditService";
+import { getOrCreatePatient, setPatientUhid, getPatientByPhone } from "./services/patientService";
+import { createAppointment, getAppointmentsForPatient, updateAppointmentStatusByEdocId } from "./services/appointmentService";
 
 dotenv.config();
 
@@ -1197,14 +1199,49 @@ app.post("/api/edoc/book-appointment", bookingLimiter, async (req: Request, res:
     const r = await axios.post(`${EDOC_BASE}/api/EDOC/BookAppointment`, b, { headers: edocHeaders(), timeout: 15000 });
     logEdoc("BookAppointment.response", r.data);
     console.log("[EDOC] BookAppointment succeeded (200 OK)");
+    const edocData = r.data as Record<string, unknown>;
     // Audit: booking success
     void logEvent(req.sessionId, "booking_success", {
-      appointmentId: (r.data as Record<string, unknown>).AppointmentID,
+      appointmentId: edocData.AppointmentID,
       resourceId:    b.ResourceID,
       locationId:    b.LocationID,
       uhid:          b.UHIDNumber,
       startDateTime: b.StartDateTime,
     }).catch(() => {});
+
+    // Operational: persist patient + appointment
+    const phone = String(b.MobileNumber ?? "").replace(/[^0-9+]/g, "");
+    if (phone) {
+      void (async () => {
+        try {
+          const firstName = String(b.FirstName ?? "").trim();
+          const lastName  = String(b.LastName ?? "").trim();
+          const fullName  = [firstName, lastName].filter(Boolean).join(" ") || "Unknown";
+          const uhid      = String(b.UHIDNumber ?? "").trim() || undefined;
+
+          const patient = await getOrCreatePatient({ phoneNumber: phone, fullName, dob: "", uhid });
+
+          // Look up doctor by ResourceID for enriched appointment record
+          const matchedDoctor = doctors.find((d) => String(d.resourceId) === String(b.ResourceID));
+          const startDt = String(b.StartDateTime ?? ""); // "DD-Mon-YYYY HH:MM:00"
+          const [appointmentDate = "", slotTimeFull = ""] = startDt.split(" ");
+          const slotTime = slotTimeFull.substring(0, 5); // "HH:MM"
+
+          await createAppointment({
+            patientId:         patient.id,
+            doctorName:        matchedDoctor?.name ?? String(b.ResourceID),
+            specialty:         matchedDoctor?.speciality,
+            hospital:          matchedDoctor?.branch,
+            appointmentDate,
+            slotTime,
+            edocAppointmentId: edocData.AppointmentID !== undefined ? String(edocData.AppointmentID) : undefined,
+          });
+        } catch (opErr) {
+          console.error("[Operational] Failed to persist appointment:", opErr);
+        }
+      })();
+    }
+
     res.json(r.data);
   } catch (err: unknown) {
     const e = err as { message?: string; response?: { data: unknown } };
@@ -1235,6 +1272,35 @@ app.post("/api/edoc/reschedule-appointment", bookingLimiter, async (req: Request
   try {
     const r = await axios.post(`${EDOC_BASE}/api/EDOC/ResheduleAppointment`, b, { headers: edocHeaders(), timeout: 15000 });
     console.log("[EDOC] ResheduleAppointment succeeded (200 OK)");
+    const edocData = r.data as Record<string, unknown>;
+
+    // Operational: mark old appointment as cancelled, insert new row with rescheduled slot
+    void (async () => {
+      try {
+        // 1. Find the old appointment row (to copy patient + doctor info to the new row)
+        const oldEdocId = String(b.AppointmentID);
+        const oldRow = await updateAppointmentStatusByEdocId(oldEdocId, "cancelled");
+
+        // 2. Insert a new confirmed row for the rescheduled slot
+        if (oldRow) {
+          const startDt = String(b.StartDateTime ?? ""); // "DD-Mon-YYYY HH:MM:00"
+          const [newDate = "", newSlotFull = ""] = startDt.split(" ");
+          const newSlot = newSlotFull.substring(0, 5); // "HH:MM"
+          await createAppointment({
+            patientId:         oldRow.patientId,
+            doctorName:        oldRow.doctorName,
+            specialty:         oldRow.specialty ?? undefined,
+            hospital:          oldRow.hospital ?? undefined,
+            appointmentDate:   newDate,
+            slotTime:          newSlot,
+            edocAppointmentId: edocData.AppointmentID !== undefined ? String(edocData.AppointmentID) : oldEdocId,
+          });
+        }
+      } catch (opErr) {
+        console.error("[Operational] Failed to update rescheduled appointment:", opErr);
+      }
+    })();
+
     res.json(r.data);
   } catch (err: unknown) {
     const e = err as { message?: string; response?: { data: unknown } };
@@ -1257,6 +1323,12 @@ app.post("/api/edoc/cancel-appointment", bookingLimiter, async (req: Request, re
   try {
     const r = await axios.post(`${EDOC_BASE}/api/EDOC/CancelAppointment`, b, { headers: edocHeaders(), timeout: 15000 });
     console.log("[EDOC] CancelAppointment succeeded (200 OK)");
+
+    // Operational: mark appointment as cancelled in local DB
+    void updateAppointmentStatusByEdocId(String(b.AppointmentID), "cancelled").catch((err) =>
+      console.error("[Operational] Failed to update cancelled status:", err)
+    );
+
     res.json(r.data);
   } catch (err: unknown) {
     const e = err as { message?: string; response?: { data: unknown } };
@@ -1519,6 +1591,20 @@ app.post("/api/edoc/uhid-search", async (req: Request, res: Response): Promise<v
     res.status(400).json({ error: "Invalid phone number format" });
     return;
   }
+
+  // ── Local DB first: avoid unnecessary EDOC round-trip ──────────────────────
+  try {
+    const localPatient = await getPatientByPhone(normalizedPhone);
+    if (localPatient?.uhid) {
+      console.log(`[UHID] Cache hit for ${normalizedPhone} → ${localPatient.uhid}`);
+      res.json({ uhidList: [{ UHIDNumber: localPatient.uhid }], retcode: 0, source: "local" });
+      return;
+    }
+  } catch (localErr) {
+    // Non-fatal: log and fall through to EDOC
+    console.error("[UHID] Local patient lookup failed, falling back to EDOC:", localErr);
+  }
+
   try {
     const r = await axios.post(
       `${EDOC_BASE}/api/EDOC/GetUHID`,
@@ -1608,7 +1694,31 @@ app.post("/api/edoc/generate-uhid", async (req: Request, res: Response): Promise
   try {
     const r = await axios.post(`${EDOC_BASE}/api/EDOC/GenerateUHIDOnline`, b, { headers: edocHeaders(), timeout: 15000 });
     const data = r.data as { result?: string; retcode?: number };
-    res.json({ uhid: data.result ?? "", retcode: data.retcode ?? 0 });
+    const uhid = data.result ?? "";
+
+    // Operational: create patient record when EDOC assigns a new UHID
+    if (uhid) {
+      const phone = String(b.MobileNumber ?? "").replace(/[^0-9+]/g, "");
+      if (phone) {
+        void (async () => {
+          try {
+            const firstName = String(b.FirstName ?? "").trim();
+            const lastName  = String(b.LastName ?? "").trim();
+            const fullName  = [firstName, lastName].filter(Boolean).join(" ") || "Unknown";
+            const dob       = String(b.DateOfBirth ?? "").trim();
+            const patient   = await getOrCreatePatient({ phoneNumber: phone, fullName, dob, uhid });
+            // If patient already existed without a UHID, update it
+            if (!patient.uhid) {
+              await setPatientUhid(patient.id, uhid);
+            }
+          } catch (opErr) {
+            console.error("[Operational] Failed to persist patient from generate-uhid:", opErr);
+          }
+        })();
+      }
+    }
+
+    res.json({ uhid, retcode: data.retcode ?? 0 });
   } catch (err: unknown) {
     const e = err as { message?: string; response?: { data: unknown } };
     res.status(500).json({ error: e.response?.data ?? e.message ?? "GenerateUHIDOnline failed" });
@@ -2021,6 +2131,54 @@ app.get("/api/session/:sessionId", generalLimiter, async (req: Request, res: Res
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", ts: new Date().toISOString(), provider: process.env.DATA_PROVIDER ?? "sqlite" });
+});
+
+// ── Check existing appointments for duplicate-booking warning ─────────────────
+// POST /api/appointments/check
+// Body: { phone: string; doctorName: string }
+// Returns: { existing: { apptId, doctorName, date, time, status } | null }
+app.post("/api/appointments/check", async (req: Request, res: Response): Promise<void> => {
+  const { phone, doctorName } = req.body as Record<string, string>;
+  const normalizedPhone = String(phone ?? "").replace(/[^0-9+]/g, "");
+  if (!normalizedPhone || !doctorName) {
+    res.status(400).json({ error: "phone and doctorName required", existing: null });
+    return;
+  }
+  try {
+    const patient = await getPatientByPhone(normalizedPhone);
+    if (!patient) {
+      res.json({ existing: null });
+      return;
+    }
+    const appointments = await getAppointmentsForPatient(patient.id);
+    // Find the most recent confirmed appointment with the same doctor
+    const normalizedTarget = doctorName.toLowerCase().replace(/^dr\.?\s*/i, "").trim();
+    const match = appointments.find((a) => {
+      const normalizedAppt = a.doctorName.toLowerCase().replace(/^dr\.?\s*/i, "").trim();
+      return (
+        normalizedAppt === normalizedTarget &&
+        a.status === "confirmed"
+      );
+    });
+    if (!match) {
+      res.json({ existing: null });
+      return;
+    }
+    res.json({
+      existing: {
+        apptId:     match.edocAppointmentId ?? match.id,
+        doctorName: match.doctorName,
+        date:       match.appointmentDate,
+        time:       match.slotTime,
+        status:     match.status,
+      },
+    });
+  } catch (err) {
+    const e = err as { message?: string };
+    log.error({ err }, "POST /api/appointments/check error");
+    // Non-fatal — if the check fails, let booking proceed without the warning
+    res.json({ existing: null, warning: e.message });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

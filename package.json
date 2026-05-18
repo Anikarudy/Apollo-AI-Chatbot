@@ -9,7 +9,7 @@
     "dev:server": "NODE_OPTIONS=--use-system-ca ts-node --project backend/tsconfig.json backend/index.ts",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "vitest run --config vitest.config.ts"
   },
   "keywords": [],
   "author": "",

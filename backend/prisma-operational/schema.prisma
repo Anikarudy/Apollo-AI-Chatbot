@@ -1,0 +1,39 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../node_modules/@prisma/operational-client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("OPERATIONAL_DATABASE_URL")
+}
+
+model Patient {
+  id          String   @id @default(uuid())
+  phoneNumber String   @unique
+  fullName    String
+  dob         String   // stored as string in DD-Mon-YYYY format (EDOC compatible)
+  uhid        String?  @unique  // null until EDOC assigns one
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  appointments Appointment[]
+}
+
+model Appointment {
+  id                  String   @id @default(uuid())
+  patientId           String
+  doctorName          String
+  specialty           String?
+  hospital            String?
+  appointmentDate     String   // "DD-Mon-YYYY"
+  slotTime            String   // "HH:MM"
+  status              String   @default("confirmed")  // "confirmed" | "cancelled" | "rescheduled"
+  edocAppointmentId   String?  // AppointmentID returned by EDOC
+  createdAt           DateTime @default(now())
+
+  patient Patient @relation(fields: [patientId], references: [id])
+
+  @@index([patientId])
+  @@index([edocAppointmentId])
+}

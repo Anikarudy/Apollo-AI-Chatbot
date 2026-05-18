@@ -280,6 +280,13 @@ const responses: Record<string, StateResponse> = {
     ],
   },
 
+  CHECK_EXISTING_APPOINTMENT: {
+    message: "Checking your existing appointments… please wait.",
+    quickReplies: [],
+  },
+
+  // EXISTING_APPT_WARNING: dynamic — see getStateResponse() below
+
   CONFIRM_APPOINTMENT: {
     message: "Please review your booking details and confirm.",
     quickReplies: [
@@ -909,6 +916,22 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
         ? `Book this package directly on Apollo's website:\n\n${url}`
         : `Visit Apollo ProHealth to view full package details and book:\nhttps://prohealth.apollohospitals.com`,
       quickReplies: [{ label: "Done, back to menu", eventType: "EXIT" }],
+    };
+  }
+
+  // ── Dynamic: EXISTING_APPT_WARNING — prior booking detected ─────────────────
+  if (state === "EXISTING_APPT_WARNING") {
+    const doctorName      = ctx?.doctorName ?? "this doctor";
+    const existingDate    = ctx?.existingApptDate ?? "";
+    const existingTime    = ctx?.existingApptTime ?? "";
+    const when = [existingDate, existingTime ? `at ${existingTime}` : ""].filter(Boolean).join(" ");
+    return {
+      message: `You already have an appointment${when ? ` on ${when}` : ""} with ${doctorName}.\n\nWould you like to book another appointment with them, or manage your existing one?`,
+      quickReplies: [
+        { label: "Book another appointment", eventType: "BOOK_ANYWAY" },
+        { label: "Reschedule existing", eventType: "RESCHEDULE" },
+        { label: "Cancel existing", eventType: "CANCEL_BOOKING" },
+      ],
     };
   }
 
