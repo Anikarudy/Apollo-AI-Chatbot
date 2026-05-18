@@ -721,11 +721,20 @@ export function useChatMachine() {
   }, []);
 
   const bookAppointment = useCallback(async (payload: Record<string, unknown>): Promise<BookAppointmentResponse> => {
-    logEdoc("BookAppointment.request", payload);
+    // Generate a stable idempotency key for this booking attempt.
+    // If the user double-clicks or the frontend retries, the same UUID
+    // is NOT re-used — each *new* user-initiated booking gets a fresh key.
+    // The key is generated here (just before the call) so retries within
+    // the same useCallback invocation share it, but a second button press
+    // creates a brand-new invocation with a new UUID.
+    const bookingRequestId = crypto.randomUUID();
+    const payloadWithKey = { ...payload, bookingRequestId };
+
+    logEdoc("BookAppointment.request", payloadWithKey);
     const res = await fetch("/api/edoc/book-appointment", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(payloadWithKey),
     });
     const data = (await res.json()) as BookAppointmentResponse;
     logEdoc("BookAppointment.response", { status: res.status, data });

@@ -21,7 +21,9 @@ import { logMessage } from "./services/chatMessageService";
 import { logEvent } from "./services/auditService";
 import { getOrCreatePatient, setPatientUhid, getPatientByPhone } from "./services/patientService";
 import { createAppointment, getAppointmentsForPatient, updateAppointmentStatusByEdocId } from "./services/appointmentService";
+import operationalPrisma from "./db/operationalPrismaClient";
 import { buildSessionDebugPayload } from "./services/adminDebugService";
+import { edocPost, isSafeFailure } from "./infra/edocClient";
 
 dotenv.config();
 
@@ -1183,7 +1185,7 @@ app.post("/api/agent/book-appointment", async (req: Request, res: Response): Pro
 // ── Apollo EDOC API proxy routes  (AuthKey stays server-side) ────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 
-// 2. Book Appointment
+// 2. Book Appointment (idempotency + EDOC resilience)
 app.post("/api/edoc/book-appointment", bookingLimiter, async (req: Request, res: Response): Promise<void> => {
   if (!requireEdoc(res)) return;
   const b = req.body as Record<string, unknown>;
@@ -1195,14 +1197,99 @@ app.post("/api/edoc/book-appointment", bookingLimiter, async (req: Request, res:
     res.status(400).json({ error: "LocationID must be numeric" });
     return;
   }
+
+  // ── Idempotency key ──────────────────────────────────────────────────────────
+  const bookingRequestId = String(b.bookingRequestId ?? "").trim();
+  const startDt          = String(b.StartDateTime ?? "");
+  const [appointmentDate = "", slotTimeFull = ""] = startDt.split(" ");
+  const slotTime         = slotTimeFull.substring(0, 5); // "HH:MM"
+  const phone            = String(b.MobileNumber ?? "").replace(/[^0-9+]/g, "");
+  const matchedDoctor    = doctors.find((d) => String(d.resourceId) === String(b.ResourceID));
+  const doctorName       = matchedDoctor?.name ?? String(b.ResourceID);
+
+  if (bookingRequestId) {
+    // ── CASE A: duplicate check ────────────────────────────────────────────────
+    const existing = await operationalPrisma.bookingRequest.findUnique({
+      where: { bookingRequestId },
+    }).catch(() => null);
+
+    if (existing) {
+      if (existing.status === "processing") {
+        // Still in-flight from a previous attempt — tell client to wait
+        res.status(202).json({
+          idempotent: true,
+          status: "processing",
+          message: "Booking is already being processed. Please wait.",
+        });
+        return;
+      }
+      // Completed (success or failed) — return stored result
+      void logEvent(req.sessionId, "booking_duplicate_prevented", {
+        bookingRequestId,
+        status: existing.status,
+      }).catch(() => {});
+
+      log.info({ bookingRequestId, status: existing.status }, "[Idempotency] hit — returning stored response");
+      const stored = existing.responsePayload as Record<string, unknown> | null;
+      if (existing.status === "success" && stored) {
+        res.json({ ...stored, idempotent: true });
+      } else {
+        res.status(500).json({ ...((stored as Record<string, unknown>) ?? {}), idempotent: true, error: "Previous booking attempt failed" });
+      }
+      return;
+    }
+
+    // ── CASE B: new request — create processing record ─────────────────────────
+    void logEvent(req.sessionId, "idempotency_hit", {
+      bookingRequestId,
+      action: "new_request",
+    }).catch(() => {});
+
+    await operationalPrisma.bookingRequest.create({
+      data: {
+        bookingRequestId,
+        sessionId:      req.sessionId,
+        patientPhone:   phone || "unknown",
+        doctorName,
+        appointmentDate,
+        slotTime,
+        status:         "processing",
+      },
+    }).catch((err) => console.error("[Idempotency] Failed to create BookingRequest row:", err));
+  }
+
+  // ── Call EDOC via resilient client ───────────────────────────────────────────
   try {
-    logEdoc("BookAppointment.request", b);
-    const r = await axios.post(`${EDOC_BASE}/api/EDOC/BookAppointment`, b, { headers: edocHeaders(), timeout: 15000 });
-    logEdoc("BookAppointment.response", r.data);
+    const edocData = await edocPost<Record<string, unknown>>(
+      "/api/EDOC/BookAppointment",
+      b,
+      req.sessionId,
+    );
+
+    if (isSafeFailure(edocData)) {
+      // All retries exhausted — graceful degradation
+      if (bookingRequestId) {
+        await operationalPrisma.bookingRequest.update({
+          where:  { bookingRequestId },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          data:   { status: "failed", responsePayload: edocData as any },
+        }).catch(() => {});
+      }
+      void logEvent(req.sessionId, "booking_failure", {
+        bookingRequestId,
+        reason: "edoc_exhausted",
+        resourceId: b.ResourceID,
+        startDateTime: b.StartDateTime,
+      }).catch(() => {});
+      res.status(503).json(edocData);
+      return;
+    }
+
     console.log("[EDOC] BookAppointment succeeded (200 OK)");
-    const edocData = r.data as Record<string, unknown>;
+
     // Audit: booking success
     void logEvent(req.sessionId, "booking_success", {
+      bookingRequestId,
       appointmentId: edocData.AppointmentID,
       resourceId:    b.ResourceID,
       locationId:    b.LocationID,
@@ -1210,8 +1297,16 @@ app.post("/api/edoc/book-appointment", bookingLimiter, async (req: Request, res:
       startDateTime: b.StartDateTime,
     }).catch(() => {});
 
-    // Operational: persist patient + appointment
-    const phone = String(b.MobileNumber ?? "").replace(/[^0-9+]/g, "");
+    // Update idempotency record → success
+    if (bookingRequestId) {
+      await operationalPrisma.bookingRequest.update({
+        where:  { bookingRequestId },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        data:   { status: "success", responsePayload: edocData as any },
+      }).catch(() => {});
+    }
+
+    // Operational: persist patient + appointment (fire-and-forget)
     if (phone) {
       void (async () => {
         try {
@@ -1219,14 +1314,7 @@ app.post("/api/edoc/book-appointment", bookingLimiter, async (req: Request, res:
           const lastName  = String(b.LastName ?? "").trim();
           const fullName  = [firstName, lastName].filter(Boolean).join(" ") || "Unknown";
           const uhid      = String(b.UHIDNumber ?? "").trim() || undefined;
-
-          const patient = await getOrCreatePatient({ phoneNumber: phone, fullName, dob: "", uhid });
-
-          // Look up doctor by ResourceID for enriched appointment record
-          const matchedDoctor = doctors.find((d) => String(d.resourceId) === String(b.ResourceID));
-          const startDt = String(b.StartDateTime ?? ""); // "DD-Mon-YYYY HH:MM:00"
-          const [appointmentDate = "", slotTimeFull = ""] = startDt.split(" ");
-          const slotTime = slotTimeFull.substring(0, 5); // "HH:MM"
+          const patient   = await getOrCreatePatient({ phoneNumber: phone, fullName, dob: "", uhid });
 
           await createAppointment({
             patientId:         patient.id,
@@ -1243,12 +1331,20 @@ app.post("/api/edoc/book-appointment", bookingLimiter, async (req: Request, res:
       })();
     }
 
-    res.json(r.data);
+    res.json(edocData);
   } catch (err: unknown) {
     const e = err as { message?: string; response?: { data: unknown } };
-    logEdoc("BookAppointment.error", { message: e.message, response: e.response?.data });
+
+    if (bookingRequestId) {
+      await operationalPrisma.bookingRequest.update({
+        where:  { bookingRequestId },
+        data:   { status: "failed", responsePayload: { error: String(e.message ?? "unknown") } },
+      }).catch(() => {});
+    }
+
     // Audit: booking failure
     void logEvent(req.sessionId, "booking_failure", {
+      bookingRequestId,
       error:         String(e.message ?? "unknown"),
       resourceId:    b.ResourceID,
       locationId:    b.LocationID,
