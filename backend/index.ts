@@ -21,6 +21,7 @@ import { logMessage } from "./services/chatMessageService";
 import { logEvent } from "./services/auditService";
 import { getOrCreatePatient, setPatientUhid, getPatientByPhone } from "./services/patientService";
 import { createAppointment, getAppointmentsForPatient, updateAppointmentStatusByEdocId } from "./services/appointmentService";
+import { buildSessionDebugPayload } from "./services/adminDebugService";
 
 dotenv.config();
 
@@ -2125,6 +2126,56 @@ app.get("/api/session/:sessionId", generalLimiter, async (req: Request, res: Res
   } catch (err) {
     log.error({ err }, "GET /api/session/:sessionId error");
     res.status(500).json({ error: "Failed to load session", messages: [] });
+  }
+});
+
+// ── Admin Debug ───────────────────────────────────────────────────────────────
+// GET /api/admin/session/:sessionId
+//
+// Returns a full replay/debug timeline for a session.
+// Requires header:  X-Admin-Key: <ADMIN_DEBUG_KEY from .env>
+// Read-only. Never exposes API keys or EDOC credentials.
+const ADMIN_DEBUG_KEY = process.env.ADMIN_DEBUG_KEY ?? "";
+
+function requireAdmin(req: Request, res: Response): boolean {
+  if (!ADMIN_DEBUG_KEY) {
+    res.status(503).json({ error: "Admin debug endpoint is not configured on this server." });
+    return false;
+  }
+  const provided = req.headers["x-admin-key"];
+  if (!provided || provided !== ADMIN_DEBUG_KEY) {
+    res.status(401).json({ error: "Unauthorized. Valid X-Admin-Key header required." });
+    return false;
+  }
+  return true;
+}
+
+app.get("/api/admin/session/:sessionId", async (req: Request, res: Response): Promise<void> => {
+  if (!requireAdmin(req, res)) return;
+
+  const { sessionId } = req.params;
+
+  // Validate: sessionId must be a non-empty string, UUID-shaped
+  if (!sessionId || typeof sessionId !== "string" || sessionId.trim().length === 0) {
+    res.status(400).json({ error: "sessionId is required." });
+    return;
+  }
+  // UUIDs are 36 chars; enforce a safe length to prevent DB abuse
+  if (sessionId.length > 128) {
+    res.status(400).json({ error: "sessionId is malformed." });
+    return;
+  }
+
+  try {
+    const payload = await buildSessionDebugPayload(sessionId.trim());
+    if (!payload) {
+      res.status(404).json({ error: `No session found for id: ${sessionId}` });
+      return;
+    }
+    res.json(payload);
+  } catch (err) {
+    log.error({ err }, "GET /api/admin/session/:sessionId error");
+    res.status(500).json({ error: "Failed to build session debug payload." });
   }
 });
 
