@@ -17,6 +17,7 @@
 import axios from "axios";
 import { retryWithBackoff, safeFailure, type SafeFailureResponse } from "./retryWithBackoff";
 import { logEvent } from "../services/auditService";
+import log from "../lib/logger";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const EDOC_BASE = (process.env.APOLLO_EDOC_BASE_URL ?? "").replace(/\/$/, "");
@@ -40,11 +41,7 @@ export function isEdocConfigured(): boolean {
 
 // ── Internal log helper ───────────────────────────────────────────────────────
 function logEdoc(step: string, payload: unknown): void {
-  try {
-    console.info(`[EDOC] ${step} ${JSON.stringify(payload)}`);
-  } catch {
-    console.info(`[EDOC] ${step}`, payload);
-  }
+  log.info({ data: payload }, `[EDOC] ${step}`);
 }
 
 // ── Core POST wrapper ─────────────────────────────────────────────────────────

@@ -54,7 +54,8 @@ export const prismaPatientProvider: PatientProvider = {
     } catch (err) {
       // P2002 = unique constraint — another patient already has this UHID
       // (edge case: EDOC reassigned an existing UHID). Log and return existing.
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      const prismaErr = err as { code?: string; name?: string };
+      if (prismaErr.code === "P2002") {
         const existing = await operationalPrisma.patient.findFirst({ where: { uhid } });
         if (existing) return toRecord(existing);
       }

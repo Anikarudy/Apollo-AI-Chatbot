@@ -24,6 +24,8 @@ import { createAppointment, getAppointmentsForPatient, updateAppointmentStatusBy
 import operationalPrisma from "./db/operationalPrismaClient";
 import { buildSessionDebugPayload } from "./services/adminDebugService";
 import { edocPost, isSafeFailure } from "./infra/edocClient";
+import { startAuditWorker, stopAuditWorker } from "./workers/auditWorker";
+import { closeRedisConnection } from "./lib/redis";
 
 dotenv.config();
 
@@ -226,11 +228,7 @@ function requireEdoc(res: Response): boolean {
 }
 
 function logEdoc(step: string, payload: unknown): void {
-  try {
-    console.info(`[EDOC] ${step} ${JSON.stringify(payload)}`);
-  } catch {
-    console.info(`[EDOC] ${step}`, payload);
-  }
+  log.info({ data: payload }, `[EDOC] ${step}`);
 }
 
 const MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
@@ -1240,11 +1238,6 @@ app.post("/api/edoc/book-appointment", bookingLimiter, async (req: Request, res:
     }
 
     // ── CASE B: new request — create processing record ─────────────────────────
-    void logEvent(req.sessionId, "idempotency_hit", {
-      bookingRequestId,
-      action: "new_request",
-    }).catch(() => {});
-
     await operationalPrisma.bookingRequest.create({
       data: {
         bookingRequestId,
@@ -1255,7 +1248,7 @@ app.post("/api/edoc/book-appointment", bookingLimiter, async (req: Request, res:
         slotTime,
         status:         "processing",
       },
-    }).catch((err) => console.error("[Idempotency] Failed to create BookingRequest row:", err));
+    }).catch((err: unknown) => log.error({ err }, "[Idempotency] failed to create BookingRequest row"));
   }
 
   // ── Call EDOC via resilient client ───────────────────────────────────────────
@@ -1285,7 +1278,7 @@ app.post("/api/edoc/book-appointment", bookingLimiter, async (req: Request, res:
       return;
     }
 
-    console.log("[EDOC] BookAppointment succeeded (200 OK)");
+    log.info({ appointmentId: edocData.AppointmentID }, "[EDOC] BookAppointment succeeded");
 
     // Audit: booking success
     void logEvent(req.sessionId, "booking_success", {
@@ -2332,6 +2325,14 @@ app.post("/api/appointments/check", async (req: Request, res: Response): Promise
 
 const server = app.listen(PORT, () => {
   log.info({ port: PORT, provider: process.env.DATA_PROVIDER ?? "sqlite" }, "Apollo Assist backend started");
+
+  // Start BullMQ audit worker in-process.
+  // If Redis is unavailable the worker will log the error but NOT crash the server.
+  try {
+    startAuditWorker();
+  } catch (err) {
+    log.warn({ err: (err as Error).message }, "[workers] auditWorker failed to start — audit events will queue when Redis recovers");
+  }
 });
 
 server.on("error", (err: NodeJS.ErrnoException) => {
@@ -2340,18 +2341,31 @@ server.on("error", (err: NodeJS.ErrnoException) => {
 });
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
-function shutdown(signal: string) {
+async function shutdown(signal: string) {
   log.info({ signal }, "Received shutdown signal, closing server...");
-  server.close(() => {
+
+  // 1. Stop accepting new HTTP requests
+  server.close(async () => {
     log.info("HTTP server closed");
+
+    // 2. Drain in-flight worker jobs then close worker + Redis
+    try {
+      await stopAuditWorker();
+      await closeRedisConnection();
+      log.info("BullMQ worker and Redis connection closed");
+    } catch (err) {
+      log.warn({ err: (err as Error).message }, "Error during worker/redis shutdown");
+    }
+
     process.exit(0);
   });
-  // Force-kill after 10 s if connections are stuck
+
+  // Force-kill after 15 s if connections are stuck
   setTimeout(() => {
     log.error("Graceful shutdown timed out, forcing exit");
     process.exit(1);
-  }, 10000).unref();
+  }, 15000).unref();
 }
 
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT",  () => shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT",  () => void shutdown("SIGINT"));
