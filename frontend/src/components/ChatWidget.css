@@ -387,6 +387,29 @@
   gap: 12px;
 }
 
+.appt-show-more-wrap {
+  width: min(360px, 100%);
+  display: flex;
+  justify-content: center;
+}
+
+.appt-show-more-btn {
+  background: #ffffff;
+  color: #3d4a57;
+  border: 1px solid #cfd8e3;
+  border-radius: 8px;
+  padding: 9px 18px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, border-color 0.2s;
+}
+
+.appt-show-more-btn:hover {
+  background: #f3f7fb;
+  border-color: #b8c7d8;
+}
+
 .appt-card {
   width: min(360px, 100%);
   background: #ffffff;

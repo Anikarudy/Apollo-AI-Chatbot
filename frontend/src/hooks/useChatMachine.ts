@@ -853,7 +853,7 @@ export function useChatMachine() {
           }>;
         };
 
-        const cards = (data.doctors ?? []).slice(0, 6).map((d) => ({
+        const cards = (data.doctors ?? []).map((d) => ({
           name:       d.name,
           specialty:  d.specialty ?? machineCtx.specialty,
           hospital:   d.hospital  ?? hospital,
@@ -899,7 +899,7 @@ export function useChatMachine() {
           const fallbackData = fallbackRes.ok
             ? (await fallbackRes.json()) as { doctors?: typeof data.doctors }
             : { doctors: [] };
-          const fallbackCards = (fallbackData.doctors ?? []).slice(0, 6).map((d) => ({
+          const fallbackCards = (fallbackData.doctors ?? []).map((d) => ({
             name:        d.name,
             specialty:   d.specialty ?? "General Medicine",
             hospital:    d.hospital  ?? hospital,

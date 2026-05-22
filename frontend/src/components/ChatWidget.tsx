@@ -13,6 +13,8 @@ function edocToDate(edoc: string): Date {
   return new Date(parseInt(y), EDOC_MONTHS[m.toUpperCase()] ?? 0, parseInt(d));
 }
 
+const DOCTORS_PAGE_SIZE = 6;
+
 const ChatWidget: React.FC = () => {
   const {
     messages, currentState, machineCtx, isLlmLoading, rateLimitSeconds,
@@ -32,6 +34,7 @@ const ChatWidget: React.FC = () => {
   const [slotsOpenByDoctor, setSlotsOpenByDoctor]             = useState<Record<string, boolean>>({});
   const [dateStartByDoctor, setDateStartByDoctor]             = useState<Record<string, number>>({});
   const [msgQuickReplies, setMsgQuickReplies]                 = useState<Record<number, { label: string; eventType: string; value?: string }[]>>({});
+  const [visibleDoctorCount, setVisibleDoctorCount]           = useState<number>(DOCTORS_PAGE_SIZE);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll to bottom
@@ -46,6 +49,10 @@ const ChatWidget: React.FC = () => {
     setSlotsOpenByDoctor({});
     setDateStartByDoctor({});
   }, [currentState, doctorCards.length]);
+
+  useEffect(() => {
+    setVisibleDoctorCount(DOCTORS_PAGE_SIZE);
+  }, [cardsAnchorMsgId]);
 
   // Set/clear rate limit countdown whenever hook signals a 429
   useEffect(() => {
@@ -173,7 +180,7 @@ const ChatWidget: React.FC = () => {
             {/* Doctor cards anchored inline — only rendered once at their original position */}
             {msg.id === cardsAnchorMsgId && doctorCards.length > 0 && (
               <div className="appt-card-wrap" aria-live="polite">
-                {doctorCards.map((doctor, idx) => {
+                {doctorCards.slice(0, visibleDoctorCount).map((doctor, idx) => {
                   const doctorKey = `${doctor.name}-${idx}`;
                   const hasLiveSchedule = !!doctor.resourceId && !!doctor.locationId;
                   const allDates     = liveDates[doctorKey] ?? [];
@@ -350,6 +357,17 @@ const ChatWidget: React.FC = () => {
                     </article>
                   );
                 })}
+                {doctorCards.length > visibleDoctorCount && (
+                  <div className="appt-show-more-wrap">
+                    <button
+                      type="button"
+                      className="appt-show-more-btn"
+                      onClick={() => setVisibleDoctorCount((prev) => prev + DOCTORS_PAGE_SIZE)}
+                    >
+                      Show more
+                    </button>
+                  </div>
+                )}
                 <div className="appt-global-actions">
                   <button type="button" className="appt-secondary-btn"
                     onClick={() => void sendQuickReply("Change search", "CHANGE_SEARCH")}>
