@@ -52,6 +52,8 @@ import {
 import { requestLoggerMiddleware } from "./middleware/requestLogger.middleware";
 import { sessionMiddleware } from "./middleware/session.middleware";
 import { generalLimiter, chatLimiter } from "./middleware/rateLimit.middleware";
+import { requireInternalRouteAccess } from "./middleware/adminAuth.middleware";
+import { maskSessionId } from "./lib/maskSensitiveData";
 
 // ── Routers ───────────────────────────────────────────────────────────────────
 import { healthRouter }  from "./routes/health.routes";
@@ -66,10 +68,37 @@ dotenv.config();
 
 // ── App setup ─────────────────────────────────────────────────────────────────
 const app = express();
-const frontendOrigin = process.env.FRONTEND_ORIGIN ?? "http://localhost:5173";
+
+const configuredOrigins = (process.env.FRONTEND_ORIGIN ?? "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const ngrokOrigin = String(process.env.NGROK_ORIGIN ?? "").trim();
+if (ngrokOrigin) configuredOrigins.push(ngrokOrigin);
+if (configuredOrigins.length === 0 && process.env.NODE_ENV !== "production") {
+  configuredOrigins.push("http://localhost:5173", "http://127.0.0.1:5173");
+}
+const allowedOrigins = new Set(configuredOrigins);
+
+if (allowedOrigins.size === 0) {
+  log.warn("No allowed FRONTEND_ORIGIN configured; cross-origin browser requests will be blocked.");
+}
 
 app.use(helmet());
-app.use(cors({ origin: frontendOrigin }));
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) {
+      callback(null, true);
+      return;
+    }
+    if (allowedOrigins.has(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(null, false);
+  },
+  credentials: false,
+}));
 app.use(express.json({ limit: "64kb" }));
 app.use(generalLimiter);
 app.use(requestLoggerMiddleware);
@@ -220,7 +249,7 @@ const VALID_AGENT_ACTIONS: AgentDecisionAction[] = [
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/chat
+// POST /api/chat (public-safe route)
 // ─────────────────────────────────────────────────────────────────────────────
 interface ChatRequest {
   currentState?:  string;
@@ -318,9 +347,11 @@ GENERAL:
   const history = (payload.history ?? []).slice(-8);
 
   try {
-    log.info({ sessionId: req.sessionId, state: currentState }, "/api/chat invoked");
+    log.info({ sessionId: maskSessionId(req.sessionId), state: currentState }, "/api/chat invoked");
 
-    void upsertSession(req.sessionId, userLanguage || "en").catch(() => {});
+    void upsertSession(req.sessionId, userLanguage || "en").catch((err) => {
+      log.warn({ err, sessionId: maskSessionId(req.sessionId) }, "upsertSession failed");
+    });
 
     if (userMessage) {
       void logMessage({
@@ -331,7 +362,9 @@ GENERAL:
         buttonLabel,
         buttonValue,
         machineState: currentState,
-      }).catch(() => {});
+      }).catch((err) => {
+        log.warn({ err, sessionId: maskSessionId(req.sessionId) }, "logMessage(user) failed");
+      });
     }
 
     const text = await callLlm(systemPrompt, userContent, history);
@@ -343,21 +376,24 @@ GENERAL:
         message:      text,
         machineState: currentState,
         agentAction:  "chat_response",
-      }).catch(() => {});
+      }).catch((err) => {
+        log.warn({ err, sessionId: maskSessionId(req.sessionId) }, "logMessage(bot) failed");
+      });
     }
 
     res.json({ text });
   } catch (err: unknown) {
     const error = err as { message?: string };
-    log.error({ err, sessionId: req.sessionId }, "/api/chat error");
+    log.error({ err, sessionId: maskSessionId(req.sessionId) }, "/api/chat error");
     res.json({ text: null, error: error.message ?? "LLM unavailable" });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/agent/query — tool-routing orchestration
+// POST /api/agent/query — INTERNAL ONLY tool-routing orchestration
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/api/agent/query", async (req: Request, res: Response): Promise<void> => {
+  if (!requireInternalRouteAccess(req, res)) return;
   const { message, context } = req.body as AgentToolRequest;
   if (!message) { res.status(400).json({ error: "message required" }); return; }
 
@@ -470,9 +506,10 @@ app.post("/api/agent/query", async (req: Request, res: Response): Promise<void> 
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/agent/book-appointment — thin proxy (used internally by agent/query)
+// POST /api/agent/book-appointment — INTERNAL ONLY thin proxy
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/api/agent/book-appointment", async (req: Request, res: Response): Promise<void> => {
+  if (!requireInternalRouteAccess(req, res)) return;
   const payload = req.body as Record<string, unknown>;
   try {
     const raw = await localPost("/api/edoc/book-appointment", payload);
@@ -486,7 +523,7 @@ app.post("/api/agent/book-appointment", async (req: Request, res: Response): Pro
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/agent/decide — LLM orchestration decision
+// POST /api/agent/decide — public-safe LLM orchestration decision
 // ─────────────────────────────────────────────────────────────────────────────
 interface AgentDecideRequest {
   currentState?:   string;
@@ -579,7 +616,7 @@ Return ONLY a valid JSON object — no markdown, no extra text:
   }
 }${userLanguage && userLanguage !== "en" ? `\n\n=== LANGUAGE ===\nThe user's interface language is "${userLanguage}". When action is ASK_CLARIFICATION, write the "reason" field in the user's language (not English).` : ""}`;
 
-  log.info({ sessionId: req.sessionId, state: botState, msg: userMessage }, "[AGENT/decide]");
+  log.info({ sessionId: maskSessionId(req.sessionId), state: botState, userMessageLength: userMessage.length }, "[AGENT/decide]");
 
   try {
     const raw    = stripMarkdownJson(
@@ -624,13 +661,15 @@ Return ONLY a valid JSON object — no markdown, no extra text:
         userMessage,
         confidence:     decision.confidence,
         entities:       decision.entities,
-      }).catch(() => {});
+      }).catch((err) => {
+        log.warn({ err, sessionId: maskSessionId(req.sessionId) }, "logEvent(workflow_switch) failed");
+      });
     }
 
     res.json(decision);
   } catch (err: unknown) {
     const e = err as { message?: string };
-    log.warn({ err: e.message, sessionId: req.sessionId }, "[AGENT/decide] LLM error, falling back");
+    log.warn({ err: e.message, sessionId: maskSessionId(req.sessionId) }, "[AGENT/decide] LLM error, falling back");
     res.json(AGENT_DECIDE_FALLBACK);
   }
 });

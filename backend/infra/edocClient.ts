@@ -18,6 +18,7 @@ import axios from "axios";
 import { retryWithBackoff, safeFailure, type SafeFailureResponse } from "./retryWithBackoff";
 import { logEvent } from "../services/auditService";
 import log from "../lib/logger";
+import { maskSensitiveData } from "../lib/maskSensitiveData";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const EDOC_BASE = (process.env.APOLLO_EDOC_BASE_URL ?? "").replace(/\/$/, "");
@@ -41,7 +42,21 @@ export function isEdocConfigured(): boolean {
 
 // ── Internal log helper ───────────────────────────────────────────────────────
 function logEdoc(step: string, payload: unknown): void {
-  log.info({ data: payload }, `[EDOC] ${step}`);
+  const summary = (() => {
+    if (payload === null || payload === undefined) return { type: "empty" };
+    if (Array.isArray(payload)) return { type: "array", count: payload.length };
+    if (typeof payload !== "object") return { type: typeof payload };
+    const obj = payload as Record<string, unknown>;
+    return {
+      type: "object",
+      keys: Object.keys(obj).slice(0, 12),
+      keyCount: Object.keys(obj).length,
+      retcode: obj.retcode,
+      status: obj.status,
+      error: obj.error ? String(obj.error).slice(0, 120) : undefined,
+    };
+  })();
+  log.info({ summary: maskSensitiveData(summary) }, `[EDOC] ${step}`);
 }
 
 // ── Core POST wrapper ─────────────────────────────────────────────────────────
@@ -85,7 +100,9 @@ export async function edocPost<T = unknown>(
           path,
           attempt,
           error: String(e.message ?? ""),
-        }).catch(() => {});
+        }).catch((auditErr) => {
+          log.warn({ err: auditErr }, "[EDOC] audit log failed: retry");
+        });
       },
 
       onCircuitOpen() {
@@ -93,7 +110,9 @@ export async function edocPost<T = unknown>(
         void logEvent(sessionId, "edoc_failure", {
           path,
           reason: "circuit_open",
-        }).catch(() => {});
+        }).catch((auditErr) => {
+          log.warn({ err: auditErr }, "[EDOC] audit log failed: circuit_open");
+        });
       },
     },
   );
@@ -105,7 +124,9 @@ export async function edocPost<T = unknown>(
       path,
       retries: retryCount,
       timedOut: result.timedOut,
-    }).catch(() => {});
+    }).catch((auditErr) => {
+      log.warn({ err: auditErr }, "[EDOC] audit log failed: exhausted retries");
+    });
   }
 
   if (!isSafeFailure(result)) {
@@ -149,14 +170,18 @@ export async function edocGet<T = unknown>(
           path,
           attempt,
           error: String(e.message ?? ""),
-        }).catch(() => {});
+        }).catch((auditErr) => {
+          log.warn({ err: auditErr }, "[EDOC] audit log failed: get retry");
+        });
       },
 
       onCircuitOpen() {
         void logEvent(sessionId, "edoc_failure", {
           path,
           reason: "circuit_open",
-        }).catch(() => {});
+        }).catch((auditErr) => {
+          log.warn({ err: auditErr }, "[EDOC] audit log failed: get circuit_open");
+        });
       },
     },
   );
@@ -166,7 +191,9 @@ export async function edocGet<T = unknown>(
       path,
       retries: retryCount,
       timedOut: (result as SafeFailureResponse).timedOut,
-    }).catch(() => {});
+    }).catch((auditErr) => {
+      log.warn({ err: auditErr }, "[EDOC] audit log failed: get exhausted retries");
+    });
   }
 
   if (!isSafeFailure(result)) {

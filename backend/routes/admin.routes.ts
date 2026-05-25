@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import { requireAdmin } from "../middleware/adminAuth.middleware";
 import { buildSessionDebugPayload } from "../services/adminDebugService";
 import log from "../lib/logger";
+import { isValidSessionId } from "../middleware/session.middleware";
 
 export const adminRouter = Router();
 
@@ -14,6 +15,10 @@ adminRouter.get("/session/:sessionId", async (req: Request, res: Response): Prom
 
   if (!sessionId || typeof sessionId !== "string" || sessionId.trim().length === 0) {
     res.status(400).json({ error: "sessionId is required." });
+    return;
+  }
+  if (!isValidSessionId(sessionId.trim())) {
+    res.status(400).json({ error: "sessionId format is invalid." });
     return;
   }
   // Enforce safe length to prevent DB abuse (UUIDs are 36 chars)

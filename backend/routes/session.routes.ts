@@ -3,6 +3,7 @@ import { getSession } from "../services/chatSessionService";
 import { getPatientByPhone } from "../services/patientService";
 import { getAppointmentsForPatient } from "../services/appointmentService";
 import { generalLimiter } from "../middleware/rateLimit.middleware";
+import { isValidSessionId } from "../middleware/session.middleware";
 import log from "../lib/logger";
 
 export const sessionRouter = Router();
@@ -14,8 +15,12 @@ sessionRouter.get(
   generalLimiter,
   async (req: Request, res: Response): Promise<void> => {
     const { sessionId } = req.params;
-    if (!sessionId || typeof sessionId !== "string") {
+    if (!sessionId || typeof sessionId !== "string" || !isValidSessionId(sessionId)) {
       res.status(400).json({ error: "sessionId required", messages: [] });
+      return;
+    }
+    if (req.sessionId !== sessionId) {
+      res.status(403).json({ error: "Session access denied", messages: [] });
       return;
     }
     try {
@@ -50,9 +55,13 @@ sessionRouter.get(
 sessionRouter.post(
   "/appointments/check",
   async (req: Request, res: Response): Promise<void> => {
+    if (req.sessionId === "anonymous") {
+      res.status(401).json({ error: "X-Session-Id required", existing: null });
+      return;
+    }
     const { phone, doctorName } = req.body as Record<string, string>;
     const normalizedPhone = String(phone ?? "").replace(/[^0-9+]/g, "");
-    if (!normalizedPhone || !doctorName) {
+    if (!normalizedPhone || !doctorName || !/^\+?[0-9]{10,13}$/.test(normalizedPhone)) {
       res.status(400).json({ error: "phone and doctorName required", existing: null });
       return;
     }

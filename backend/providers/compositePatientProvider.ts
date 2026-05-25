@@ -24,6 +24,7 @@ import type { PatientProvider, PatientRecord, CreatePatientInput, ProviderMetada
 import { apolloEdocPatientProvider } from "./apolloEdocPatientProvider";
 import { prismaPatientProvider } from "./prismaPatientProvider";
 import { logEvent } from "../services/auditService";
+import log from "../lib/logger";
 
 // Session ID is not meaningful at the provider layer; use a fixed sentinel for
 // audit events that originate here rather than from an HTTP request.
@@ -52,7 +53,9 @@ function auditProviderEvent(
     fallbackUsed:   meta.fallbackUsed,
     fallbackReason: meta.fallbackReason ?? null,
     ...extra,
-  }).catch(() => {});
+  }).catch((err) => {
+    log.warn({ err, operation }, "[CompositeProvider] auditProviderEvent failed");
+  });
 }
 
 export const compositePatientProvider: PatientProvider = {
@@ -67,7 +70,7 @@ export const compositePatientProvider: PatientProvider = {
       return patient;
     } catch (primaryErr) {
       const reason = classifyError(primaryErr);
-      console.warn(`[CompositeProvider] EDOC getPatientByPhone failed (${reason}), falling back to Prisma`);
+      log.warn({ reason }, "[CompositeProvider] EDOC getPatientByPhone failed, falling back to Prisma");
 
       auditProviderEvent("getPatientByPhone", {
         provider:       "prisma_local",
@@ -95,12 +98,14 @@ export const compositePatientProvider: PatientProvider = {
         fullName:    input.fullName,
         dob:         input.dob,
         uhid:        patient.uhid ?? undefined,
-      }).catch(() => {}); // non-fatal — local is fallback, not source of truth
+      }).catch((err) => {
+        log.warn({ err }, "[CompositeProvider] local cache createPatient failed");
+      }); // non-fatal — local is fallback, not source of truth
 
       return patient;
     } catch (primaryErr) {
       const reason = classifyError(primaryErr);
-      console.warn(`[CompositeProvider] EDOC createPatient failed (${reason}), falling back to Prisma`);
+      log.warn({ reason }, "[CompositeProvider] EDOC createPatient failed, falling back to Prisma");
 
       auditProviderEvent("createPatient", {
         provider:       "prisma_local",

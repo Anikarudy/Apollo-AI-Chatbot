@@ -8,6 +8,7 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { ApolloAssistRunner } from "../../apolloAssistMachine";
 import { mapInputToEvent, AppEvent } from "../inputMapping.js";
 import { getStateResponse, ChatContext, QuickReply } from "../stateResponses";
+import { maskSensitiveData } from "../maskSensitiveData";
 
 export interface ChatMessage {
   id: number;
@@ -463,7 +464,9 @@ export function useChatMachine() {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Session-Id": sessionIdRef.current },
       body: JSON.stringify({ message: resp.message, messageType: "system_event", machineState: state, role: "bot" }),
-    }).catch(() => {});
+    }).catch((err) => {
+      console.warn("[CHAT] Failed to persist static bot message:", err);
+    });
 
     // Background-translate the static message when the UI language is non-English.
     // The English text is shown immediately; we replace it once the translation arrives.
@@ -531,8 +534,14 @@ export function useChatMachine() {
   }, []);
 
   const logEdoc = useCallback((step: string, payload: Record<string, unknown>) => {
-    // Keep logs verbose by design for EDOC diagnostics.
-    console.info(`[EDOC] ${step}`, payload);
+    const summary = {
+      keys: Object.keys(payload).slice(0, 12),
+      keyCount: Object.keys(payload).length,
+      status: payload.status,
+      retcode: payload.retcode,
+      error: payload.error ? String(payload.error).slice(0, 120) : undefined,
+    };
+    console.info(`[EDOC] ${step}`, maskSensitiveData(summary));
   }, []);
 
   const getAvailableDates = useCallback(async (
@@ -1763,8 +1772,8 @@ export function useChatMachine() {
       }
       if (!res.ok) return null;
       const decision = await res.json() as AgentDecision;
-      console.log(
-        `[AGENT] state="${currentState}" message="${text}" → ` +
+      console.info(
+        `[AGENT] state="${currentState}" userMessageLength=${text.length} → ` +
         `action="${decision.action}" workflow="${decision.targetWorkflow ?? "-"}" ` +
         `confidence=${decision.confidence}`
       );
@@ -1819,7 +1828,7 @@ export function useChatMachine() {
       if (nextState !== edocFiredForState.current) edocFiredForState.current = "";
       setCurrentState(nextState);
       setMachineCtx(nextCtx);
-      console.log(`[AGENT] Transitioned → state="${nextState}"`);
+      console.info(`[AGENT] Transitioned → state="${nextState}"`);
       pushStaticBotMessage(nextState, nextCtx);
     };
 
@@ -1827,7 +1836,7 @@ export function useChatMachine() {
     if (action === "ASK_CLARIFICATION") {
       const question = decision.reason || "Could you clarify what you're looking for?";
       setMessages((prev) => [...prev, { id: nextId(), sender: "bot", text: question }]);
-      console.log(`[AGENT] ASK_CLARIFICATION: "${question}"`);
+      console.info("[AGENT] ASK_CLARIFICATION emitted");
       return true;
     }
 
@@ -1837,7 +1846,7 @@ export function useChatMachine() {
       if (runner.currentState !== "MAIN_MENU") {
         runner.sendEvent({ type: "BACK_TO_MENU" } as AppEvent);
       }
-      console.log("[AGENT] RESET_FLOW → MAIN_MENU");
+      console.info("[AGENT] RESET_FLOW → MAIN_MENU");
       commitState();
       return true;
     }
@@ -1857,7 +1866,7 @@ export function useChatMachine() {
       if (useCity)      params.set("city",      useCity);
       if (useBranch)    params.set("branch",    useBranch);
 
-      console.log(`[AGENT] CALL_TOOL CHANGE_DOCTOR name="${nameQuery}" city="${useCity ?? "-"}" specialty="${useSpecialty ?? "-"}"`);
+      console.info("[AGENT] CALL_TOOL CHANGE_DOCTOR");
 
       let found: DoctorCardData[] = [];
       try {
@@ -1918,7 +1927,7 @@ export function useChatMachine() {
       if (entities.city)        freshPrefill.city       = entities.city;
       if (entities.branch)      freshPrefill.branch     = entities.branch;
 
-      console.log(`[AGENT] ${action} → workflow="${targetWorkflow ?? "-"}" freshEntities:`, freshPrefill);
+      console.info(`[AGENT] ${action} → workflow="${targetWorkflow ?? "-"}"`, maskSensitiveData(freshPrefill));
 
       // ── Workflows that don't go through AI_PREFILL ─────────────────────────
 
@@ -2163,7 +2172,9 @@ export function useChatMachine() {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Session-Id": sessionIdRef.current },
         body: JSON.stringify({ message, messageType, buttonLabel, buttonValue, machineState: currentState }),
-      }).catch(() => {});
+      }).catch((err) => {
+        console.warn("[CHAT] Failed to persist interaction:", err);
+      });
     },
     [currentState]
   );

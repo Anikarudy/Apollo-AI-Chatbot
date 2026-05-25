@@ -12,6 +12,7 @@ dotenv.config();
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import Groq from "groq-sdk";
+import log from "./logger";
 
 // Re-export for consumers that drive Gemini tool-calling directly
 export { GoogleGenerativeAI };
@@ -53,7 +54,7 @@ export async function callLlm(
   if (process.env.GEMINI_API_KEY) {
     try {
       const geminiModel = "gemini-2.0-flash";
-      console.log(`[LLM] Trying Gemini (${geminiModel})`);
+      log.info({ provider: "gemini", model: geminiModel }, "[LLM] Trying provider");
       const model = genAI.getGenerativeModel({ model: geminiModel, systemInstruction: systemPrompt });
       const geminiHistory = (history ?? [])
         .filter((h) => String(h.text ?? "").trim().length > 0)
@@ -68,19 +69,19 @@ export async function callLlm(
       const result = await chat.sendMessage(userContent);
       const text = result.response.text();
       if (text.trim()) {
-        console.log(`[LLM] Response from Gemini (${geminiModel})`);
+        log.info({ provider: "gemini", model: geminiModel }, "[LLM] Response received");
         return text;
       }
     } catch (err: unknown) {
       const error = err as { message?: string };
-      console.warn("[LLM] Gemini failed, falling back to Groq:", String(error.message ?? err));
+      log.warn({ provider: "gemini", err: String(error.message ?? err) }, "[LLM] Provider failed, falling back");
     }
   }
 
   // ── 2. Groq (fallback) ────────────────────────────────────────────────────
   if (_groq) {
     const groqModel = "llama-3.3-70b-versatile";
-    console.log(`[LLM] Trying Groq (${groqModel})`);
+    log.info({ provider: "groq", model: groqModel }, "[LLM] Trying provider");
     const completion = await _groq.chat.completions.create({
       model: groqModel,
       messages: [
@@ -92,7 +93,7 @@ export async function callLlm(
       temperature: 0.5,
     });
     const text = completion.choices[0]?.message?.content ?? "";
-    console.log(`[LLM] Response from Groq (${groqModel})`);
+    log.info({ provider: "groq", model: groqModel }, "[LLM] Response received");
     return text;
   }
 

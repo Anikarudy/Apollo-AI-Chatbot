@@ -12,6 +12,7 @@
 
 import prisma from "../db/prismaClient";
 import type { ChatMessage, Prisma } from "@prisma/client";
+import log from "../lib/logger";
 
 export interface LogMessageInput {
   sessionId: string;
@@ -46,7 +47,7 @@ export async function logMessage(input: LogMessageInput): Promise<ChatMessage | 
     });
   } catch (err) {
     // Log but never propagate — chat must work even if audit DB is down
-    console.error("[chatMessageService] logMessage failed:", err);
+    log.warn({ err }, "[chatMessageService] logMessage failed");
     return null;
   }
 }

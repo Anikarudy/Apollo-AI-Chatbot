@@ -16,6 +16,7 @@ import { getOrCreatePatient, setPatientUhid, getPatientByPhone } from "../servic
 import { createAppointment, updateAppointmentStatusByEdocId } from "../services/appointmentService";
 import operationalPrisma from "../db/operationalPrismaClient";
 import log from "../lib/logger";
+import { maskSensitiveData, maskSessionId } from "../lib/maskSensitiveData";
 
 export const edocRouter = Router();
 
@@ -60,9 +61,11 @@ edocRouter.post("/book-appointment", bookingLimiter, async (req: Request, res: R
       void logEvent(req.sessionId, "booking_duplicate_prevented", {
         bookingRequestId,
         status: existing.status,
-      }).catch(() => {});
+      }).catch((err) => {
+        log.warn({ err, sessionId: maskSessionId(req.sessionId) }, "audit log failed: booking_duplicate_prevented");
+      });
 
-      log.info({ bookingRequestId, status: existing.status }, "[Idempotency] hit — returning stored response");
+      log.info(maskSensitiveData({ bookingRequestId, status: existing.status }), "[Idempotency] hit — returning stored response");
       const stored = existing.responsePayload as Record<string, unknown> | null;
       if (existing.status === "success" && stored) {
         res.json({ ...stored, idempotent: true });
@@ -110,28 +113,34 @@ edocRouter.post("/book-appointment", bookingLimiter, async (req: Request, res: R
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             data:  { status: "failed", responsePayload: edocData as any },
           })
-          .catch(() => {});
+          .catch((err) => {
+            log.warn({ err }, "[Idempotency] failed to update BookingRequest(row=failed)");
+          });
       }
       void logEvent(req.sessionId, "booking_failure", {
         bookingRequestId,
         reason:        "edoc_exhausted",
         resourceId:    b.ResourceID,
         startDateTime: b.StartDateTime,
-      }).catch(() => {});
+      }).catch((err) => {
+        log.warn({ err, sessionId: maskSessionId(req.sessionId) }, "audit log failed: booking_failure");
+      });
       res.status(503).json(edocData);
       return;
     }
 
-    log.info({ appointmentId: edocData.AppointmentID }, "[EDOC] BookAppointment succeeded");
+    log.info("[EDOC] BookAppointment succeeded");
 
-    void logEvent(req.sessionId, "booking_success", {
+    void logEvent(req.sessionId, "booking_success", maskSensitiveData({
       bookingRequestId,
       appointmentId: edocData.AppointmentID,
       resourceId:    b.ResourceID,
       locationId:    b.LocationID,
       uhid:          b.UHIDNumber,
       startDateTime: b.StartDateTime,
-    }).catch(() => {});
+    })).catch((err) => {
+      log.warn({ err, sessionId: maskSessionId(req.sessionId) }, "audit log failed: booking_success");
+    });
 
     if (bookingRequestId) {
       await operationalPrisma.bookingRequest
@@ -140,7 +149,9 @@ edocRouter.post("/book-appointment", bookingLimiter, async (req: Request, res: R
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           data:  { status: "success", responsePayload: edocData as any },
         })
-        .catch(() => {});
+        .catch((err) => {
+          log.warn({ err }, "[Idempotency] failed to update BookingRequest(row=success)");
+        });
     }
 
     if (phone) {
@@ -162,7 +173,7 @@ edocRouter.post("/book-appointment", bookingLimiter, async (req: Request, res: R
               edocData.AppointmentID !== undefined ? String(edocData.AppointmentID) : undefined,
           });
         } catch (opErr) {
-          console.error("[Operational] Failed to persist appointment:", opErr);
+          log.warn({ err: opErr }, "[Operational] Failed to persist appointment");
         }
       })();
     }
@@ -176,15 +187,19 @@ edocRouter.post("/book-appointment", bookingLimiter, async (req: Request, res: R
           where: { bookingRequestId },
           data:  { status: "failed", responsePayload: { error: String(e.message ?? "unknown") } },
         })
-        .catch(() => {});
+        .catch((err) => {
+          log.warn({ err }, "[Idempotency] failed to update BookingRequest(row=failed:catch)");
+        });
     }
-    void logEvent(req.sessionId, "booking_failure", {
+    void logEvent(req.sessionId, "booking_failure", maskSensitiveData({
       bookingRequestId,
       error:         String(e.message ?? "unknown"),
       resourceId:    b.ResourceID,
       locationId:    b.LocationID,
       startDateTime: b.StartDateTime,
-    }).catch(() => {});
+    })).catch((err) => {
+      log.warn({ err, sessionId: maskSessionId(req.sessionId) }, "audit log failed: booking_failure(catch)");
+    });
     res.status(500).json({ error: e.response?.data ?? e.message ?? "BookAppointment failed" });
   }
 });
@@ -207,7 +222,7 @@ edocRouter.post("/reschedule-appointment", bookingLimiter, async (req: Request, 
       b,
       { headers: edocHeaders(), timeout: 15000 },
     );
-    console.log("[EDOC] ResheduleAppointment succeeded (200 OK)");
+    log.info("[EDOC] ResheduleAppointment succeeded (200 OK)");
     const edocData = r.data as Record<string, unknown>;
 
     void (async () => {
@@ -230,7 +245,7 @@ edocRouter.post("/reschedule-appointment", bookingLimiter, async (req: Request, 
           });
         }
       } catch (opErr) {
-        console.error("[Operational] Failed to update rescheduled appointment:", opErr);
+        log.warn({ err: opErr }, "[Operational] Failed to update rescheduled appointment");
       }
     })();
 
@@ -259,9 +274,9 @@ edocRouter.post("/cancel-appointment", bookingLimiter, async (req: Request, res:
       b,
       { headers: edocHeaders(), timeout: 15000 },
     );
-    console.log("[EDOC] CancelAppointment succeeded (200 OK)");
+    log.info("[EDOC] CancelAppointment succeeded (200 OK)");
     void updateAppointmentStatusByEdocId(String(b.AppointmentID), "cancelled").catch((err) =>
-      console.error("[Operational] Failed to update cancelled status:", err),
+      log.warn({ err }, "[Operational] Failed to update cancelled status"),
     );
     res.json(r.data);
   } catch (err: unknown) {
@@ -496,12 +511,12 @@ edocRouter.post("/uhid-search", async (req: Request, res: Response): Promise<voi
   try {
     const localPatient = await getPatientByPhone(normalizedPhone);
     if (localPatient?.uhid) {
-      console.log(`[UHID] Cache hit for ${normalizedPhone} → ${localPatient.uhid}`);
+      log.info("[UHID] Cache hit (local patient)");
       res.json({ uhidList: [{ UHIDNumber: localPatient.uhid }], retcode: 0, source: "local" });
       return;
     }
   } catch (localErr) {
-    console.error("[UHID] Local patient lookup failed, falling back to EDOC:", localErr);
+    log.warn({ err: localErr }, "[UHID] Local patient lookup failed, falling back to EDOC");
   }
 
   try {
@@ -616,7 +631,7 @@ edocRouter.post("/generate-uhid", async (req: Request, res: Response): Promise<v
               await setPatientUhid(patient.id, uhid);
             }
           } catch (opErr) {
-            console.error("[Operational] Failed to persist patient from generate-uhid:", opErr);
+            log.warn({ err: opErr }, "[Operational] Failed to persist patient from generate-uhid");
           }
         })();
       }

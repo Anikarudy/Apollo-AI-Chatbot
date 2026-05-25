@@ -3,6 +3,7 @@ import { intentLimiter, generalLimiter } from "../middleware/rateLimit.middlewar
 import { callLlm, hasAnyLlm, stripMarkdownJson } from "../lib/llmClient";
 import { upsertSession } from "../services/chatSessionService";
 import { logMessage } from "../services/chatMessageService";
+import log from "../lib/logger";
 
 export const intentRouter = Router();
 
@@ -240,7 +241,9 @@ intentRouter.post(
       return;
     }
     // Ensure session row exists BEFORE inserting child message (FK constraint)
-    await upsertSession(req.sessionId).catch(() => {});
+    await upsertSession(req.sessionId).catch((err) => {
+      log.warn({ err }, "upsertSession failed in /api/log-interaction");
+    });
     void logMessage({
       sessionId:    req.sessionId,
       role:         body.role ?? "user",
@@ -249,7 +252,9 @@ intentRouter.post(
       buttonLabel:  body.buttonLabel,
       buttonValue:  body.buttonValue,
       machineState: body.machineState,
-    }).catch(() => {});
+    }).catch((err) => {
+      log.warn({ err }, "logMessage failed in /api/log-interaction");
+    });
     res.json({ ok: true });
   },
 );

@@ -11,6 +11,8 @@
 import prisma from "../db/prismaClient";
 import type { ChatSession } from "@prisma/client";
 
+const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS ?? "86400");
+
 /**
  * Upsert a session.
  * Called at the start of every /api/chat request so the row always exists
@@ -45,6 +47,12 @@ export async function getSession(
     },
   });
   if (!session) return null;
+  if (SESSION_TTL_SECONDS > 0) {
+    const ageMs = Date.now() - session.updatedAt.getTime();
+    if (ageMs > SESSION_TTL_SECONDS * 1000) {
+      return null;
+    }
+  }
   // Return messages in chronological order
   return { ...session, messages: session.messages.reverse() };
 }
