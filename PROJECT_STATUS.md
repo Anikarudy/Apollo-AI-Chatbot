@@ -207,7 +207,7 @@ Carries all session state: `doctorName`, `specialty`, `city`, `branch`, `symptom
 `data/finalDoctors.json` — 6,303 doctor records (`doctorName`, `resourceId`, `regionId`, `city`, `branch`, `location`, `speciality`).
 
 ### Knowledge base (`src/knowledgeBase.ts`)
-- Loads `finalDoctors.json` + `data/jubileeDoctors.json` at startup.
+- Loads `finalDoctors.json` at startup.
 - Enriches each record: resolves `locationId` from `BRANCH_LOCATION_MAP` if not present in raw data.
 - Deduplicates by `name|resourceId|locationId|regionId`.
 - 5,337 of 6,303 records resolve a `locationId` (the rest lack a recognised branch string).
