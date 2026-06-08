@@ -9,11 +9,22 @@ import { ApolloAssistRunner } from "../../apolloAssistMachine";
 import { mapInputToEvent, AppEvent } from "../inputMapping.js";
 import { getStateResponse, ChatContext, QuickReply } from "../stateResponses";
 import { maskSensitiveData } from "../maskSensitiveData";
+import { createApiTransport } from "../services/transport";
+import {
+  OtpFlowState,
+  initialOtpFlowState,
+  mapOtpErrorMessage,
+  reduceOtpFlowState,
+  submitMobileVerificationStage,
+} from "../services/otpVerificationFlow";
+import { uploadFileWithHandshake } from "../services/fileUploadFlow";
+import { normalizeIncomingContent } from "../services/messageContent";
 
 export interface ChatMessage {
   id: number;
   sender: "bot" | "user";
   text: string;
+  feedback?: "LIKE" | "DISLIKE";
 }
 
 export interface DoctorCardData {
@@ -268,12 +279,56 @@ function getOrCreateSessionId(): string {
   return id;
 }
 
+const CHAT_CACHE_KEY = "apollo_chat_cache_v1";
+
+function loadCachedMessages(sessionId: string): ChatMessage[] {
+  try {
+    const raw = localStorage.getItem(CHAT_CACHE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as Record<string, ChatMessage[]>;
+    const rows = parsed?.[sessionId];
+    return Array.isArray(rows)
+      ? rows.filter((m) => m && (m.sender === "bot" || m.sender === "user") && typeof m.text === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistCachedMessages(sessionId: string, messages: ChatMessage[]): void {
+  try {
+    const raw = localStorage.getItem(CHAT_CACHE_KEY);
+    const parsed = raw ? (JSON.parse(raw) as Record<string, ChatMessage[]>) : {};
+    parsed[sessionId] = messages.slice(-120);
+    localStorage.setItem(CHAT_CACHE_KEY, JSON.stringify(parsed));
+  } catch {
+    // Local cache failures should never block chat flow.
+  }
+}
+
+function getHostFirstUserMessage(): string | null {
+  try {
+    const qs = new URLSearchParams(window.location.search);
+    const fromQuery = String(qs.get("firstUserMessage") ?? "").trim();
+    if (fromQuery) return fromQuery;
+    const fromAltQuery = String(qs.get("first_user_message") ?? "").trim();
+    if (fromAltQuery) return fromAltQuery;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export function useChatMachine() {
   // Stable session identifier — created once per browser and sent as X-Session-Id header
   const sessionIdRef = useRef<string>(getOrCreateSessionId());
 
   const runnerRef = useRef<ApolloAssistRunner | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messageFeedbackById, setMessageFeedbackById] = useState<Record<number, "LIKE" | "DISLIKE">>({});
+  const [otpFlowState, setOtpFlowState] = useState<OtpFlowState>(initialOtpFlowState());
+  const [isUploadingFile, setIsUploadingFile] = useState<boolean>(false);
+  const apiTransportRef = useRef(createApiTransport({ agentId: "apollo-assist-web" }));
   // Keep ref in sync with state so callbacks can read current messages without dep issues
   useEffect(() => { messagesRef.current = messages; }, [messages]);
   const [currentState, setCurrentState] = useState<string>("WELCOME");
@@ -380,6 +435,8 @@ export function useChatMachine() {
   // Key = `${doctorKey}||${edocDate}||${slot}`; value = serviceId from DoctorCalenderRules_V2
   const [slotServiceByKey, setSlotServiceByKey] = useState<Record<string, string>>({});
   const [slotsLoading, setSlotsLoading] = useState<Record<string, boolean>>({});
+  const inFlightTurnRef = useRef<boolean>(false);
+  const firstMessageSentRef = useRef<boolean>(false);
   const liveDateRequestsInFlight = useRef<Set<string>>(new Set());
   const liveDateRequestsDone = useRef<Set<string>>(new Set());
   const liveScheduleListKey = useRef<string>("");
@@ -398,8 +455,23 @@ export function useChatMachine() {
       setMessages([{ id: nextId(), sender: "bot", text: welcome.message }]);
     };
 
+    const maybeSendHostFirstMessage = (hasAnyUserMessage: boolean) => {
+      if (firstMessageSentRef.current || hasAnyUserMessage) return;
+      const firstUserMessage = getHostFirstUserMessage();
+      if (!firstUserMessage) return;
+      const sentKey = `apollo_first_msg_sent:${sessionIdRef.current}`;
+      if (localStorage.getItem(sentKey) === "1") return;
+      firstMessageSentRef.current = true;
+      localStorage.setItem(sentKey, "1");
+      void sendUserText(firstUserMessage);
+    };
+
     const fetchSession = async (retries = 3, delayMs = 1500): Promise<void> => {
       const sid = sessionIdRef.current;
+      const cached = loadCachedMessages(sid);
+      if (cached.length > 0) {
+        setMessages(cached);
+      }
       for (let attempt = 0; attempt < retries; attempt++) {
         try {
           const r = await fetch(`/api/session/${encodeURIComponent(sid)}`, {
@@ -409,13 +481,12 @@ export function useChatMachine() {
             const data = await r.json() as { messages?: Array<{ role: string; message: string }> };
             const msgs = data?.messages ?? [];
             if (msgs.length > 0) {
-              setMessages(
-                msgs.map((m) => ({
-                  id:     nextId(),
-                  sender: (m.role === "user" ? "user" : "bot") as "user" | "bot",
-                  text:   m.message,
-                }))
-              );
+              const hydrated = msgs.map((m) => ({
+                id:     nextId(),
+                sender: (m.role === "user" ? "user" : "bot") as "user" | "bot",
+                text:   m.message,
+              }));
+              setMessages(hydrated);
               // Restore machine state (currentState + machineCtx) so doctor cards re-render
               const snapshotRaw = localStorage.getItem("apollo_machine_snapshot");
               if (snapshotRaw) {
@@ -427,14 +498,17 @@ export function useChatMachine() {
                   }
                 } catch { /* ignore corrupt snapshot */ }
               }
+              maybeSendHostFirstMessage(hydrated.some((m) => m.sender === "user"));
             } else {
-              showWelcome();
+              if (cached.length === 0) showWelcome();
+              maybeSendHostFirstMessage(false);
             }
             return;
           }
           if (r.status === 404) {
             // Brand-new session — no retry needed
-            showWelcome();
+            if (cached.length === 0) showWelcome();
+            maybeSendHostFirstMessage(cached.some((m) => m.sender === "user"));
             return;
           }
         } catch {
@@ -444,13 +518,18 @@ export function useChatMachine() {
           await new Promise<void>((res) => setTimeout(res, delayMs));
         }
       }
-      showWelcome();
+      if (cached.length === 0) showWelcome();
+      maybeSendHostFirstMessage(cached.some((m) => m.sender === "user"));
     };
 
     void fetchSession();
 
     return () => runner.stop();
   }, []);
+
+  useEffect(() => {
+    persistCachedMessages(sessionIdRef.current, messages);
+  }, [messages]);
 
   // Static response
   const pushStaticBotMessage = useCallback((state: string, ctx: ChatContext) => {
@@ -2073,11 +2152,82 @@ export function useChatMachine() {
     return executeAgentDecision(decision);
   }, [callAgentDecide, executeAgentDecision, tryAiIntent]);
 
+  const submitMobileStage = useCallback(async (mobileNumber: string): Promise<boolean> => {
+    try {
+      const response = await submitMobileVerificationStage({
+        sessionId: sessionIdRef.current,
+        stage: "mobile",
+        mobileNumber,
+      });
+      setOtpFlowState((prev) => reduceOtpFlowState({ ...prev, mobileNumber }, response));
+      return !response.error_code;
+    } catch {
+      setOtpFlowState((prev) => ({
+        ...prev,
+        stage: "error",
+        errorCode: "tool_error",
+        errorMessage: mapOtpErrorMessage("tool_error"),
+      }));
+      setMessages((prev) => [...prev, { id: nextId(), sender: "bot", text: mapOtpErrorMessage("tool_error") }]);
+      return false;
+    }
+  }, []);
+
+  const submitOtpStage = useCallback(async (otp: string): Promise<boolean> => {
+    try {
+      const response = await submitMobileVerificationStage({
+        sessionId: sessionIdRef.current,
+        stage: "otp",
+        otp,
+        challengeId: otpFlowState.challengeId,
+      });
+      setOtpFlowState((prev) => reduceOtpFlowState(prev, response));
+      if (response.error_code) {
+        setMessages((prev) => [...prev, { id: nextId(), sender: "bot", text: mapOtpErrorMessage(response.error_code, response.error_message) }]);
+        return false;
+      }
+      if (response.uhid_options && response.uhid_options.length > 0) {
+        const optionsText = response.uhid_options
+          .map((item, idx) => `${idx + 1}. ${item.fullName ?? "Patient"} (${item.uhid})`)
+          .join("\n");
+        setMessages((prev) => [...prev, { id: nextId(), sender: "bot", text: `I found multiple patient profiles. Reply with the number to continue:\n${optionsText}` }]);
+        return false;
+      }
+      return true;
+    } catch {
+      setMessages((prev) => [...prev, { id: nextId(), sender: "bot", text: mapOtpErrorMessage("tool_error") }]);
+      return false;
+    }
+  }, [otpFlowState.challengeId]);
+
+  const submitUhidStage = useCallback(async (uhid: string): Promise<boolean> => {
+    try {
+      const response = await submitMobileVerificationStage({
+        sessionId: sessionIdRef.current,
+        stage: "uhid",
+        selectedUhid: uhid,
+        challengeId: otpFlowState.challengeId,
+      });
+      setOtpFlowState((prev) => reduceOtpFlowState(prev, response));
+      if (response.error_code) {
+        setMessages((prev) => [...prev, { id: nextId(), sender: "bot", text: mapOtpErrorMessage(response.error_code, response.error_message) }]);
+        return false;
+      }
+      return true;
+    } catch {
+      setMessages((prev) => [...prev, { id: nextId(), sender: "bot", text: mapOtpErrorMessage("tool_error") }]);
+      return false;
+    }
+  }, [otpFlowState.challengeId]);
+
   // ── Free-text input ────────────────────────────────────────────────────────
   const sendUserText = useCallback(
     async (text: string) => {
       const runner = runnerRef.current;
       if (!runner) return;
+      if (inFlightTurnRef.current) return;
+      inFlightTurnRef.current = true;
+      try {
       setMessages((prev) => [...prev, { id: nextId(), sender: "user", text }]);
 
       // ── Language detection ─────────────────────────────────────────────────
@@ -2091,6 +2241,62 @@ export function useChatMachine() {
         // Await detection before proceeding — guarantees the correct language code
         // is in userLanguageRef before the LLM call is made this turn.
         await detectAndSetLanguage(text);
+      }
+
+      // OTP stage-machine integration: verify mobile -> OTP -> UHID before machine confirmation.
+      if (currentState === "ENTER_PHONE_FOR_BOOKING" || currentState === "ENTER_PHONE") {
+        const phone = text.replace(/[^0-9+]/g, "");
+        if (!/^\+?[0-9]{10,13}$/.test(phone)) {
+          setMessages((prev) => [...prev, { id: nextId(), sender: "bot", text: mapOtpErrorMessage("invalid_mobile_number") }]);
+          return;
+        }
+        const ok = await submitMobileStage(phone);
+        if (!ok) return;
+        runner.sendEvent({ type: "ENTER_PHONE", value: phone } as AppEvent);
+        const nextState = runner.currentState;
+        const nextCtx = runner.context as ChatContext;
+        if (nextState !== edocFiredForState.current) edocFiredForState.current = "";
+        setCurrentState(nextState);
+        setMachineCtx(nextCtx);
+        pushStaticBotMessage(nextState, nextCtx);
+        return;
+      }
+
+      if (currentState === "VERIFY_OTP") {
+        if (otpFlowState.stage === "uhid" && otpFlowState.uhidOptions.length > 0) {
+          const idx = Number(text.trim());
+          if (!Number.isInteger(idx) || idx < 1 || idx > otpFlowState.uhidOptions.length) {
+            setMessages((prev) => [...prev, { id: nextId(), sender: "bot", text: "Please reply with a valid profile number." }]);
+            return;
+          }
+          const chosen = otpFlowState.uhidOptions[idx - 1];
+          const selected = await submitUhidStage(chosen.uhid);
+          if (!selected) return;
+          runner.sendEvent({ type: "OTP_SUCCESS" } as AppEvent);
+          const nextState = runner.currentState;
+          const nextCtx = runner.context as ChatContext;
+          if (nextState !== edocFiredForState.current) edocFiredForState.current = "";
+          setCurrentState(nextState);
+          setMachineCtx(nextCtx);
+          pushStaticBotMessage(nextState, nextCtx);
+          return;
+        }
+
+        const otp = text.replace(/\D/g, "");
+        if (!/^\d{4,8}$/.test(otp)) {
+          setMessages((prev) => [...prev, { id: nextId(), sender: "bot", text: mapOtpErrorMessage("invalid_otp") }]);
+          return;
+        }
+        const ok = await submitOtpStage(otp);
+        if (!ok) return;
+        runner.sendEvent({ type: "OTP_SUCCESS" } as AppEvent);
+        const nextState = runner.currentState;
+        const nextCtx = runner.context as ChatContext;
+        if (nextState !== edocFiredForState.current) edocFiredForState.current = "";
+        setCurrentState(nextState);
+        setMachineCtx(nextCtx);
+        pushStaticBotMessage(nextState, nextCtx);
+        return;
       }
 
       // ── SHOW_DOCTORS: keep cards visible; explicit keywords take priority ──
@@ -2157,6 +2363,9 @@ export function useChatMachine() {
         // rather than blindly re-pushing the same state message.
         await pushLlmDirect(currentState, runner.context as Record<string, unknown>, text);
       }
+      } finally {
+        inFlightTurnRef.current = false;
+      }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [currentState, pushLlmBotMessage, pushLlmDirect, tryAgentDecide, tryAiIntent, detectAndSetLanguage]
@@ -2181,12 +2390,70 @@ export function useChatMachine() {
 
   const sendQuickReply = useCallback(
     (label: string, eventType: string, value?: string) => {
+      if (inFlightTurnRef.current) return;
       setMessages((prev) => [...prev, { id: nextId(), sender: "user", text: label }]);
       logInteraction(label, "quick_reply", label, eventType);
       sendEvent(eventType, value);
     },
     [sendEvent, logInteraction]
   );
+
+  const submitMessageFeedback = useCallback(async (
+    messageId: number,
+    feedback: "LIKE" | "DISLIKE",
+    feedbackReason?: string,
+  ): Promise<void> => {
+    const message = messagesRef.current.find((m) => m.id === messageId);
+    if (!message || message.sender !== "bot") return;
+
+    setMessageFeedbackById((prev) => ({ ...prev, [messageId]: feedback }));
+    setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, feedback } : m)));
+
+    try {
+      await apiTransportRef.current.requestJson<{ ok: boolean }>({
+        path: `/api/session/${encodeURIComponent(sessionIdRef.current)}/${encodeURIComponent(String(messageId))}/feedback`,
+        method: "PATCH",
+        sessionId: sessionIdRef.current,
+        body: {
+          feedback,
+          feedbackReason,
+          messageText: message.text,
+        },
+      });
+    } catch {
+      // Keep local feedback state even when backend telemetry fails.
+    }
+  }, []);
+
+  const sendFileAttachment = useCallback(async (file: File, caption?: string): Promise<void> => {
+    if (isUploadingFile || inFlightTurnRef.current) return;
+    setIsUploadingFile(true);
+    try {
+      const uploaded = await uploadFileWithHandshake({
+        sessionId: sessionIdRef.current,
+        file,
+        caption,
+      });
+
+      const normalized = normalizeIncomingContent({
+        ct: "file",
+        data: {
+          text: caption ? `${caption} (${file.name})` : `Uploaded file: ${file.name}`,
+          files: [{ url: uploaded.fileUrl, name: file.name, mimeType: file.type }],
+        },
+      });
+
+      const displayText = `${normalized.text ?? "Uploaded file"}\n${uploaded.fileUrl}`;
+      setMessages((prev) => [...prev, { id: nextId(), sender: "user", text: displayText }]);
+
+      await sendUserText(`I uploaded a file for review: ${uploaded.fileUrl}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "File upload failed";
+      setMessages((prev) => [...prev, { id: nextId(), sender: "bot", text: `File upload failed: ${message}` }]);
+    } finally {
+      setIsUploadingFile(false);
+    }
+  }, [isUploadingFile, sendUserText]);
 
   /**
    * Called from the doctor card "Book appointment" button.
@@ -2284,6 +2551,11 @@ export function useChatMachine() {
     setLiveSlots({});
     setSlotServiceByKey({});
     setSlotsLoading({});
+    setMessageFeedbackById({});
+    setOtpFlowState(initialOtpFlowState());
+    setIsUploadingFile(false);
+    inFlightTurnRef.current = false;
+    firstMessageSentRef.current = false;
     // Reset language tracking for the new conversation
     userLanguageRef.current = "en";
     setUserLanguage("en");
@@ -2298,9 +2570,12 @@ export function useChatMachine() {
 
   return {
     messages,
+    messageFeedbackById,
+    otpFlowState,
     currentState,
     machineCtx,
     isLlmLoading,
+    isUploadingFile,
     rateLimitSeconds,
     doctorCards,
     cardsAnchorMsgId,
@@ -2315,7 +2590,10 @@ export function useChatMachine() {
     selectDoctorForBooking,
     requestAppointmentForDoctor,
     sendUserText,
+    sendFileAttachment,
     sendQuickReply,
+    submitMessageFeedback,
+    sessionId: sessionIdRef.current,
     resetMachine,
   };
 }

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, KeyboardEvent } from "react";
+import React, { useEffect, useRef, useState, KeyboardEvent, ChangeEvent } from "react";
 import "./ChatWidget.css";
 import { useChatMachine } from "../hooks/useChatMachine";
 import { getStateResponse } from "../stateResponses";
@@ -22,8 +22,9 @@ const ChatWidget: React.FC = () => {
     liveDates, liveSlots, slotsLoading,
     getServiceIdForSlot, fetchSlotsForDate, selectDoctorForBooking,
     requestAppointmentForDoctor,
-    sendUserText, sendQuickReply, resetMachine,
-    translatedQuickReplies,
+    sendUserText, sendQuickReply, sendFileAttachment, resetMachine,
+    isUploadingFile,
+    translatedQuickReplies, messageFeedbackById, submitMessageFeedback,
   } = useChatMachine();
 
   const [inputText, setInputText] = useState("");
@@ -35,7 +36,9 @@ const ChatWidget: React.FC = () => {
   const [dateStartByDoctor, setDateStartByDoctor]             = useState<Record<string, number>>({});
   const [msgQuickReplies, setMsgQuickReplies]                 = useState<Record<number, { label: string; eventType: string; value?: string }[]>>({});
   const [visibleDoctorCount, setVisibleDoctorCount]           = useState<number>(DOCTORS_PAGE_SIZE);
+  const [pendingDislikeMsgId, setPendingDislikeMsgId]         = useState<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -98,7 +101,15 @@ const ChatWidget: React.FC = () => {
     if (e.key === "Enter") void handleSend();
   };
 
+  const handleFilePicked = async (e: ChangeEvent<HTMLInputElement>) => {
+    const picked = e.target.files?.[0];
+    if (!picked) return;
+    await sendFileAttachment(picked);
+    e.target.value = "";
+  };
+
   const now = new Date();
+  const latestBotMessageId = [...messages].reverse().find((m) => m.sender === "bot")?.id ?? null;
   const dateLabel = now.toLocaleDateString("en-US", {
     weekday: "long",
     hour: "2-digit",
@@ -417,9 +428,53 @@ const ChatWidget: React.FC = () => {
               ))}
             </div>
             <div className="chat-reactions">
-              <button className="reaction-btn" title="Helpful" aria-label="Mark as helpful">👍</button>
-              <button className="reaction-btn" title="Not helpful" aria-label="Mark as not helpful">👎</button>
+              <button
+                className="reaction-btn"
+                title="Helpful"
+                aria-label="Mark as helpful"
+                disabled={!latestBotMessageId}
+                onClick={() => {
+                  if (!latestBotMessageId) return;
+                  setPendingDislikeMsgId(null);
+                  void submitMessageFeedback(latestBotMessageId, "LIKE");
+                }}
+              >
+                {latestBotMessageId && messageFeedbackById[latestBotMessageId] === "LIKE" ? "✅👍" : "👍"}
+              </button>
+              <button
+                className="reaction-btn"
+                title="Not helpful"
+                aria-label="Mark as not helpful"
+                disabled={!latestBotMessageId}
+                onClick={() => {
+                  if (!latestBotMessageId) return;
+                  setPendingDislikeMsgId(latestBotMessageId);
+                  void submitMessageFeedback(latestBotMessageId, "DISLIKE");
+                }}
+              >
+                {latestBotMessageId && messageFeedbackById[latestBotMessageId] === "DISLIKE" ? "✅👎" : "👎"}
+              </button>
             </div>
+            {pendingDislikeMsgId && (
+              <div className="quick-replies" role="group" aria-label="Feedback reason options">
+                {[
+                  { label: "Not accurate", reason: "INACCURATE" },
+                  { label: "Missing details", reason: "MISSING_DETAILS" },
+                  { label: "Too generic", reason: "TOO_GENERIC" },
+                ].map((item) => (
+                  <button
+                    key={item.reason}
+                    className="quick-reply-btn"
+                    onClick={() => {
+                      void submitMessageFeedback(pendingDislikeMsgId, "DISLIKE", item.reason);
+                      setPendingDislikeMsgId(null);
+                    }}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            )}
           </>
         )}
 
@@ -453,7 +508,24 @@ const ChatWidget: React.FC = () => {
           </>
         ) : (
           <>
-            <button className="chat-input-attach" aria-label="Attach file">＋</button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/pdf,image/jpeg,image/jpg,image/png"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                void handleFilePicked(e);
+              }}
+            />
+            <button
+              className="chat-input-attach"
+              aria-label="Attach file"
+              disabled={isUploadingFile || isLlmLoading || !!rateLimitUntil}
+              onClick={() => fileInputRef.current?.click()}
+              title={isUploadingFile ? "Uploading..." : "Attach file"}
+            >
+              ＋
+            </button>
             <input
               className="chat-input-field"
               type="text"
@@ -468,6 +540,12 @@ const ChatWidget: React.FC = () => {
           </>
         )}
       </div>
+
+      {isUploadingFile && (
+        <div className="rate-limit-banner" role="status" aria-live="polite">
+          Uploading your file securely...
+        </div>
+      )}
 
       {/* Footer */}
       <div className="chat-footer">

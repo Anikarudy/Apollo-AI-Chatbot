@@ -63,6 +63,8 @@ import { intentRouter }  from "./routes/intent.routes";
 import { doctorRouter }  from "./routes/doctor.routes";
 import { edocRouter }    from "./routes/edoc.routes";
 import { metricsRouter } from "./routes/metrics.routes";
+import { toolRouter }    from "./routes/tool.routes";
+import { uploadRouter }  from "./routes/upload.routes";
 
 dotenv.config();
 
@@ -110,6 +112,8 @@ app.use("/api",       intentRouter);   // /api/intent, /api/symptom-specialty, /
 app.use("/api",       doctorRouter);   // /api/doctors, /api/doctor-search
 app.use("/api",       sessionRouter);  // /api/session/:id, /api/appointments/check
 app.use("/api/edoc",  edocRouter);     // /api/edoc/*
+app.use("/api",       toolRouter);     // /api/tools/mobile-verification
+app.use("/api/uploads", uploadRouter); // /api/uploads/* (handshake + presigned upload)
 app.use("/api/admin", adminRouter);    // /api/admin/session/:id
 app.use("/api",       metricsRouter);  // /api/metrics (501 stub)
 

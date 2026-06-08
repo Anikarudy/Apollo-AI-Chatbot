@@ -2,11 +2,18 @@ import { Router, Request, Response } from "express";
 import { getSession } from "../services/chatSessionService";
 import { getPatientByPhone } from "../services/patientService";
 import { getAppointmentsForPatient } from "../services/appointmentService";
+import { logEvent } from "../services/auditService";
 import { generalLimiter } from "../middleware/rateLimit.middleware";
 import { isValidSessionId } from "../middleware/session.middleware";
 import log from "../lib/logger";
 
 export const sessionRouter = Router();
+
+interface FeedbackPatchRequest {
+  feedback?: "LIKE" | "DISLIKE" | "NONE";
+  feedbackReason?: string;
+  messageText?: string;
+}
 
 // ── GET /api/session/:sessionId ───────────────────────────────────────────────
 // Returns chat session history for page-refresh restoration.
@@ -94,6 +101,44 @@ sessionRouter.post(
       const e = err as { message?: string };
       log.error({ err }, "POST /api/appointments/check error");
       res.json({ existing: null, warning: e.message });
+    }
+  },
+);
+
+// ── PATCH /api/session/:sessionId/:messageId/feedback ───────────────────────
+// Captures message-level quality feedback as audit telemetry.
+sessionRouter.patch(
+  "/session/:sessionId/:messageId/feedback",
+  generalLimiter,
+  async (req: Request, res: Response): Promise<void> => {
+    const { sessionId, messageId } = req.params;
+    if (!sessionId || typeof sessionId !== "string" || !isValidSessionId(sessionId)) {
+      res.status(400).json({ error: "valid sessionId required" });
+      return;
+    }
+    if (req.sessionId !== sessionId) {
+      res.status(403).json({ error: "Session access denied" });
+      return;
+    }
+
+    const body = (req.body ?? {}) as FeedbackPatchRequest;
+    const feedback = String(body.feedback ?? "").toUpperCase();
+    if (feedback !== "LIKE" && feedback !== "DISLIKE" && feedback !== "NONE") {
+      res.status(400).json({ error: "feedback must be LIKE, DISLIKE, or NONE" });
+      return;
+    }
+
+    try {
+      await logEvent(sessionId, "message_feedback", {
+        messageId,
+        feedback,
+        feedbackReason: body.feedbackReason ?? null,
+        messageText: typeof body.messageText === "string" ? body.messageText.slice(0, 2000) : null,
+      });
+      res.json({ ok: true });
+    } catch (err) {
+      log.warn({ err }, "PATCH /api/session/:sessionId/:messageId/feedback failed");
+      res.status(500).json({ error: "Failed to store feedback" });
     }
   },
 );
