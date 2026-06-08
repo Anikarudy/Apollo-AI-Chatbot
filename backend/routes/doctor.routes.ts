@@ -6,8 +6,13 @@ import {
   getDoctorsForLocation,
   buildDoctorSearchUrl,
 } from "../../frontend/src/knowledgeBase";
-import { searchDoctors, SEARCH_DOCTORS_TOOL, fuzzySearchAllDoctors } from "../searchDoctors";
-import { genAI, hasAnyLlm, stripMarkdownJson } from "../lib/llmClient";
+import {
+  searchDoctors,
+  SEARCH_DOCTORS_TOOL,
+  fuzzySearchAllDoctors,
+  resolveDoctorFilters,
+} from "../searchDoctors";
+import { genAI, hasAnyLlm, stripMarkdownJson, GEMINI_TOOL_MODEL } from "../lib/llmClient";
 import {
   normaliseNameForIdLookup,
   dedupeDoctorsForCards,
@@ -24,6 +29,11 @@ doctorRouter.get("/doctors", async (req: Request, res: Response): Promise<void> 
   const city      = String(req.query.city      ?? "").trim();
   const branch    = String(req.query.branch    ?? "").trim();
   const name      = String(req.query.name      ?? "").trim();
+
+  const resolvedFilters = resolveDoctorFilters({ city, branch, specialty });
+  const cityResolved = resolvedFilters.city ?? city;
+  const branchResolved = resolvedFilters.branch ?? branch;
+  const specialtyResolved = resolvedFilters.specialty ?? specialty;
 
   const normaliseDoctorName = (value: string): string =>
     value
@@ -48,18 +58,22 @@ doctorRouter.get("/doctors", async (req: Request, res: Response): Promise<void> 
     const lower = s.toLowerCase().trim();
     return US_TO_UK[lower] ?? lower;
   };
-  const specNorm = normaliseSpecialty(specialty);
+  const specNorm = normaliseSpecialty(specialtyResolved);
 
   // ── Name-based search: fuzzy via Fuse.js ──────────────────────────────────
   if (name) {
     const strictMatched = getDoctorsByName(name, 200);
     let matched = strictMatched.length > 0 ? strictMatched : fuzzySearchAllDoctors(name, 200);
 
-    if (city)     matched = matched.filter((d: { location: string }) => d.location.toLowerCase() === city.toLowerCase());
-    if (branch)   matched = matched.filter((d: { branch: string }) => d.branch.toLowerCase() === branch.toLowerCase());
-    if (specialty) matched = matched.filter((d: { speciality: string }) => {
+    if (cityResolved) {
+      matched = matched.filter((d: { location: string }) => d.location.toLowerCase() === cityResolved.toLowerCase());
+    }
+    if (branchResolved) {
+      matched = matched.filter((d: { branch: string }) => d.branch.toLowerCase() === branchResolved.toLowerCase());
+    }
+    if (specialtyResolved) matched = matched.filter((d: { speciality: string }) => {
       const ds = normaliseSpecialty(d.speciality);
-      return ds === specNorm || ds === specialty.toLowerCase();
+      return ds === specNorm || ds === specialtyResolved.toLowerCase();
     });
 
     const normalizedRequestedName = normaliseDoctorName(name);
@@ -73,7 +87,7 @@ doctorRouter.get("/doctors", async (req: Request, res: Response): Promise<void> 
       uniqueMatched,
       12,
     );
-    const url = buildDoctorSearchUrl(specialty, city, branch);
+    const url = buildDoctorSearchUrl(specialtyResolved, cityResolved, branchResolved);
     res.json({
       url,
       source: hasAnyLlm ? "local+llm-rerank" : "local",
@@ -87,23 +101,27 @@ doctorRouter.get("/doctors", async (req: Request, res: Response): Promise<void> 
   }
 
   // ── City/branch + optional specialty ─────────────────────────────────────
-  if (city || branch) {
-    const localDocs = getDoctorsForLocation(city, branch || undefined, specialty || undefined);
+  if (cityResolved || branchResolved) {
+    const localDocs = getDoctorsForLocation(
+      cityResolved,
+      branchResolved || undefined,
+      specialtyResolved || undefined,
+    );
     const finalDocs =
       localDocs.length > 0
         ? localDocs
-        : specNorm !== specialty.toLowerCase()
-        ? getDoctorsForLocation(city, branch || undefined, specNorm)
+        : specNorm !== specialtyResolved.toLowerCase()
+        ? getDoctorsForLocation(cityResolved, branchResolved || undefined, specNorm)
         : [];
     if (finalDocs.length > 0) {
       const uniqueDocs = dedupeDoctorsForCards(finalDocs);
       const reranked = await rerankDoctorCandidates(
-        buildDoctorQueryText({ specialty, city, branch }),
+        buildDoctorQueryText({ specialty: specialtyResolved, city: cityResolved, branch: branchResolved }),
         uniqueDocs,
         12,
       );
       res.json({
-        url: buildDoctorSearchUrl(specialty, city, branch),
+        url: buildDoctorSearchUrl(specialtyResolved, cityResolved, branchResolved),
         source: hasAnyLlm ? "local+llm-rerank" : "local",
         doctors: reranked.map(toDoctorCardPayload),
       });
@@ -112,23 +130,23 @@ doctorRouter.get("/doctors", async (req: Request, res: Response): Promise<void> 
   }
 
   // ── Specialty-only (no city/branch) ───────────────────────────────────────
-  if (specialty && !city && !branch) {
+  if (specialtyResolved && !cityResolved && !branchResolved) {
     const specDocs = dedupeDoctorsForCards(
       doctors
         .filter((d) => {
           const ds = normaliseSpecialty(d.speciality);
-          return ds === specNorm || ds === specialty.toLowerCase();
+          return ds === specNorm || ds === specialtyResolved.toLowerCase();
         })
         .slice(0, 50),
     );
     if (specDocs.length > 0) {
       const reranked = await rerankDoctorCandidates(
-        buildDoctorQueryText({ specialty }),
+        buildDoctorQueryText({ specialty: specialtyResolved }),
         specDocs,
         12,
       );
       res.json({
-        url: buildDoctorSearchUrl(specialty),
+        url: buildDoctorSearchUrl(specialtyResolved),
         source: hasAnyLlm ? "local+llm-rerank" : "local",
         doctors: reranked.map(toDoctorCardPayload),
       });
@@ -138,7 +156,7 @@ doctorRouter.get("/doctors", async (req: Request, res: Response): Promise<void> 
 
   // ── Nothing found locally ─────────────────────────────────────────────────
   res.json({
-    url: buildDoctorSearchUrl(specialty, city, branch),
+    url: buildDoctorSearchUrl(specialtyResolved, cityResolved, branchResolved),
     source: "local",
     notFound: true,
     doctors: [],
@@ -192,7 +210,7 @@ STRICT RULES:
 - If no results are returned, say "No matching doctors found" and suggest broadening the search.`;
 
   try {
-    const geminiModel = "gemini-2.0-flash";
+    const geminiModel = GEMINI_TOOL_MODEL;
     console.log(`[doctor-search] Gemini tool-calling with message: "${message}"`);
 
     const model = genAI.getGenerativeModel({

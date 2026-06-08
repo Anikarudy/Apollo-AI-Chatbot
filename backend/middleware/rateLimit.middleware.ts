@@ -44,11 +44,11 @@ export const bookingLimiter = rateLimit({
   message: rateLimitResponse(60),
 });
 
-/** EDOC calendar/slot reads: 30 req/min */
+/** EDOC calendar/slot reads: 180 req/min (bursty card-load friendly) */
 export const calendarLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 30,
+  max: 180,
   standardHeaders: true,
   legacyHeaders: false,
-  message: rateLimitResponse(15),
+  message: rateLimitResponse(5),
 });

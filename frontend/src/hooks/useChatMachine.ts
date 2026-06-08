@@ -439,9 +439,32 @@ export function useChatMachine() {
   const firstMessageSentRef = useRef<boolean>(false);
   const liveDateRequestsInFlight = useRef<Set<string>>(new Set());
   const liveDateRequestsDone = useRef<Set<string>>(new Set());
+  const prevScheduleStateRef = useRef<string>("WELCOME");
   const liveScheduleListKey = useRef<string>("");
   const noLiveDatesNoticeKey = useRef<string>("");
   const similarNameNoticeKey = useRef<string>("");
+
+  useEffect(() => {
+    const isScheduleState = currentState === "SHOW_DOCTORS" || currentState === "RESCHEDULE_APPOINTMENT";
+    const wasScheduleState =
+      prevScheduleStateRef.current === "SHOW_DOCTORS" ||
+      prevScheduleStateRef.current === "RESCHEDULE_APPOINTMENT";
+
+    // Re-entering schedule card states should always trigger a fresh live-date/slot cycle,
+    // even when the doctor key is unchanged from a previous render.
+    if (isScheduleState && !wasScheduleState) {
+      liveDateRequestsInFlight.current.clear();
+      liveDateRequestsDone.current.clear();
+      liveScheduleListKey.current = "";
+      noLiveDatesNoticeKey.current = "";
+      setLiveDates({});
+      setLiveSlots({});
+      setSlotServiceByKey({});
+      setSlotsLoading({});
+    }
+
+    prevScheduleStateRef.current = currentState;
+  }, [currentState]);
 
   // Initialize runner once; attempt session hydration before showing welcome
   useEffect(() => {
@@ -1043,6 +1066,10 @@ export function useChatMachine() {
     if (currentState !== "SHOW_DOCTORS" && currentState !== "RESCHEDULE_APPOINTMENT") return;
     if (doctorCards.length === 0) return;
 
+    // Each time a fresh card block is rendered (new anchor message), treat it as a new
+    // schedule fetch session so prior done-keys do not suppress reloading.
+    const renderScope = String(cardsAnchorMsgId ?? "none");
+
     const scheduleCards = doctorCards
       .map((doctor, idx) => ({ doctor, idx }))
       .filter(({ doctor }) => !!doctor.locationId)
@@ -1052,7 +1079,7 @@ export function useChatMachine() {
             .map((value) => String(value ?? "").trim())
             .filter((value): value is string => value.length > 0)
         )).sort();
-        return `${doctor.name}-${idx}|${doctor.locationId}|${doctor.regionId ?? "5"}|${stableCandidates.join(",")}|${machineCtx.city ?? ""}`;
+        return `${renderScope}|${doctor.name}-${idx}|${doctor.locationId}|${doctor.regionId ?? "5"}|${stableCandidates.join(",")}|${machineCtx.city ?? ""}`;
       })
       .join("||");
 
@@ -1083,6 +1110,7 @@ export function useChatMachine() {
       liveDateRequestsInFlight.current.add(requestKey);
 
       const loadLiveSchedule = async () => {
+        let hadResolvedAvailability = false;
         try {
           let selectedResourceId: string | undefined;
           let selectedDatesResponse: AvailableDatesResponse | undefined;
@@ -1096,6 +1124,7 @@ export function useChatMachine() {
                 city: machineCtx.city,
                 signal: controller.signal,
               });
+              hadResolvedAvailability = true;
               if ((d.dates ?? []).length > 0) {
                 selectedResourceId = candidateResourceId;
                 selectedDatesResponse = d;
@@ -1221,7 +1250,9 @@ export function useChatMachine() {
           setLiveDates((prev) => ({ ...prev, [key]: [] }));
         } finally {
           liveDateRequestsInFlight.current.delete(requestKey);
-          liveDateRequestsDone.current.add(requestKey);
+          if (hadResolvedAvailability) {
+            liveDateRequestsDone.current.add(requestKey);
+          }
         }
       };
 
@@ -1229,7 +1260,7 @@ export function useChatMachine() {
     });
 
     return () => controller.abort();
-  }, [currentState, doctorCards, machineCtx.city, getAvailableDates, getCalendarDetails, getSlots, getSlotsV2]);
+  }, [currentState, doctorCards, cardsAnchorMsgId, machineCtx.city, getAvailableDates, getCalendarDetails, getSlots, getSlotsV2]);
 
   useEffect(() => {
     if (currentState === "SHOW_DOCTORS" || currentState === "RESCHEDULE_APPOINTMENT") return;
@@ -1341,7 +1372,10 @@ export function useChatMachine() {
 
     fetch("/api/appointments/check", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Session-Id": sessionIdRef.current,
+      },
       body: JSON.stringify({ phone, doctorName }),
     })
       .then((r) => r.json())
@@ -2301,6 +2335,20 @@ export function useChatMachine() {
 
       // ── SHOW_DOCTORS: keep cards visible; explicit keywords take priority ──
       if (currentState === "SHOW_DOCTORS") {
+        const isBookingIntent = /\b(book|appointment|schedule|reserve)\b/i.test(text);
+        const refersToShownDoctor = /\b(that|this|same|selected)\s+doctor\b/i.test(text);
+        if (isBookingIntent && refersToShownDoctor && doctorCards.length > 0) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: nextId(),
+              sender: "bot",
+              text: "Please choose a time slot on the doctor card above to continue booking. If no slots are visible, use Request Appointment.",
+            },
+          ]);
+          return;
+        }
+
         const event = mapInputToEvent(text, currentState);
         if (event.type !== "UNKNOWN") {
           // Explicit keyword navigation (CHANGE_SEARCH / BACK_TO_MENU)
@@ -2368,7 +2416,7 @@ export function useChatMachine() {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [currentState, pushLlmBotMessage, pushLlmDirect, tryAgentDecide, tryAiIntent, detectAndSetLanguage]
+    [currentState, doctorCards.length, pushLlmBotMessage, pushLlmDirect, tryAgentDecide, tryAiIntent, detectAndSetLanguage]
   );
 
   /**

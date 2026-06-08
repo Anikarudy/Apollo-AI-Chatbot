@@ -647,6 +647,7 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
   if (state === "ASK_BRANCH") {
     const city = ctx?.city ?? "";
     const doctorName = ctx?.doctorName ?? "";
+    const specialty = ctx?.specialty ?? "";
 
     // When searching by doctor name, only show branches where that doctor exists
     if (doctorName && city) {
@@ -665,7 +666,12 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
       }
     }
 
-    const branches = city ? getSubBranchesForCity(city) : [];
+    const branchesRaw = city ? getSubBranchesForCity(city) : [];
+    const branches = specialty
+      ? branchesRaw.filter((branchName) =>
+          getDoctorsForLocation(city, branchName, specialty).length > 0,
+        )
+      : branchesRaw;
     if (branches.length > 0) {
       return {
         message: `Which Apollo Hospital branch in ${city} would you prefer?`,
@@ -693,7 +699,13 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
 
   if (state === "ASK_BRANCH_FOR_LOCATION") {
     const city = ctx?.city ?? "";
-    const branches = city ? getSubBranchesForCity(city) : [];
+    const specialty = ctx?.specialty ?? "";
+    const branchesRaw = city ? getSubBranchesForCity(city) : [];
+    const branches = specialty
+      ? branchesRaw.filter((branchName) =>
+          getDoctorsForLocation(city, branchName, specialty).length > 0,
+        )
+      : branchesRaw;
     if (branches.length > 0) {
       return {
         message: `Which Apollo Hospital branch in ${city} would you like to visit?`,
@@ -928,9 +940,9 @@ export function getStateResponse(state: string, ctx?: ChatContext): StateRespons
     return {
       message: `You already have an appointment${when ? ` on ${when}` : ""} with ${doctorName}.\n\nWould you like to book another appointment with them, or manage your existing one?`,
       quickReplies: [
-        { label: "Book another appointment", eventType: "BOOK_ANYWAY" },
-        { label: "Reschedule existing", eventType: "RESCHEDULE" },
-        { label: "Cancel existing", eventType: "CANCEL_BOOKING" },
+        { label: "Book", eventType: "BOOK_ANYWAY" },
+        { label: "Reschedule", eventType: "RESCHEDULE" },
+        { label: "Cancel", eventType: "CANCEL_BOOKING" },
       ],
     };
   }

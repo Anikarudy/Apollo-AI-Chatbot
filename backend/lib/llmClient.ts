@@ -23,6 +23,10 @@ const _groq = process.env.GROQ_API_KEY
 
 export const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY ?? "");
 
+// Keep model names configurable via env; default to currently available stable flash model.
+export const GEMINI_MODEL = String(process.env.GEMINI_MODEL ?? "gemini-2.5-flash").trim();
+export const GEMINI_TOOL_MODEL = String(process.env.GEMINI_TOOL_MODEL ?? GEMINI_MODEL).trim();
+
 export const hasAnyLlm = !!(_groq || process.env.GEMINI_API_KEY);
 export const NO_LLM_ERROR = "No LLM configured. Set GEMINI_API_KEY or GROQ_API_KEY in .env";
 
@@ -53,7 +57,7 @@ export async function callLlm(
   // ── 1. Gemini (primary) ───────────────────────────────────────────────────
   if (process.env.GEMINI_API_KEY) {
     try {
-      const geminiModel = "gemini-2.0-flash";
+      const geminiModel = GEMINI_MODEL;
       log.info({ provider: "gemini", model: geminiModel }, "[LLM] Trying provider");
       const model = genAI.getGenerativeModel({ model: geminiModel, systemInstruction: systemPrompt });
       const geminiHistory = (history ?? [])

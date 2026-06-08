@@ -31,6 +31,149 @@ const allDoctors: ToolDoctor[] = doctors.map((doctor) => ({
   locationId: doctor.locationId || null,
 }));
 
+const US_TO_UK_SPECIALTY: Record<string, string> = {
+  pediatrics: "paediatrics",
+  gynecology: "gynaecology",
+  gynecologist: "gynaecology",
+  orthopedics: "orthopaedics",
+  anesthesiology: "anaesthesiology",
+  "fetal medicine": "foetal medicine",
+  hematology: "haematology",
+  "hemato oncology": "haemato oncology",
+};
+
+function normaliseSpecialtyValue(value: string): string {
+  const lowered = normalise(value);
+  return US_TO_UK_SPECIALTY[lowered] ?? lowered;
+}
+
+interface ValueHolder {
+  value: string;
+}
+
+const cityOptions = Array.from(new Set(allDoctors.map((d) => d.city).filter(Boolean)));
+const branchOptions = Array.from(new Set(allDoctors.map((d) => d.branch ?? "").filter(Boolean)));
+const specialtyOptions = Array.from(
+  new Set(allDoctors.map((d) => d.specialty ?? "").filter(Boolean)),
+);
+
+const cityFuse = new Fuse<ValueHolder>(cityOptions.map((value) => ({ value })), {
+  keys: ["value"],
+  threshold: 0.34,
+  includeScore: true,
+  ignoreLocation: true,
+  minMatchCharLength: 2,
+});
+
+const branchFuse = new Fuse<ValueHolder>(branchOptions.map((value) => ({ value })), {
+  keys: ["value"],
+  threshold: 0.34,
+  includeScore: true,
+  ignoreLocation: true,
+  minMatchCharLength: 2,
+});
+
+const specialtyFuse = new Fuse<ValueHolder>(
+  specialtyOptions.map((value) => ({ value })),
+  {
+    keys: ["value"],
+    threshold: 0.34,
+    includeScore: true,
+    ignoreLocation: true,
+    minMatchCharLength: 3,
+  },
+);
+
+const cityExactMap = new Map(cityOptions.map((value) => [normalise(value), value] as const));
+const branchExactMap = new Map(branchOptions.map((value) => [normalise(value), value] as const));
+const specialtyExactMap = new Map(
+  specialtyOptions.map((value) => [normaliseSpecialtyValue(value), value] as const),
+);
+
+function comparable(value: string): string {
+  return normalise(value)
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function levenshtein(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+
+  const row: number[] = Array.from({ length: n + 1 }, (_, i) => i);
+  for (let i = 1; i <= m; i += 1) {
+    let prev = i - 1;
+    row[0] = i;
+    for (let j = 1; j <= n; j += 1) {
+      const tmp = row[j];
+      row[j] = a[i - 1] === b[j - 1] ? prev : 1 + Math.min(prev, row[j], row[j - 1]);
+      prev = tmp;
+    }
+  }
+  return row[n];
+}
+
+function resolveCanonicalValue(
+  input: string | undefined,
+  exactMap: Map<string, string>,
+  fuzzyIndex: Fuse<ValueHolder>,
+  options: string[],
+  normalizeInput: (value: string) => string = normalise,
+): string | undefined {
+  const raw = String(input ?? "").trim();
+  if (!raw) return undefined;
+
+  const normalized = normalizeInput(raw);
+  const exact = exactMap.get(normalized);
+  if (exact) return exact;
+
+  const best = fuzzyIndex.search(raw, { limit: 1 })[0];
+  if (best && (best.score ?? 1) <= 0.46) return best.item.value;
+
+  // Fallback for heavier typos that Fuse score rejects.
+  const inputComparable = comparable(normalized);
+  if (!inputComparable) return undefined;
+
+  let bestValue: string | undefined;
+  let bestRatio = Number.POSITIVE_INFINITY;
+
+  for (const option of options) {
+    const optionComparable = comparable(normalizeInput(option));
+    if (!optionComparable) continue;
+
+    const distance = levenshtein(inputComparable, optionComparable);
+    const ratio = distance / Math.max(inputComparable.length, optionComparable.length, 1);
+
+    if (ratio < bestRatio) {
+      bestRatio = ratio;
+      bestValue = option;
+    }
+  }
+
+  if (bestValue && bestRatio <= 0.42) return bestValue;
+  return undefined;
+}
+
+export function resolveDoctorFilters(filters: {
+  city?: string;
+  branch?: string;
+  specialty?: string;
+}): { city?: string; branch?: string; specialty?: string } {
+  const city = resolveCanonicalValue(filters.city, cityExactMap, cityFuse, cityOptions, normalise);
+  const branch = resolveCanonicalValue(filters.branch, branchExactMap, branchFuse, branchOptions, normalise);
+  const specialty = resolveCanonicalValue(
+    filters.specialty,
+    specialtyExactMap,
+    specialtyFuse,
+    specialtyOptions,
+    normaliseSpecialtyValue,
+  );
+  return { city, branch, specialty };
+}
+
 const fuse = new Fuse<ToolDoctor>(allDoctors, {
   keys: [
     { name: "name", weight: 0.55 },
@@ -71,8 +214,9 @@ export function searchDoctors(query: string, city?: string, branch?: string, lim
     return [];
   }
 
-  const cityFilter = normalise(city ?? "");
-  const branchFilter = normalise(branch ?? "");
+  const resolvedFilters = resolveDoctorFilters({ city, branch });
+  const cityFilter = normalise(resolvedFilters.city ?? city ?? "");
+  const branchFilter = normalise(resolvedFilters.branch ?? branch ?? "");
   console.log(`[searchDoctors] Query: "${trimmed}" city="${cityFilter || "*"}" branch="${branchFilter || "*"}"`);
 
   let candidates = fuse
