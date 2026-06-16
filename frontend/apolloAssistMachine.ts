@@ -40,6 +40,10 @@ interface ApolloContext {
   patientFirstName?: string;
   patientLastName?: string;
   patientDob?: string;        // "03-Jun-1998"
+  // Triage workflow fields
+  triageFollowupQuestion?: string; // The follow-up question currently pending for the user
+  triageRound?: number;            // Number of user answers collected so far (max 2)
+  triageUrgency?: string;          // "low" | "medium" | "high" | "emergency"
 }
 
 function normalizeDoctorName(value: string): string {
@@ -196,6 +200,10 @@ export const apolloMachine = createMachine(
           selectedDate:     () => undefined,
           selectedSlotStart:() => undefined,
           selectedSlotEnd:  () => undefined,
+          // Clear triage state
+          triageFollowupQuestion: () => undefined,
+          triageRound:            () => undefined,
+          triageUrgency:          () => undefined,
         }),
         on: {
           BOOK_APPOINTMENT: {
@@ -524,22 +532,39 @@ export const apolloMachine = createMachine(
       },
 
       MAP_TO_SPECIALTY: {
-        always: [
-          {
-            // Symptom mapped → funnel through SPECIALTY_FOUND so city/branch are asked if missing
-            guard: ({ context }) =>
-              (mapSymptomToSpecialty(context.symptomText ?? "") ?? context.specialty ?? "").length > 0,
-            target: "SPECIALTY_FOUND",
+        // Event-driven: the hook's useEffect calls /api/triage and fires the result event.
+        on: {
+          TRIAGE_NEEDS_FOLLOWUP: {
+            target: "TRIAGE_IN_PROGRESS",
             actions: assign({
-              specialty: ({ context }) =>
-                mapSymptomToSpecialty(context.symptomText ?? "") ?? context.specialty,
+              triageFollowupQuestion: ({ event }) => event.value,
             }),
           },
-          {
-            // No mapping found → let user pick a category
-            target: "SELECT_SYMPTOM_CATEGORY",
+          TRIAGE_COMPLETE: {
+            target: "SPECIALTY_FOUND",
+            actions: assign({
+              specialty:    ({ event }) => event.value,
+              triageUrgency: ({ event }) => (event as { type: string; value: string; urgency?: string }).urgency ?? "low",
+            }),
           },
-        ],
+          TRIAGE_FAILED: { target: "SELECT_SYMPTOM_CATEGORY" },
+          BACK_TO_MENU: "MAIN_MENU",
+        },
+      },
+
+      TRIAGE_IN_PROGRESS: {
+        // User is answering a follow-up triage question.
+        // Their answer is sent back to MAP_TO_SPECIALTY via TRIAGE_ANSWER.
+        on: {
+          TRIAGE_ANSWER: {
+            target: "MAP_TO_SPECIALTY",
+            actions: assign({
+              triageRound: ({ context }) => (context.triageRound ?? 0) + 1,
+            }),
+          },
+          BACK_TO_MENU: "MAIN_MENU",
+          UNKNOWN: "FALLBACK",
+        },
       },
 
       SHOW_SPECIALTY_RESULT: {

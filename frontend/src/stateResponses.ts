@@ -164,8 +164,16 @@ const responses: Record<string, StateResponse> = {
   },
 
   MAP_TO_SPECIALTY: {
-    message: "Finding the best specialist for you…",
+    message: "Analysing your symptoms…",
     quickReplies: [],
+  },
+
+  TRIAGE_IN_PROGRESS: {
+    // Default placeholder — overridden by getStateResponse() with ctx.triageFollowupQuestion
+    message: "Can you tell me a bit more about your symptoms?",
+    quickReplies: [{ label: "Back to menu", eventType: "BACK_TO_MENU" }],
+    showInput: true,
+    inputPlaceholder: "Type your answer…",
   },
 
   SHOW_SPECIALTY_RESULT: {
@@ -547,6 +555,17 @@ export type ChatContext = Record<string, string | undefined>;
  * Pass `ctx` (machine context) so dynamic states can show real data.
  */
 export function getStateResponse(state: string, ctx?: ChatContext): StateResponse {
+  // ── Dynamic: TRIAGE_IN_PROGRESS — show the AI's follow-up question ───────────
+  if (state === "TRIAGE_IN_PROGRESS") {
+    const question = ctx?.triageFollowupQuestion ?? "Can you tell me a bit more about your symptoms?";
+    return {
+      message: question,
+      quickReplies: [{ label: "Back to menu", eventType: "BACK_TO_MENU" }],
+      showInput: true,
+      inputPlaceholder: "Type your answer…",
+    };
+  }
+
   // ── Dynamic: SHOW_PACKAGES ────────────────────────────────────────────
   if (state === "SHOW_PACKAGES") {
     const city = ctx?.city ?? "";

@@ -93,6 +93,85 @@ Rules:
   }
 });
 
+// ── POST /api/triage ──────────────────────────────────────────────────────────
+// Multi-turn AI triage: decides whether more info is needed or routes to a specialty.
+// `reasoning` is logged server-side only and never forwarded to the client.
+intentRouter.post("/triage", intentLimiter, async (req: Request, res: Response): Promise<void> => {
+  if (!hasAnyLlm) {
+    res.json({ requiresFollowup: false, followupQuestion: null, specialty: null, urgency: "low" });
+    return;
+  }
+
+  const { symptomText, triageRound = 0, history, specialties } = req.body as {
+    symptomText: string;
+    triageRound?: number;
+    history?: Array<{ role: "user" | "assistant"; text: string }>;
+    specialties: string[];
+  };
+
+  if (!symptomText?.trim()) { res.status(400).json({ error: "symptomText required" }); return; }
+
+  const historyBlock =
+    (history ?? []).length > 0
+      ? `\nConversation so far:\n${(history ?? [])
+          .map((h) => `${h.role === "user" ? "Patient" : "Triage Bot"}: ${h.text}`)
+          .join("\n")}\n`
+      : "";
+
+  const specialtyList = (specialties ?? []).join(", ");
+
+  const systemPrompt = `You are a healthcare triage assistant for Apollo Hospitals.
+You are NOT diagnosing disease. Your job is to gather enough information to route the patient to the correct specialist.
+
+Available specialties: ${specialtyList}
+
+Rules:
+1. If the symptom clearly indicates urgency (e.g. possible fracture, stroke symptoms, severe bleeding, crushing chest pain with sweating), set urgency to "high" or "emergency" and set requiresFollowup to false — route immediately without asking questions.
+2. Ask at most 2 follow-up questions total. If triageRound >= 2 you MUST recommend a specialty (requiresFollowup: false).
+3. When asking a follow-up, provide ONE concise, patient-friendly question in followupQuestion.
+4. When recommendating a specialty (requiresFollowup: false), specialty MUST be an exact name from the available specialties list above.
+5. Never expose medical diagnoses. Only route to a specialist.
+6. Return ONLY valid JSON with no markdown or explanation outside the JSON.
+
+Current triage round: ${triageRound} (0 = first call, 1 = one answer received, 2 = two answers received — must resolve now)
+${historyBlock}
+Return this exact JSON structure:
+{
+  "requiresFollowup": boolean,
+  "followupQuestion": string | null,
+  "specialty": string | null,
+  "urgency": "low" | "medium" | "high" | "emergency",
+  "reasoning": string
+}`;
+
+  try {
+    const raw = (await callLlm(systemPrompt, `Patient symptom: "${symptomText}"`))
+      .trim()
+      .replace(/^```json\s*/i, "")
+      .replace(/```\s*$/, "");
+    const result = JSON.parse(raw) as {
+      requiresFollowup: boolean;
+      followupQuestion: string | null;
+      specialty: string | null;
+      urgency: "low" | "medium" | "high" | "emergency";
+      reasoning: string;
+    };
+
+    // Log full result including reasoning (internal only), then strip before sending
+    log.info(
+      { symptomText, triageRound, urgency: result.urgency, specialty: result.specialty, reasoning: result.reasoning },
+      "triage result"
+    );
+
+    const { reasoning: _r, ...clientResult } = result;
+    void _r; // suppress unused-var warning
+    res.json(clientResult);
+  } catch (err) {
+    log.error({ err }, "triage LLM error");
+    res.json({ requiresFollowup: false, followupQuestion: null, specialty: null, urgency: "low" });
+  }
+});
+
 // ── POST /api/symptom-specialty ───────────────────────────────────────────────
 intentRouter.post("/symptom-specialty", async (req: Request, res: Response): Promise<void> => {
   if (!hasAnyLlm) { res.json({ specialty: null }); return; }

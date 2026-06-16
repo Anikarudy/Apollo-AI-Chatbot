@@ -149,6 +149,7 @@ const NO_LLM_STATES = new Set([
   "SEARCH_BY_SPECIALTY_STATE", "PROCESS_SYMPTOM_CATEGORY", "PROCESS_SYMPTOM_DETAIL",
   "MAP_TO_SPECIALTY", "BOOKING_FAILED_STATE", "RESCHEDULE_FAILED_STATE",
   "CANCEL_FAILED_STATE", "UHID_GENERATE_FAILED",
+  "TRIAGE_IN_PROGRESS",      // question displayed by stateResponses from ctx.triageFollowupQuestion
   "DOCTOR_NAME_SUGGESTIONS", // rendered by stateResponses with suggestion buttons
   "AI_PREFILL_ROUTE",        // transient routing state, never shown
   "SHOW_DOCTORS",            // UI is card-driven; LLM message shown before cards load
@@ -186,6 +187,8 @@ const AGENT_DECIDE_STATES = new Set([
   "HEALTH_CHECKUP_ENTRY",
   // Symptom flow — user may type a symptom instead of pressing a button
   "SELECT_SYMPTOM_CATEGORY",
+  // Triage follow-up — user answers an AI question; agent can still redirect mid-triage
+  "TRIAGE_IN_PROGRESS",
   // Results / post-booking
   "SHOW_DOCTORS", "BOOKING_CONFIRMED",
   // Error / not-found recovery
@@ -1360,6 +1363,76 @@ export function useChatMachine() {
 
   // Prevent EDOC async effects from double-firing on re-renders
   const edocFiredForState = useRef<string>("");
+
+  // MAP_TO_SPECIALTY: call /api/triage and fire TRIAGE_NEEDS_FOLLOWUP or TRIAGE_COMPLETE
+  useEffect(() => {
+    if (currentState !== "MAP_TO_SPECIALTY") return;
+    if (edocFiredForState.current === currentState) return;
+    edocFiredForState.current = currentState;
+
+    const symptomText = machineCtx.symptomText ?? "";
+    if (!symptomText.trim()) { sendSilentEvent("TRIAGE_FAILED"); return; }
+
+    const triageRound = Number(machineCtx.triageRound ?? 0);
+
+    // Build conversation history from the last 8 messages for context
+    const history = messagesRef.current
+      .slice(-8)
+      .filter((m) => m.text.trim().length > 0)
+      .map((m) => ({
+        role: m.sender === "user" ? "user" : "assistant" as "user" | "assistant",
+        text: m.text,
+      }));
+
+    import("../knowledgeBase.js")
+      .then(({ specialities }) =>
+        fetch("/api/triage", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Session-Id": sessionIdRef.current },
+          body: JSON.stringify({ symptomText, triageRound, history, specialties: specialities }),
+        })
+      )
+      .then((r) => r.json())
+      .then((data: unknown) => {
+        const d = data as {
+          requiresFollowup: boolean;
+          followupQuestion: string | null;
+          specialty: string | null;
+          urgency: "low" | "medium" | "high" | "emergency";
+        };
+        if (d.requiresFollowup) {
+          sendSilentEvent("TRIAGE_NEEDS_FOLLOWUP", d.followupQuestion ?? "Can you tell me more about your symptoms?");
+        } else {
+          const specialty = d.specialty ?? "";
+          if (!specialty.trim()) { sendSilentEvent("TRIAGE_FAILED"); return; }
+          // Warn the user before routing for emergency urgency
+          if (d.urgency === "emergency" || d.urgency === "high") {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: nextId(),
+                sender: "bot" as const,
+                text: d.urgency === "emergency"
+                  ? "⚠️ Your symptoms suggest you may need immediate medical attention. I'm routing you to the right specialist — please also call 1860-500-1066 or visit the nearest Apollo Emergency."
+                  : "⚠️ Your symptoms may need prompt attention. I'm finding you the right specialist.",
+              },
+            ]);
+          }
+          // Fire TRIAGE_COMPLETE with specialty + urgency embedded in the event
+          const runner = runnerRef.current;
+          if (!runner) return;
+          runner.sendEvent({ type: "TRIAGE_COMPLETE", value: specialty, urgency: d.urgency } as AppEvent);
+          const nextState = runner.currentState;
+          const nextCtx = runner.context as ChatContext;
+          if (nextState !== edocFiredForState.current) edocFiredForState.current = "";
+          setCurrentState(nextState);
+          setMachineCtx(nextCtx);
+          pushStaticBotMessage(nextState, nextCtx);
+        }
+      })
+      .catch(() => sendSilentEvent("TRIAGE_FAILED"));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentState, machineCtx.symptomText, machineCtx.triageRound]);
 
   // CHECK_EXISTING_APPOINTMENT: check if patient already has an appt with this doctor
   useEffect(() => {

@@ -98,6 +98,11 @@ export type AppEvent =
   // ── AI intent navigation ──────────────────────────────────────────────────
   | { type: "AI_PREFILL"; value: string }   // JSON: {specialty?,city?,branch?,doctorName?}
   | { type: "AI_SYMPTOM_MAPPED"; value: string } // specialty string from AI
+  // ── AI triage events ─────────────────────────────────────────────────────
+  | { type: "TRIAGE_NEEDS_FOLLOWUP"; value: string }  // value = follow-up question text
+  | { type: "TRIAGE_ANSWER"; value: string }          // user's free-text answer to a triage question
+  | { type: "TRIAGE_COMPLETE"; value: string; urgency?: string } // value = resolved specialty name
+  | { type: "TRIAGE_FAILED" }                         // API error — fall back to category picker
   | { type: "UNKNOWN" };
 
 // ─────────────────────────────────────────────────────────────
@@ -184,6 +189,11 @@ export function mapInputToEvent(message: string, currentState?: string): AppEven
 
   if (state === "COLLECT_PATIENT_DETAILS") {
     return { type: "ENTER_PATIENT_DETAILS", value: message.trim() };
+  }
+
+  // In TRIAGE_IN_PROGRESS, all free text is the user's answer to the triage question.
+  if (state === "TRIAGE_IN_PROGRESS") {
+    return { type: "TRIAGE_ANSWER", value: message.trim() };
   }
 
   // In SHOW_DOCTORS, typing "book" / "I want to book" maps to Change Search so the
