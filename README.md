@@ -1,3 +1,9 @@
+
+
+https://github.com/user-attachments/assets/47a7c3a6-edb9-4be2-8c31-b4a8b1b50f47
+
+
+
 # Apollo Assist — AI Healthcare Assistant
 
 Apollo Assist is a conversational assistant for Apollo Hospitals. Patients can find the right doctor, describe their symptoms, and book, reschedule or cancel real hospital appointments just by chatting, in English or their own language.
